@@ -82,73 +82,60 @@ function Toggle({ value, onChange, color = "#06B6D4" }) {
 }
 
 // VOICE RECORDING SCREEN - fully upgraded
-function VoiceNoteScreen({ onBack, onSave }) {
-  const [mode, setMode] = useState("text");
-  const [isRecording, setIsRecording] = useState(false);
-  const [isPaused, setIsPaused] = useState(false);
-  const [transcript, setTranscript] = useState("");
-  const [elapsed, setElapsed] = useState(0);
-  const [title, setTitle] = useState("");
-  const [courses, setCourses] = useState(["General"]);
-  const [course, setCourse] = useState("General");
-  const [status, setStatus] = useState("Tap microphone to start");
-  const [showAddCourse, setShowAddCourse] = useState(false);
-  const [newCourse, setNewCourse] = useState("");
-  const [formulaMode, setFormulaMode] = useState(true);
-  const [audioURL, setAudioURL] = useState(null);
+const sessionBaseRef = useRef("");
 
-  const recognitionRef = useRef(null);
-  const timerRef = useRef(null);
-  const finalRef = useRef("");
-  const isRecordingRef = useRef(false);
-  const isPausedRef = useRef(false);
-  const mediaRecorderRef = useRef(null);
-  const audioChunksRef = useRef([]);
-  const fmt = s => `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+const startVoiceToText = useCallback(() => {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { setStatus("Use Chrome browser!"); return; }
 
-  const addCourse = () => {
-    const c = newCourse.trim().toUpperCase();
-    if (!c) return;
-    if (courses.includes(c)) { alert("Course already added!"); return; }
-    setCourses(p => [...p, c]);
-    setNewCourse(""); setShowAddCourse(false);
-  };
+  const recognition = new SR();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = "en-US";
 
-  const removeCourse = (c) => {
-    if (c === "General") return;
-    setCourses(p => p.filter(x => x !== c));
-    if (course === c) setCourse("General");
-  };
+  // Save text before this session starts
+  sessionBaseRef.current = finalRef.current;
+  let sessionFinal = "";
 
-  const startVoiceToText = useCallback(() => {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) { setStatus("Use Chrome browser for voice recording!"); return; }
-    const recognition = new SR();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 1;
-    recognition.lang = "en-US";
+  recognition.onstart = () => setStatus("Listening... speak clearly");
 
-    recognition.onstart = () => setStatus("Listening... speak clearly");
-
-    recognition.onresult = (e) => {
-      let interim = "";
-      for (let i = e.resultIndex; i < e.results.length; i++) {
+  recognition.onresult = (e) => {
+    // Only process NEW results using resultIndex
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      if (e.results[i].isFinal) {
         const t = e.results[i][0].transcript;
-        if (e.results[i].isFinal) {
-          const processed = formulaMode ? convertFormulas(t) : t;
-          finalRef.current += processed + " ";
-        } else {
-          interim = formulaMode ? convertFormulas(t) : t;
-        }
+        sessionFinal += (formulaMode ? convertFormulas(t) : t) + " ";
+        finalRef.current = sessionBaseRef.current + sessionFinal;
       }
-      setTranscript(finalRef.current + interim);
-    };
+    }
+    // Get interim text
+    let interim = "";
+    const last = e.results[e.results.length - 1];
+    if (!last.isFinal) {
+      interim = formulaMode ? convertFormulas(last[0].transcript) : last[0].transcript;
+    }
+    setTranscript(finalRef.current + interim);
+  };
 
-    recognition.onerror = (e) => {
-      if (e.error === "no-speech" || e.error === "aborted") return;
-      setStatus("Reconnecting...");
-    };
+  recognition.onerror = (e) => {
+    if (e.error === "no-speech" || e.error === "aborted") return;
+    setStatus("Reconnecting...");
+  };
+
+  recognition.onend = () => {
+    if (isRecordingRef.current && !isPausedRef.current) {
+      // Small delay before restart prevents audio buffer replays
+      setTimeout(() => {
+        try { recognition.start(); } catch(e) {}
+      }, 300);
+    } else {
+      setStatus("Recording complete ✅");
+    }
+  };
+
+  recognitionRef.current = recognition;
+  try { recognition.start(); } catch(e) {}
+}, [formulaMode]);
 
     // Auto-restart to prevent stopping
     recognition.onend = () => {
