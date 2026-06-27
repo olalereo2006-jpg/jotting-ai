@@ -897,7 +897,7 @@ function SettingsScreen() {
                 <span style={{ fontSize:32 }}>🚀</span>
               </div>
               <div style={{ display:"flex", alignItems:"baseline", gap:4, marginBottom:14 }}>
-                <span style={{ fontSize:28, fontWeight:800, color:"#fff" }}>₦2,000</span>
+                <span style={{ fontSize:28, fontWeight:800, color:"#fff" }}>₦550</span>
                 <span style={{ fontSize:12, color:"rgba(255,255,255,0.6)" }}>/month</span>
               </div>
               <button style={{ width:"100%", background:"#fff", color:"#4F46E5", border:"none", borderRadius:12, padding:"12px", fontWeight:800, fontSize:14, cursor:"pointer" }}>Get Pro Now →</button>
