@@ -95,21 +95,6 @@ const convertFormulas = (text) => {
 };
 
 // Remove duplicate words safely
-const removeDuplicates = (text) => {
-  const words = text.trim().split(" ").filter(w => w.length > 0);
-  const result = [];
-  for (let i = 0; i < words.length; i++) {
-    if (i < 3) { result.push(words[i]); continue; }
-    const last3 = result.slice(-3).join(" ").toLowerCase();
-    const current = words[i].toLowerCase();
-    if (!last3.endsWith(current + " " + current) && !(result[result.length-1] || "").toLowerCase() === current) {
-      result.push(words[i]);
-    } else if ((result[result.length-1] || "").toLowerCase() !== current) {
-      result.push(words[i]);
-    }
-  }
-  return result.join(" ");
-};
 
 function Wave({ active, color, size }) {
   const c = color || "#06B6D4";
