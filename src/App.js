@@ -39,7 +39,9 @@ function Toggle({ value, onChange, color }) {
 var backBtn = { background:"rgba(255,255,255,0.08)", border:"none", borderRadius:10, width:36, height:36, cursor:"pointer", color:"#fff", fontSize:18, display:"flex", alignItems:"center", justifyContent:"center" };
 function actionBtn(color) { return { background:color+"15", border:"1px solid "+color+"40", borderRadius:12, padding:"12px", fontSize:13, fontWeight:700, color:color, cursor:"pointer", fontFamily:"inherit" }; }
 
-// VOICE SCREEN - Google Free Speech API (Zero duplicates fix)
+// REPLACE ONLY THE VoiceNoteScreen FUNCTION in your App.js
+// Find "function VoiceNoteScreen" and replace everything until the next "function"
+
 function VoiceNoteScreen({ onBack, onSave }) {
   var [isRecording, setIsRecording] = useState(false);
   var [isPaused, setIsPaused] = useState(false);
@@ -51,167 +53,207 @@ function VoiceNoteScreen({ onBack, onSave }) {
   var [showAddCourse, setShowAddCourse] = useState(false);
   var [newCourse, setNewCourse] = useState("");
   var [transcript, setTranscript] = useState("");
-  var [interimText, setInterimText] = useState("");
 
-  // Refs - survive re-renders
   var timerRef = useRef(null);
   var recognitionRef = useRef(null);
-  var savedTextRef = useRef(""); // permanent final text
-  var isRecordingRef = useRef(false);
-  var isPausedRef = useRef(false);
-  var restartRef = useRef(null);
+  var allTextRef = useRef("");
+  var isActiveRef = useRef(false);
 
-  var fmt = function(s) { return String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0"); };
+  var fmt = function(s) {
+    return String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0");
+  };
 
   function addCourse() {
     var c = newCourse.trim().toUpperCase();
     if (!c || courses.includes(c)) return;
-    setCourses(function(p){ return [...p,c]; }); setNewCourse(""); setShowAddCourse(false);
+    setCourses(function(p){ return [...p,c]; });
+    setNewCourse(""); setShowAddCourse(false);
   }
+
   function removeCourse(c) {
     if (c==="General") return;
     setCourses(function(p){ return p.filter(function(x){ return x!==c; }); });
     if (course===c) setCourse("General");
   }
 
-  // Create a fresh recognition session
-  function createSession() {
-    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) { setStatus("Please use Chrome browser!"); return null; }
-
-    var r = new SR();
-    r.continuous = true;
-    r.interimResults = true;
-    r.lang = "en-US";
-    r.maxAlternatives = 1;
-
-    // Capture text at the START of this session
-    var sessionStart = savedTextRef.current;
-    var sessionNew = "";
-
-    r.onstart = function() { setStatus("Listening... speak clearly"); };
-
-    r.onresult = function(e) {
-      var finalInSession = "";
-      var interim = "";
-
-      for (var i = 0; i < e.results.length; i++) {
-        var t = e.results[i][0].transcript;
-        if (e.results[i].isFinal) {
-          finalInSession += t + " ";
-        } else {
-          interim = t;
-        }
-      }
-
-      // sessionNew = only NEW final text in this session
-      sessionNew = finalInSession;
-
-      // Full transcript = saved before session + new in this session + interim
-      var full = sessionStart + sessionNew;
-      savedTextRef.current = sessionStart + sessionNew;
-      setTranscript(full + interim);
-      setInterimText(interim);
-    };
-
-    r.onerror = function(e) {
-      if (e.error === "no-speech") return;
-      if (e.error === "aborted") return;
-      setStatus("Reconnecting...");
-    };
-
-    r.onend = function() {
-      // Save what we have so far before restarting
-      savedTextRef.current = sessionStart + sessionNew;
-
-      if (isRecordingRef.current && !isPausedRef.current) {
-        // Wait 400ms then start fresh session (prevents audio replay)
-        restartRef.current = setTimeout(function() {
-          if (isRecordingRef.current && !isPausedRef.current) {
-            var newSession = createSession();
-            if (newSession) {
-              recognitionRef.current = newSession;
-              try { newSession.start(); } catch(err) {}
-            }
-          }
-        }, 400);
-      } else {
-        setInterimText("");
-        setStatus(isRecordingRef.current ? "Paused" : "Recording complete");
-      }
-    };
-
-    return r;
-  }
-
   function startRecording() {
-    savedTextRef.current = "";
+    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { setStatus("Please use Chrome browser!"); return; }
+
+    allTextRef.current = "";
     setTranscript("");
-    setInterimText("");
-    isRecordingRef.current = true;
-    isPausedRef.current = false;
+    isActiveRef.current = true;
     setIsRecording(true);
     setIsPaused(false);
     setElapsed(0);
+    setStatus("Listening... speak clearly");
 
-    timerRef.current = setInterval(function(){ setElapsed(function(e){ return e+1; }); }, 1000);
+    timerRef.current = setInterval(function(){
+      setElapsed(function(e){ return e+1; });
+    }, 1000);
 
-    var session = createSession();
-    if (session) {
-      recognitionRef.current = session;
-      try { session.start(); } catch(e) {}
-    }
+    var recognition = new SR();
+
+    // KEY SETTINGS - single session, no restart
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+
+    recognition.onresult = function(e) {
+      // Build complete transcript from ALL results
+      var finalText = "";
+      var interimText = "";
+
+      for (var i = 0; i < e.results.length; i++) {
+        if (e.results[i].isFinal) {
+          finalText += e.results[i][0].transcript + " ";
+        } else {
+          interimText += e.results[i][0].transcript;
+        }
+      }
+
+      // Show final text + current interim
+      setTranscript(finalText + interimText);
+      allTextRef.current = finalText;
+    };
+
+    recognition.onerror = function(e) {
+      if (e.error === "no-speech") {
+        // Just silence - do nothing, keep recording
+        return;
+      }
+      if (e.error === "aborted") return;
+      setStatus("Error: " + e.error + " - try stopping and starting again");
+    };
+
+    recognition.onend = function() {
+      // Only restart if user did NOT stop or pause
+      if (isActiveRef.current) {
+        // Natural end (timeout) - restart immediately
+        setStatus("Continuing...");
+        try {
+          // Create NEW recognition to avoid audio replay bug
+          var newRec = new SR();
+          newRec.continuous = true;
+          newRec.interimResults = true;
+          newRec.lang = "en-US";
+
+          var baseText = allTextRef.current;
+
+          newRec.onresult = function(e) {
+            var newFinal = "";
+            var interimText = "";
+            for (var i = 0; i < e.results.length; i++) {
+              if (e.results[i].isFinal) {
+                newFinal += e.results[i][0].transcript + " ";
+              } else {
+                interimText += e.results[i][0].transcript;
+              }
+            }
+            allTextRef.current = baseText + newFinal;
+            setTranscript(baseText + newFinal + interimText);
+            setStatus("Listening... speak clearly");
+          };
+
+          newRec.onerror = function(e) {
+            if (e.error==="no-speech"||e.error==="aborted") return;
+          };
+
+          newRec.onend = recognition.onend;
+          recognitionRef.current = newRec;
+          newRec.start();
+        } catch(err) {}
+      }
+    };
+
+    recognitionRef.current = recognition;
+    recognition.start();
   }
 
   function pauseRecording() {
-    isPausedRef.current = true;
+    isActiveRef.current = false;
     setIsPaused(true);
     clearInterval(timerRef.current);
-    clearTimeout(restartRef.current);
     try { recognitionRef.current && recognitionRef.current.stop(); } catch(e) {}
-    setInterimText("");
     setStatus("Paused - tap Resume to continue");
   }
 
   function resumeRecording() {
-    isPausedRef.current = false;
+    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) return;
+
+    isActiveRef.current = true;
     setIsPaused(false);
-    timerRef.current = setInterval(function(){ setElapsed(function(e){ return e+1; }); }, 1000);
-    var session = createSession();
-    if (session) {
-      recognitionRef.current = session;
-      try { session.start(); } catch(e) {}
-    }
+    timerRef.current = setInterval(function(){
+      setElapsed(function(e){ return e+1; });
+    }, 1000);
+
+    var baseText = allTextRef.current;
+    var recognition = new SR();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+
+    recognition.onresult = function(e) {
+      var newFinal = "";
+      var interimText = "";
+      for (var i = 0; i < e.results.length; i++) {
+        if (e.results[i].isFinal) {
+          newFinal += e.results[i][0].transcript + " ";
+        } else {
+          interimText += e.results[i][0].transcript;
+        }
+      }
+      allTextRef.current = baseText + newFinal;
+      setTranscript(baseText + newFinal + interimText);
+    };
+
+    recognition.onerror = function(e) {
+      if (e.error==="no-speech"||e.error==="aborted") return;
+    };
+
+    recognition.onend = function() {
+      if (isActiveRef.current) {
+        try { recognition.start(); } catch(err) {}
+      }
+    };
+
+    recognitionRef.current = recognition;
+    try { recognition.start(); } catch(e) {}
     setStatus("Resumed - listening...");
   }
 
   function stopRecording() {
-    isRecordingRef.current = false;
-    isPausedRef.current = false;
+    isActiveRef.current = false;
     setIsRecording(false);
     setIsPaused(false);
     clearInterval(timerRef.current);
-    clearTimeout(restartRef.current);
     try { recognitionRef.current && recognitionRef.current.stop(); } catch(e) {}
-    setInterimText("");
     setStatus("Recording complete");
   }
 
   useEffect(function() {
     return function() {
-      isRecordingRef.current = false;
+      isActiveRef.current = false;
       clearInterval(timerRef.current);
-      clearTimeout(restartRef.current);
       try { recognitionRef.current && recognitionRef.current.stop(); } catch(e) {}
     };
   }, []);
 
   function saveNote() {
     if (!transcript.trim()) { alert("Record something first!"); return; }
-    onSave({ id:Date.now(), title:title||("Voice Note - "+new Date().toLocaleDateString()), course, color:"#06B6D4", bg:"rgba(6,182,212,0.12)", date:"Today", tag:"Lecture", preview:transcript.slice(0,100), content:transcript });
+    onSave({
+      id: Date.now(),
+      title: title || ("Voice Note - " + new Date().toLocaleDateString()),
+      course: course,
+      color: "#06B6D4",
+      bg: "rgba(6,182,212,0.12)",
+      date: "Today",
+      tag: "Lecture",
+      preview: transcript.slice(0, 100),
+      content: transcript
+    });
   }
-
-  var fullDisplay = transcript + (interimText ? interimText : "");
 
   return (
     <div style={{ flex:1, background:C.bg, display:"flex", flexDirection:"column" }}>
@@ -220,21 +262,21 @@ function VoiceNoteScreen({ onBack, onSave }) {
         <span style={{ fontWeight:800, fontSize:16, color:C.text }}>Voice Recording</span>
         <button onClick={saveNote} style={{ background:"linear-gradient(135deg,#06B6D4,#A78BFA)", color:"#fff", border:"none", borderRadius:10, padding:"8px 18px", fontWeight:800, fontSize:14, cursor:"pointer" }}>Save</button>
       </div>
-
       <div style={{ flex:1, overflowY:"auto", padding:20 }}>
-        {/* Google Free badge */}
+
+        {/* Free badge */}
         <div style={{ background:"linear-gradient(135deg,rgba(52,211,153,0.1),rgba(6,182,212,0.1))", borderRadius:14, padding:"10px 16px", marginBottom:16, border:"1px solid rgba(52,211,153,0.2)", display:"flex", alignItems:"center", gap:10 }}>
           <span style={{ fontSize:20 }}>🆓</span>
           <div>
             <div style={{ fontWeight:700, fontSize:13, color:C.green }}>Google Free Speech API</div>
-            <div style={{ fontSize:11, color:C.muted }}>Powered by Google Chrome - completely free, no account needed</div>
+            <div style={{ fontSize:11, color:C.muted }}>Completely free - no API key needed</div>
           </div>
         </div>
 
         {/* Title */}
         <input value={title} onChange={function(e){ setTitle(e.target.value); }} placeholder="Note title (optional)..." style={{ width:"100%", padding:"13px 16px", borderRadius:12, border:"1px solid "+C.border, fontSize:15, fontWeight:700, background:C.card, color:C.text, outline:"none", marginBottom:14, boxSizing:"border-box" }} />
 
-        {/* Course Selector */}
+        {/* Courses */}
         <div style={{ marginBottom:16 }}>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
             <span style={{ fontSize:13, fontWeight:700, color:C.soft }}>Select Course</span>
@@ -254,37 +296,31 @@ function VoiceNoteScreen({ onBack, onSave }) {
               return (
                 <div key={c} style={{ display:"flex" }}>
                   <button onClick={function(){ setCourse(c); }} style={{ padding:"7px 14px", borderRadius:c==="General"?99:"99px 0 0 99px", border:"2px solid", borderColor:course===c?C.cyan:C.border, borderRight:c!=="General"?"none":undefined, background:course===c?C.cyan:C.card, color:course===c?"#0A0F1E":C.muted, fontSize:12, fontWeight:700, cursor:"pointer" }}>{c}</button>
-                  {c!=="General" && <button onClick={function(){ removeCourse(c); }} style={{ padding:"7px 8px", borderRadius:"0 99px 99px 0", border:"2px solid", borderColor:course===c?C.cyan:C.border, borderLeft:"none", background:course===c?C.cyan:C.card, color:C.red, fontSize:11, cursor:"pointer" }}>X</button>}
+                  {c!=="General"&&<button onClick={function(){ removeCourse(c); }} style={{ padding:"7px 8px", borderRadius:"0 99px 99px 0", border:"2px solid", borderColor:course===c?C.cyan:C.border, borderLeft:"none", background:course===c?C.cyan:C.card, color:C.red, fontSize:11, cursor:"pointer" }}>X</button>}
                 </div>
               );
             })}
           </div>
         </div>
 
-        {/* Big Recording Area */}
+        {/* Recording */}
         <div style={{ background:C.card, borderRadius:24, padding:"28px 20px", border:"2px solid "+(isRecording&&!isPaused?C.red:isPaused?C.amber:C.border), marginBottom:16, textAlign:"center", transition:"border-color 0.3s" }}>
-          <div onClick={!isRecording?startRecording:undefined} style={{ width:110, height:110, borderRadius:"50%", background:isRecording?(isPaused?"linear-gradient(135deg,#F59E0B,#FCD34D)":"linear-gradient(135deg,#EF4444,#F87171)"):"linear-gradient(135deg,#06B6D4,#A78BFA)", display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 20px", cursor:!isRecording?"pointer":"default", fontSize:46, boxShadow:isRecording&&!isPaused?"0 0 0 14px rgba(239,68,68,0.12), 0 0 0 28px rgba(239,68,68,0.06)":"0 8px 32px rgba(6,182,212,0.35)", transition:"all 0.3s", animation:isRecording&&!isPaused?"pulse 1.5s ease-in-out infinite":"none" }}>
+          <div onClick={!isRecording?startRecording:undefined} style={{ width:110, height:110, borderRadius:"50%", background:isRecording?(isPaused?"linear-gradient(135deg,#F59E0B,#FCD34D)":"linear-gradient(135deg,#EF4444,#F87171)"):"linear-gradient(135deg,#06B6D4,#A78BFA)", display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 20px", cursor:!isRecording?"pointer":"default", fontSize:46, boxShadow:isRecording&&!isPaused?"0 0 0 14px rgba(239,68,68,0.12)":"0 8px 32px rgba(6,182,212,0.35)", animation:isRecording&&!isPaused?"pulse 1.5s ease-in-out infinite":"none" }}>
             {isPaused?"⏸":"🎙️"}
           </div>
-
-          {isRecording && <div style={{ fontSize:40, fontWeight:800, color:isPaused?C.amber:C.red, marginBottom:12, fontFamily:"monospace", letterSpacing:3 }}>{fmt(elapsed)}</div>}
-
+          {isRecording&&<div style={{ fontSize:40, fontWeight:800, color:isPaused?C.amber:C.red, marginBottom:12, fontFamily:"monospace", letterSpacing:3 }}>{fmt(elapsed)}</div>}
           <div style={{ display:"flex", justifyContent:"center", marginBottom:14 }}>
             <Wave active={isRecording&&!isPaused} color={isRecording&&!isPaused?"#EF4444":C.cyan} size={1.6} />
           </div>
-
           <p style={{ color:isRecording?(isPaused?C.amber:C.red):C.muted, fontSize:14, fontWeight:600, margin:"0 0 20px" }}>{status}</p>
-
-          <div style={{ display:"flex", gap:10, justifyContent:"center", flexWrap:"wrap" }}>
-            {!isRecording ? (
-              <button onClick={startRecording} style={{ background:"linear-gradient(135deg,#EF4444,#F87171)", color:"#fff", border:"none", borderRadius:14, padding:"14px 36px", fontWeight:800, fontSize:15, cursor:"pointer", boxShadow:"0 4px 20px rgba(239,68,68,0.4)" }}>
-                Start Recording
-              </button>
-            ) : (
+          <div style={{ display:"flex", gap:10, justifyContent:"center" }}>
+            {!isRecording?(
+              <button onClick={startRecording} style={{ background:"linear-gradient(135deg,#EF4444,#F87171)", color:"#fff", border:"none", borderRadius:14, padding:"14px 36px", fontWeight:800, fontSize:15, cursor:"pointer", boxShadow:"0 4px 20px rgba(239,68,68,0.4)" }}>Start Recording</button>
+            ):(
               <div style={{ display:"flex", gap:10 }}>
                 {!isPaused
-                  ? <button onClick={pauseRecording} style={{ background:C.amber, color:"#0A0F1E", border:"none", borderRadius:14, padding:"13px 24px", fontWeight:800, fontSize:14, cursor:"pointer" }}>⏸ Pause</button>
-                  : <button onClick={resumeRecording} style={{ background:C.green, color:"#0A0F1E", border:"none", borderRadius:14, padding:"13px 24px", fontWeight:800, fontSize:14, cursor:"pointer" }}>▶ Resume</button>
+                  ?<button onClick={pauseRecording} style={{ background:C.amber, color:"#0A0F1E", border:"none", borderRadius:14, padding:"13px 24px", fontWeight:800, fontSize:14, cursor:"pointer" }}>⏸ Pause</button>
+                  :<button onClick={resumeRecording} style={{ background:C.green, color:"#0A0F1E", border:"none", borderRadius:14, padding:"13px 24px", fontWeight:800, fontSize:14, cursor:"pointer" }}>▶ Resume</button>
                 }
                 <button onClick={stopRecording} style={{ background:"rgba(248,113,113,0.15)", color:C.red, border:"2px solid "+C.red+"40", borderRadius:14, padding:"13px 24px", fontWeight:800, fontSize:14, cursor:"pointer" }}>⏹ Stop</button>
               </div>
@@ -292,29 +328,22 @@ function VoiceNoteScreen({ onBack, onSave }) {
           </div>
         </div>
 
-        {/* Live Transcript */}
-        <div style={{ background:C.card, borderRadius:16, padding:20, border:"1px solid "+(fullDisplay?C.cyan+"40":C.border) }}>
+        {/* Transcript */}
+        <div style={{ background:C.card, borderRadius:16, padding:20, border:"1px solid "+(transcript?C.cyan+"40":C.border) }}>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12 }}>
             <div style={{ display:"flex", alignItems:"center", gap:8 }}>
               <span style={{ fontWeight:700, fontSize:14, color:C.cyan }}>📝 Live Transcript</span>
-              {isRecording && !isPaused && <div style={{ width:8, height:8, borderRadius:"50%", background:C.red, animation:"pulse 1s ease-in-out infinite" }} />}
+              {isRecording&&!isPaused&&<div style={{ width:8, height:8, borderRadius:"50%", background:C.red, animation:"pulse 1s ease-in-out infinite" }} />}
             </div>
             <div style={{ display:"flex", gap:8 }}>
-              {transcript && <button onClick={function(){ savedTextRef.current=""; setTranscript(""); setInterimText(""); }} style={{ background:"none", border:"none", color:C.muted, cursor:"pointer", fontSize:12, fontWeight:600 }}>Clear</button>}
-              {transcript && <button onClick={function(){ navigator.clipboard&&navigator.clipboard.writeText(transcript); }} style={{ background:C.card2, border:"none", borderRadius:8, padding:"4px 10px", color:C.cyan, cursor:"pointer", fontSize:12, fontWeight:600 }}>Copy</button>}
+              {transcript&&<button onClick={function(){ allTextRef.current=""; setTranscript(""); }} style={{ background:"none", border:"none", color:C.muted, cursor:"pointer", fontSize:12, fontWeight:600 }}>Clear</button>}
+              {transcript&&<button onClick={function(){ navigator.clipboard&&navigator.clipboard.writeText(transcript); }} style={{ background:C.card2, border:"none", borderRadius:8, padding:"4px 10px", color:C.cyan, cursor:"pointer", fontSize:12, fontWeight:600 }}>Copy</button>}
             </div>
           </div>
-          <div style={{ minHeight:160, fontSize:14, lineHeight:1.9, color:fullDisplay?C.text:C.muted }}>
-            {fullDisplay ? (
-              <div>
-                <span style={{ color:C.text }}>{transcript}</span>
-                <span style={{ color:C.muted, fontStyle:"italic" }}>{interimText}</span>
-              </div>
-            ) : (
-              <span>Tap Start Recording — your words will appear here instantly...</span>
-            )}
+          <div style={{ minHeight:160, fontSize:14, lineHeight:1.9, color:transcript?C.text:C.muted }}>
+            {transcript||"Tap Start Recording — your words will appear here instantly..."}
           </div>
-          {transcript && (
+          {transcript&&(
             <div style={{ marginTop:10, paddingTop:10, borderTop:"1px solid "+C.border, display:"flex", justifyContent:"space-between" }}>
               <span style={{ fontSize:11, color:C.muted }}>{transcript.split(" ").filter(function(w){ return w; }).length} words</span>
               <span style={{ fontSize:11, color:C.muted }}>{transcript.length} characters</span>
@@ -323,16 +352,11 @@ function VoiceNoteScreen({ onBack, onSave }) {
         </div>
 
         {/* Tips */}
-        {!isRecording && !transcript && (
+        {!isRecording&&!transcript&&(
           <div style={{ background:C.card, borderRadius:16, padding:20, marginTop:14, border:"1px solid "+C.border }}>
             <div style={{ fontWeight:700, fontSize:14, color:C.text, marginBottom:14 }}>Tips for best results:</div>
-            {[["🎯","Speak clearly and at normal pace"],["🔇","Use in a quiet room if possible"],["⏸","Pause if you need to think"],["📱","Use Chrome browser for best accuracy"],["🇳🇬","Works with Nigerian English accent"]].map(function(item,i) {
-              return (
-                <div key={i} style={{ display:"flex", alignItems:"center", gap:12, marginBottom:10 }}>
-                  <span style={{ fontSize:20 }}>{item[0]}</span>
-                  <span style={{ fontSize:13, color:C.soft }}>{item[1]}</span>
-                </div>
-              );
+            {[["🎯","Speak clearly and at normal pace"],["🔇","Use in a quiet room if possible"],["📱","Must use Chrome browser"],["🇳🇬","Works with Nigerian English accent"],["⏸","Tap Pause if you need to think"]].map(function(item,i){
+              return <div key={i} style={{ display:"flex", alignItems:"center", gap:12, marginBottom:10 }}><span style={{ fontSize:20 }}>{item[0]}</span><span style={{ fontSize:13, color:C.soft }}>{item[1]}</span></div>;
             })}
           </div>
         )}
