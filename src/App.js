@@ -76,152 +76,103 @@ function VoiceNoteScreen({ onBack, onSave }) {
     if (course===c) setCourse("General");
   }
 
-  function startRecording() {
-    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) { setStatus("Please use Chrome browser!"); return; }
+  // Helper to build a fresh recognition session that only appends NEW finals
+function buildRecognition(SR, onDone) {
+  var rec = new SR();
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.lang = "en-US";
 
-    allTextRef.current = "";
-    setTranscript("");
-    isActiveRef.current = true;
-    setIsRecording(true);
-    setIsPaused(false);
-    setElapsed(0);
-    setStatus("Listening... speak clearly");
+  // Track which result indices we've already committed for THIS session
+  var committedUpTo = 0;
 
-    timerRef.current = setInterval(function(){
-      setElapsed(function(e){ return e+1; });
-    }, 1000);
-
-    var recognition = new SR();
-
-    // KEY SETTINGS - single session, no restart
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = "en-US";
-
-    recognition.onresult = function(e) {
-      // Build complete transcript from ALL results
-      var finalText = "";
-      var interimText = "";
-
-      for (var i = 0; i < e.results.length; i++) {
-        if (e.results[i].isFinal) {
-          finalText += e.results[i][0].transcript + " ";
-        } else {
-          interimText += e.results[i][0].transcript;
-        }
+  rec.onresult = function(e) {
+    var newFinal = "";
+    var interim = "";
+    // Only look at results from where we left off
+    for (var i = committedUpTo; i < e.results.length; i++) {
+      var chunk = e.results[i][0].transcript;
+      if (e.results[i].isFinal) {
+        newFinal += chunk.trim() + " ";
+        committedUpTo = i + 1;          // mark this index as committed
+      } else {
+        interim += chunk;
       }
+    }
+    if (newFinal) allTextRef.current += newFinal;
+    setTranscript(allTextRef.current + interim);
+  };
 
-      // Show final text + current interim
-      setTranscript(finalText + interimText);
-      allTextRef.current = finalText;
-    };
+  rec.onerror = function(e) {
+    if (e.error === "no-speech" || e.error === "aborted") return;
+    setStatus("Error: " + e.error);
+  };
 
-    recognition.onerror = function(e) {
-      if (e.error === "no-speech") {
-        // Just silence - do nothing, keep recording
-        return;
-      }
-      if (e.error === "aborted") return;
-      setStatus("Error: " + e.error + " - try stopping and starting again");
-    };
+  rec.onend = onDone;
+  return rec;
+}
 
-    recognition.onend = function() {
-      // Only restart if user did NOT stop or pause
-      if (isActiveRef.current) {
-        // Natural end (timeout) - restart immediately
-        setStatus("Continuing...");
-        try {
-          // Create NEW recognition to avoid audio replay bug
-          var newRec = new SR();
-          newRec.continuous = true;
-          newRec.interimResults = true;
-          newRec.lang = "en-US";
+function startRecording() {
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { setStatus("Please use Chrome browser!"); return; }
 
-          var baseText = allTextRef.current;
+  allTextRef.current = "";
+  setTranscript("");
+  isActiveRef.current = true;
+  setIsRecording(true);
+  setIsPaused(false);
+  setElapsed(0);
+  setStatus("Listening... speak clearly");
 
-          newRec.onresult = function(e) {
-            var newFinal = "";
-            var interimText = "";
-            for (var i = 0; i < e.results.length; i++) {
-              if (e.results[i].isFinal) {
-                newFinal += e.results[i][0].transcript + " ";
-              } else {
-                interimText += e.results[i][0].transcript;
-              }
-            }
-            allTextRef.current = baseText + newFinal;
-            setTranscript(baseText + newFinal + interimText);
-            setStatus("Listening... speak clearly");
-          };
+  timerRef.current = setInterval(function(){
+    setElapsed(function(e){ return e+1; });
+  }, 1000);
 
-          newRec.onerror = function(e) {
-            if (e.error==="no-speech"||e.error==="aborted") return;
-          };
-
-          newRec.onend = recognition.onend;
-          recognitionRef.current = newRec;
-          newRec.start();
-        } catch(err) {}
-      }
-    };
-
-    recognitionRef.current = recognition;
-    recognition.start();
+  function handleEnd() {
+    if (!isActiveRef.current) return;     // user stopped/paused
+    setStatus("Continuing...");
+    // Fresh session = fresh committedUpTo counter, no duplicate finals
+    var next = buildRecognition(SR, handleEnd);
+    recognitionRef.current = next;
+    try { next.start(); } catch(err) {}
   }
 
-  function pauseRecording() {
-    isActiveRef.current = false;
-    setIsPaused(true);
-    clearInterval(timerRef.current);
-    try { recognitionRef.current && recognitionRef.current.stop(); } catch(e) {}
-    setStatus("Paused - tap Resume to continue");
+  var rec = buildRecognition(SR, handleEnd);
+  recognitionRef.current = rec;
+  rec.start();
+}
+
+function pauseRecording() {
+  isActiveRef.current = false;
+  setIsPaused(true);
+  clearInterval(timerRef.current);
+  try { recognitionRef.current && recognitionRef.current.stop(); } catch(e) {}
+  setStatus("Paused - tap Resume to continue");
+}
+
+function resumeRecording() {
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) return;
+
+  isActiveRef.current = true;
+  setIsPaused(false);
+  timerRef.current = setInterval(function(){
+    setElapsed(function(e){ return e+1; });
+  }, 1000);
+
+  function handleEnd() {
+    if (!isActiveRef.current) return;
+    var next = buildRecognition(SR, handleEnd);
+    recognitionRef.current = next;
+    try { next.start(); } catch(err) {}
   }
 
-  function resumeRecording() {
-    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) return;
+  var rec = buildRecognition(SR, handleEnd);
+  recognitionRef.current = rec;
+  try { rec.start(); } catch(e) {}
+  setStatus("Resumed - listening...");
+}
 
-    isActiveRef.current = true;
-    setIsPaused(false);
-    timerRef.current = setInterval(function(){
-      setElapsed(function(e){ return e+1; });
-    }, 1000);
-
-    var baseText = allTextRef.current;
-    var recognition = new SR();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = "en-US";
-
-    recognition.onresult = function(e) {
-      var newFinal = "";
-      var interimText = "";
-      for (var i = 0; i < e.results.length; i++) {
-        if (e.results[i].isFinal) {
-          newFinal += e.results[i][0].transcript + " ";
-        } else {
-          interimText += e.results[i][0].transcript;
-        }
-      }
-      allTextRef.current = baseText + newFinal;
-      setTranscript(baseText + newFinal + interimText);
-    };
-
-    recognition.onerror = function(e) {
-      if (e.error==="no-speech"||e.error==="aborted") return;
-    };
-
-    recognition.onend = function() {
-      if (isActiveRef.current) {
-        try { recognition.start(); } catch(err) {}
-      }
-    };
-
-    recognitionRef.current = recognition;
-    try { recognition.start(); } catch(e) {}
-    setStatus("Resumed - listening...");
-  }
 
   function stopRecording() {
     isActiveRef.current = false;
