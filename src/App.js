@@ -367,38 +367,63 @@ function VoiceNoteScreen({ onBack, onSave }) {
   var recognitionRef = useRef(null);
   var allTextRef = useRef("");
   var isActiveRef = useRef(false);
+  var sessionIdRef = useRef(0); // guards against stale/overlapping recognition instances
   var fmt = function(s){ return String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0"); };
   function addCourse(){ var c=newCourse.trim().toUpperCase(); if(!c||courses.includes(c))return; setCourses(function(p){return [...p,c];}); setNewCourse(""); setShowAddCourse(false); }
   function removeCourse(c){ if(c==="General")return; setCourses(function(p){return p.filter(function(x){return x!==c;});}); if(course===c)setCourse("General"); }
 
-  function createRecognition(baseText){
+  // Trims duplicate words at the point where `addition` overlaps the tail of `base`.
+  // Catches cases where a restarted recognition session re-captures a word or two
+  // of audio the previous session had already finalized.
+  function mergeNoDupe(base, addition){
+    if(!base) return addition;
+    if(!addition) return base;
+    var baseWords = base.trim().split(/\s+/);
+    var addWords = addition.trim().split(/\s+/);
+    var maxOverlap = Math.min(6, baseWords.length, addWords.length);
+    for(var len=maxOverlap; len>0; len--){
+      var tail = baseWords.slice(baseWords.length-len).join(" ").toLowerCase();
+      var head = addWords.slice(0,len).join(" ").toLowerCase();
+      if(tail === head){
+        return base + " " + addWords.slice(len).join(" ");
+      }
+    }
+    return base + " " + addition;
+  }
+
+  function createRecognition(baseText, sessionId){
     var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if(!SR)return null;
     var r = new SR();
     r.continuous = true; r.interimResults = true; r.lang = "en-US";
     var sessionNew = "";
     r.onresult = function(e){
+      if(sessionIdRef.current !== sessionId) return; // a newer session has taken over; ignore stale events
       var final = ""; var interim = "";
-      for(var i=0;i<e.results.length;i++){
+      for(var i=e.resultIndex;i<e.results.length;i++){
         if(e.results[i].isFinal){ final += e.results[i][0].transcript+" "; }
-        else{ interim = e.results[i][0].transcript; }
+        else{ interim += e.results[i][0].transcript; }
       }
-      sessionNew = final;
-      allTextRef.current = baseText + sessionNew;
-      setTranscript(baseText + sessionNew + interim);
+      if(final){ sessionNew = mergeNoDupe(sessionNew, final); }
+      var combined = mergeNoDupe(baseText, sessionNew);
+      allTextRef.current = combined;
+      setTranscript((combined + " " + interim).replace(/\s+/g," ").trim());
       setStatus("Listening... speak clearly");
     };
     r.onerror = function(e){ if(e.error==="no-speech"||e.error==="aborted")return; };
     r.onend = function(){
+      if(sessionIdRef.current !== sessionId) return; // stale instance; a restart already happened elsewhere
       if(isActiveRef.current){
-        var newBase = baseText + sessionNew;
+        var newBase = mergeNoDupe(baseText, sessionNew);
         allTextRef.current = newBase;
         setTimeout(function(){
-          if(isActiveRef.current){
-            var next = createRecognition(newBase);
+          if(isActiveRef.current && sessionIdRef.current === sessionId){
+            var newId = sessionId + 1;
+            sessionIdRef.current = newId;
+            var next = createRecognition(newBase, newId);
             if(next){ recognitionRef.current=next; try{next.start();}catch(err){} }
           }
-        },400);
+        },300);
       } else { setStatus("Recording complete"); }
     };
     return r;
@@ -410,12 +435,14 @@ function VoiceNoteScreen({ onBack, onSave }) {
     allTextRef.current=""; setTranscript(""); isActiveRef.current=true;
     setIsRecording(true); setIsPaused(false); setElapsed(0);
     timerRef.current = setInterval(function(){setElapsed(function(e){return e+1;});},1000);
-    var r = createRecognition("");
+    var newId = sessionIdRef.current + 1;
+    sessionIdRef.current = newId;
+    var r = createRecognition("", newId);
     if(r){ recognitionRef.current=r; try{r.start();}catch(e){} }
   }
-  function pauseRecording(){ isActiveRef.current=false; setIsPaused(true); clearInterval(timerRef.current); try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){} setStatus("Paused"); }
-  function resumeRecording(){ isActiveRef.current=true; setIsPaused(false); timerRef.current=setInterval(function(){setElapsed(function(e){return e+1;});},1000); var r=createRecognition(allTextRef.current); if(r){recognitionRef.current=r;try{r.start();}catch(e){}} setStatus("Resumed..."); }
-  function stopRecording(){ isActiveRef.current=false; setIsRecording(false); setIsPaused(false); clearInterval(timerRef.current); try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){} setStatus("Recording complete"); }
+  function pauseRecording(){ isActiveRef.current=false; setIsPaused(true); sessionIdRef.current++; clearInterval(timerRef.current); try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){} setStatus("Paused"); }
+  function resumeRecording(){ isActiveRef.current=true; setIsPaused(false); timerRef.current=setInterval(function(){setElapsed(function(e){return e+1;});},1000); var newId=sessionIdRef.current+1; sessionIdRef.current=newId; var r=createRecognition(allTextRef.current, newId); if(r){recognitionRef.current=r;try{r.start();}catch(e){}} setStatus("Resumed..."); }
+  function stopRecording(){ isActiveRef.current=false; setIsRecording(false); setIsPaused(false); sessionIdRef.current++; clearInterval(timerRef.current); try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){} setStatus("Recording complete"); }
   useEffect(function(){ return function(){ isActiveRef.current=false; clearInterval(timerRef.current); try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}; }; },[]);
   function saveNote(){ if(!transcript.trim()){alert("Record something first!");return;} onSave({id:Date.now(),title:title||("Voice Note - "+new Date().toLocaleDateString()),course,color:"#06B6D4",bg:"rgba(6,182,212,0.12)",date:"Today",tag:"Lecture",words:transcript.split(" ").length,preview:transcript.slice(0,100),content:transcript}); }
 
