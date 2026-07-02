@@ -7,7 +7,7 @@ const C = {
   red: "#F87171", text: "#F1F5F9", muted: "#64748B", soft: "#94A3B8",
 };
 
-const GEMINI_KEY = "AQ.Ab8RN6IbBnG7ziM4LHDj1Cuh8qr_uo2XKtRH3XxWnFdGA2zoww";
+const GEMINI_KEY ="AIzaSyAX1zlGPs-4ZQBiWoUm8NFHtmbE40nhCJM";
 const GEMINI_MODEL = "gemini-2.5-flash";
 
 // Shared helpers for calling Google's free Gemini API (text-only and vision).
