@@ -34,19 +34,42 @@ function sendNotification(title, body) {
   }
 }
 
-function scheduleStudyReminder(hour, minute, message) {
+// Config for each individual reminder toggle: what time it fires and what it says.
+// "assignment" has no real due-date data yet, so it's a generic daily nudge, not a
+// due-date-specific alert — flagged honestly rather than faked.
+const REMINDER_CONFIG = {
+  study:      { hour: 9,  minute: 0,  title: "Study Reminder",     message: "Time to review your notes and study a bit!" },
+  assignment: { hour: 18, minute: 0,  title: "Assignment Check",   message: "Quick check-in: any assignments due soon?" },
+  daily:      { hour: 20, minute: 0,  title: "Daily Goal Reminder", message: "Have you hit your daily study goal today?" },
+  recording:  { hour: 7,  minute: 30, title: "Recording Reminder", message: "Got a lecture today? Don't forget to record it!" },
+};
+
+// Module-level registry of live timers, keyed by reminder id, so each toggle can be
+// scheduled/cancelled independently without stacking duplicate timers.
+var reminderTimers = {};
+
+function cancelReminder(key) {
+  if (reminderTimers[key]) {
+    clearTimeout(reminderTimers[key]);
+    clearInterval(reminderTimers[key]);
+    delete reminderTimers[key];
+  }
+}
+
+function scheduleDailyReminder(key) {
+  cancelReminder(key);
+  var cfg = REMINDER_CONFIG[key];
+  if (!cfg) return;
   var now = new Date();
   var next = new Date();
-  next.setHours(hour, minute, 0, 0);
+  next.setHours(cfg.hour, cfg.minute, 0, 0);
   if (next <= now) next.setDate(next.getDate() + 1);
-  var delay = next - now;
-  setTimeout(function() {
-    sendNotification("Jotting AI Study Reminder", message);
-    // Schedule again for next day
-    setInterval(function() {
-      sendNotification("Jotting AI Study Reminder", message);
+  reminderTimers[key] = setTimeout(function fire() {
+    sendNotification(cfg.title, cfg.message);
+    reminderTimers[key] = setInterval(function() {
+      sendNotification(cfg.title, cfg.message);
     }, 24 * 60 * 60 * 1000);
-  }, delay);
+  }, next - now);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -352,7 +375,8 @@ function LibraryScreen({ notes, onNote, onDelete }) {
 }
 
 // ── VOICE RECORDING SCREEN ─────────────────────────────────────────────────
-function VoiceNoteScreen({ onBack, onSave }) {
+function VoiceNoteScreen({ onBack, onSave, recSettings }) {
+  recSettings = recSettings || { noise:true, autoTranscribe:true, speakerID:false, autoSave:false };
   var [isRecording, setIsRecording] = useState(false);
   var [isPaused, setIsPaused] = useState(false);
   var [elapsed, setElapsed] = useState(0);
@@ -432,6 +456,15 @@ function VoiceNoteScreen({ onBack, onSave }) {
   function startRecording(){
     var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if(!SR){setStatus("Please use Chrome browser!");return;}
+    // Best-effort: ask the browser for a noise-suppressed mic before the Speech API
+    // grabs its own audio access. The recognizer manages capture internally, so this
+    // won't transform the transcription itself, but it does apply real OS/browser-level
+    // noise suppression to the mic session and primes the permission early.
+    if(recSettings.noise && navigator.mediaDevices && navigator.mediaDevices.getUserMedia){
+      navigator.mediaDevices.getUserMedia({ audio: { noiseSuppression:true, echoCancellation:true } })
+        .then(function(stream){ stream.getTracks().forEach(function(t){ t.stop(); }); })
+        .catch(function(){});
+    }
     allTextRef.current=""; setTranscript(""); isActiveRef.current=true;
     setIsRecording(true); setIsPaused(false); setElapsed(0);
     timerRef.current = setInterval(function(){setElapsed(function(e){return e+1;});},1000);
@@ -442,7 +475,20 @@ function VoiceNoteScreen({ onBack, onSave }) {
   }
   function pauseRecording(){ isActiveRef.current=false; setIsPaused(true); sessionIdRef.current++; clearInterval(timerRef.current); try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){} setStatus("Paused"); }
   function resumeRecording(){ isActiveRef.current=true; setIsPaused(false); timerRef.current=setInterval(function(){setElapsed(function(e){return e+1;});},1000); var newId=sessionIdRef.current+1; sessionIdRef.current=newId; var r=createRecognition(allTextRef.current, newId); if(r){recognitionRef.current=r;try{r.start();}catch(e){}} setStatus("Resumed..."); }
-  function stopRecording(){ isActiveRef.current=false; setIsRecording(false); setIsPaused(false); sessionIdRef.current++; clearInterval(timerRef.current); try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){} setStatus("Recording complete"); }
+  function stopRecording(){
+    isActiveRef.current=false; setIsRecording(false); setIsPaused(false); sessionIdRef.current++; clearInterval(timerRef.current);
+    try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}
+    setStatus("Recording complete");
+    if(recSettings.autoSave){
+      // Small delay lets the final onresult/onend from the recognizer settle before we read it.
+      setTimeout(function(){
+        var finalText = allTextRef.current;
+        if(finalText && finalText.trim()){
+          onSave({id:Date.now(),title:title||("Voice Note - "+new Date().toLocaleDateString()),course,color:"#06B6D4",bg:"rgba(6,182,212,0.12)",date:"Today",tag:"Lecture",words:finalText.split(" ").length,preview:finalText.slice(0,100),content:finalText});
+        }
+      }, 500);
+    }
+  }
   useEffect(function(){ return function(){ isActiveRef.current=false; clearInterval(timerRef.current); try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}; }; },[]);
   function saveNote(){ if(!transcript.trim()){alert("Record something first!");return;} onSave({id:Date.now(),title:title||("Voice Note - "+new Date().toLocaleDateString()),course,color:"#06B6D4",bg:"rgba(6,182,212,0.12)",date:"Today",tag:"Lecture",words:transcript.split(" ").length,preview:transcript.slice(0,100),content:transcript}); }
 
@@ -451,7 +497,9 @@ function VoiceNoteScreen({ onBack, onSave }) {
       <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
         <button onClick={onBack} style={backBtn}>←</button>
         <span style={{ fontWeight:800,fontSize:16,color:C.text }}>Voice Recording</span>
-        <button onClick={saveNote} style={{ background:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:"#fff",border:"none",borderRadius:10,padding:"8px 18px",fontWeight:800,fontSize:14,cursor:"pointer" }}>Save</button>
+        {recSettings.autoSave
+          ? <span style={{ fontSize:11,fontWeight:700,color:C.green,background:"rgba(52,211,153,0.12)",borderRadius:99,padding:"6px 12px" }}>💾 Auto-saves on stop</span>
+          : <button onClick={saveNote} style={{ background:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:"#fff",border:"none",borderRadius:10,padding:"8px 18px",fontWeight:800,fontSize:14,cursor:"pointer" }}>Save</button>}
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:20 }}>
         <div style={{ background:"linear-gradient(135deg,rgba(52,211,153,0.1),rgba(6,182,212,0.1))",borderRadius:14,padding:"10px 16px",marginBottom:16,border:"1px solid rgba(52,211,153,0.2)",display:"flex",alignItems:"center",gap:10 }}>
@@ -542,6 +590,113 @@ function AIWriteScreen({ onBack, onSave }) {
         {!result&&!loading&&suggestions.map(function(s){return <button key={s} onClick={function(){setPrompt(s);generate(s);}} style={{ width:"100%",textAlign:"left",background:C.card,border:"1px solid "+C.border,borderRadius:12,padding:"12px 16px",color:C.soft,fontSize:13,cursor:"pointer",marginBottom:8,fontFamily:"inherit" }}>{s}</button>;})}
         {loading&&<div style={{ textAlign:"center",padding:"40px 20px" }}><div style={{ fontSize:48,animation:"spin 2s linear infinite" }}>✨</div><p style={{ color:C.muted }}>Writing your notes...</p></div>}
         {result&&<div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+C.border }}><textarea value={result} onChange={function(e){setResult(e.target.value);}} style={{ width:"100%",minHeight:280,background:"transparent",border:"none",color:C.text,fontSize:14,lineHeight:1.9,outline:"none",resize:"none",fontFamily:"inherit",boxSizing:"border-box" }} /></div>}
+      </div>
+    </div>
+  );
+}
+
+// ── SCAN DOC ──────────────────────────────────────────────────────────────────
+function ScanDocScreen({ onBack, onSave }) {
+  var [image, setImage] = useState(null);       // {dataUrl, base64, mediaType}
+  var [result, setResult] = useState("");
+  var [loading, setLoading] = useState(false);
+  var [error, setError] = useState("");
+  var [course, setCourse] = useState("General");
+  var fileInputRef = useRef(null);
+  var courses = ["General","PHY 101","MTH 101","COS 102","ENG 201","CHM 102"];
+
+  function handleFile(e){
+    var file = e.target.files && e.target.files[0];
+    if(!file) return;
+    setResult(""); setError("");
+    var reader = new FileReader();
+    reader.onload = function(){
+      var dataUrl = reader.result;
+      var base64 = dataUrl.split(",")[1];
+      setImage({ dataUrl: dataUrl, base64: base64, mediaType: file.type || "image/jpeg" });
+    };
+    reader.readAsDataURL(file);
+  }
+
+  async function extractText(){
+    if(!image) return;
+    setLoading(true); setError(""); setResult("");
+    try{
+      var res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type":"application/json", "x-api-key":CLAUDE_KEY, "anthropic-version":"2023-06-01" },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 1200,
+          messages: [{
+            role: "user",
+            content: [
+              { type:"image", source:{ type:"base64", media_type:image.mediaType, data:image.base64 } },
+              { type:"text", text:"Transcribe all readable text from this document/page image into clean, well-organized student notes. Keep headers, bullet points and structure where relevant. Return only the notes text, no preamble." }
+            ]
+          }]
+        })
+      });
+      var data = await res.json();
+      if(data && data.content && data.content[0] && data.content[0].text){
+        setResult(data.content[0].text);
+      } else {
+        throw new Error("no content");
+      }
+    }catch(e){
+      setError("Couldn't reach Claude (check the API key in the code, or your connection). Add your Claude API key to CLAUDE_KEY to enable real scanning.");
+    }
+    setLoading(false);
+  }
+
+  function saveScanned(){
+    if(!result.trim()) return;
+    onSave({ id:Date.now(), title:"Scanned Doc - "+new Date().toLocaleDateString(), course, color:"#F59E0B", bg:"rgba(245,158,11,0.12)", date:"Today", tag:"Lecture", words:result.split(" ").length, preview:result.slice(0,100), content:result });
+  }
+
+  return (
+    <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
+      <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
+        <button onClick={onBack} style={backBtn}>←</button>
+        <span style={{ fontWeight:800,fontSize:16,color:C.text }}>Scan Doc</span>
+        {result&&<button onClick={saveScanned} style={{ background:"linear-gradient(135deg,#F59E0B,#A78BFA)",color:"#fff",border:"none",borderRadius:10,padding:"8px 16px",fontWeight:800,fontSize:13,cursor:"pointer" }}>Save</button>}
+      </div>
+      <div style={{ flex:1,overflowY:"auto",padding:20 }}>
+        <input ref={fileInputRef} type="file" accept="image/*" capture="environment" onChange={handleFile} style={{ display:"none" }} />
+
+        {!image && (
+          <div>
+            <div onClick={function(){fileInputRef.current&&fileInputRef.current.click();}} style={{ background:C.card,border:"2px dashed "+C.border,borderRadius:16,padding:"48px 20px",textAlign:"center",cursor:"pointer" }}>
+              <div style={{ fontSize:44,marginBottom:12 }}>📷</div>
+              <div style={{ fontWeight:700,fontSize:15,color:C.text,marginBottom:4 }}>Tap to scan a page</div>
+              <div style={{ fontSize:12,color:C.muted }}>Take a photo or upload an image of your notes/textbook</div>
+            </div>
+          </div>
+        )}
+
+        {image && !result && !loading && (
+          <div>
+            <img src={image.dataUrl} alt="scanned" style={{ width:"100%",borderRadius:14,marginBottom:14,border:"1px solid "+C.border }} />
+            <div style={{ display:"flex",gap:10 }}>
+              <button onClick={function(){setImage(null);setResult("");setError("");}} style={{ flex:1,background:C.card2,color:C.muted,border:"none",borderRadius:12,padding:"12px",fontWeight:700,cursor:"pointer" }}>Retake</button>
+              <button onClick={extractText} style={{ flex:2,background:"linear-gradient(135deg,#F59E0B,#A78BFA)",color:"#fff",border:"none",borderRadius:12,padding:"12px",fontWeight:800,cursor:"pointer" }}>✨ Extract Text</button>
+            </div>
+          </div>
+        )}
+
+        {loading && <div style={{ textAlign:"center",padding:"40px 20px" }}><div style={{ fontSize:48,animation:"spin 2s linear infinite" }}>📄</div><p style={{ color:C.muted }}>Reading your document...</p></div>}
+
+        {error && <div style={{ background:"rgba(248,113,113,0.1)",border:"1px solid rgba(248,113,113,0.3)",borderRadius:12,padding:14,color:C.red,fontSize:13,marginTop:12 }}>{error}</div>}
+
+        {result && (
+          <div>
+            <div style={{ display:"flex",gap:8,marginBottom:14,flexWrap:"wrap" }}>{courses.map(function(c){return <button key={c} onClick={function(){setCourse(c);}} style={{ padding:"6px 14px",borderRadius:99,border:"2px solid",borderColor:course===c?C.amber:C.border,background:course===c?C.amber:C.card,color:course===c?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{c}</button>;})}</div>
+            <div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+C.border }}>
+              <textarea value={result} onChange={function(e){setResult(e.target.value);}} style={{ width:"100%",minHeight:280,background:"transparent",border:"none",color:C.text,fontSize:14,lineHeight:1.9,outline:"none",resize:"none",fontFamily:"inherit",boxSizing:"border-box" }} />
+            </div>
+            <button onClick={function(){setImage(null);setResult("");setError("");}} style={{ width:"100%",marginTop:10,background:"none",border:"1px solid "+C.border,borderRadius:12,padding:"10px",color:C.muted,fontWeight:700,cursor:"pointer" }}>Scan Another</button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -651,14 +806,11 @@ function AIScreen() {
 }
 
 // ── SETTINGS ──────────────────────────────────────────────────────────────────
-function SettingsScreen({ notifEnabled, setNotifEnabled }) {
+function SettingsScreen({ notifEnabled, setNotifEnabled, notifs, setNotifs, recSettings, setRecSettings }) {
   var [openSection, setOpenSection] = useState(null);
   var [lang, setLang] = useState("English");
   var [aiModel, setAiModel] = useState("Claude");
   var [aiStyle, setAiStyle] = useState("Academic");
-  var [recQuality, setRecQuality] = useState("High");
-  var [notifs, setNotifs] = useState({study:true,assignment:false,daily:true,recording:false});
-  var [recSettings, setRecSettings] = useState({noise:true,autoTranscribe:true,speakerID:false,autoSave:true});
   var [privacy, setPrivacy] = useState({fingerprint:false,face:false,pin:false,autoLock:true,hiddenFolder:false,encrypt:false});
   var [editProfile, setEditProfile] = useState(false);
   var [profile, setProfile] = useState({name:"Samuel",email:"samuel@gmail.com",username:"@samuel_dev"});
@@ -696,8 +848,11 @@ function SettingsScreen({ notifEnabled, setNotifEnabled }) {
 
         <Section id="notif" icon="🔔" title="Notifications" color="#A78BFA">
           <div style={{ marginTop:12 }}>
-            <Row icon="📳" label="Enable Notifications" sub="Allow push notifications" right={<Toggle value={notifEnabled} onChange={function(v){ setNotifEnabled(v); if(v){ requestNotificationPermission(); scheduleStudyReminder(8,0,"Good morning! Time to study and take notes!"); scheduleStudyReminder(20,0,"Evening study reminder - review today's notes!"); sendNotification("Notifications Enabled!","You will get study reminders from Jotting AI"); } }} color={C.purple} />} />
-            {[["📚","study","Study Reminders","Remind you to study daily"],["📋","assignment","Assignment Reminder","Due date alerts"],["🎯","daily","Daily Goal Reminder","Track daily goals"],["🎙️","recording","Recording Reminder","Remind to record lectures"]].map(function(item){return <Row key={item[1]} icon={item[0]} label={item[2]} sub={item[3]} right={<Toggle value={notifs[item[1]]} onChange={function(v){setNotifs(function(p){return {...p,[item[1]]:v};});}} color={C.purple} />} />;}) }
+            <Row icon="📳" label="Enable Notifications" sub="Allow push notifications" right={<Toggle value={notifEnabled} onChange={function(v){ setNotifEnabled(v); if(v){ requestNotificationPermission(); sendNotification("Notifications Enabled!","You'll get reminders based on what's toggled below"); } }} color={C.purple} />} />
+            <div style={{ opacity:notifEnabled?1:0.4,pointerEvents:notifEnabled?"auto":"none" }}>
+              {[["📚","study","Study Reminders","Daily at 9:00 AM"],["📋","assignment","Assignment Reminder","Daily check-in at 6:00 PM"],["🎯","daily","Daily Goal Reminder","Daily at 8:00 PM"],["🎙️","recording","Recording Reminder","Daily at 7:30 AM"]].map(function(item){return <Row key={item[1]} icon={item[0]} label={item[2]} sub={item[3]} right={<Toggle value={notifs[item[1]]} onChange={function(v){setNotifs(function(p){return {...p,[item[1]]:v};});}} color={C.purple} />} />;}) }
+            </div>
+            {!notifEnabled&&<div style={{ fontSize:11,color:C.muted,marginTop:8 }}>Turn on "Enable Notifications" above to activate any of these.</div>}
           </div>
         </Section>
 
@@ -707,8 +862,18 @@ function SettingsScreen({ notifEnabled, setNotifEnabled }) {
 
         <Section id="rec" icon="🎤" title="Recording Settings" color="#06B6D4">
           <div style={{ marginTop:12 }}>
-            <div style={{ marginBottom:12 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>RECORDING QUALITY</div><div style={{ display:"flex",gap:8 }}>{["Low","Medium","High"].map(function(q){return <button key={q} onClick={function(){setRecQuality(q);}} style={{ flex:1,padding:"8px",borderRadius:10,border:"2px solid",borderColor:recQuality===q?C.cyan:C.border,background:recQuality===q?C.cyan:C.card,color:recQuality===q?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{q}</button>;})}</div></div>
-            {[["🔇","noise","Noise Reduction","Filter background noise"],["📝","autoTranscribe","Auto Transcription","Google free speech API"],["👥","speakerID","Speaker Identification","Identify different speakers"],["💾","autoSave","Auto Save Recording","Save recordings automatically"]].map(function(item){return <Row key={item[1]} icon={item[0]} label={item[2]} sub={item[3]} right={<Toggle value={recSettings[item[1]]} onChange={function(v){setRecSettings(function(p){return {...p,[item[1]]:v};});}} color={C.cyan} />} />;}) }
+            <div style={{ marginBottom:4,opacity:0.5 }}>
+              <div style={{ display:"flex",alignItems:"center",gap:6,marginBottom:8 }}><span style={{ fontSize:12,color:C.muted,fontWeight:600 }}>RECORDING QUALITY</span><span style={{ fontSize:9,fontWeight:700,color:C.amber,background:"rgba(245,158,11,0.15)",borderRadius:99,padding:"2px 7px" }}>COMING SOON</span></div>
+              <div style={{ display:"flex",gap:8 }}>{["Low","Medium","High"].map(function(q){return <div key={q} style={{ flex:1,padding:"8px",borderRadius:10,border:"2px solid "+C.border,background:C.card,color:C.muted,fontSize:13,fontWeight:700,textAlign:"center" }}>{q}</div>;})}</div>
+              <div style={{ fontSize:11,color:C.muted,marginTop:6 }}>Needs real audio-file recording, which isn't built yet — right now the app transcribes live speech directly and doesn't save an audio file to apply quality to.</div>
+            </div>
+            <div style={{ height:12 }} />
+            <Row icon="🔇" label="Noise Reduction" sub="Requests a noise-suppressed mic when you hit record" right={<Toggle value={recSettings.noise} onChange={function(v){setRecSettings(function(p){return {...p,noise:v};});}} color={C.cyan} />} />
+            <Row icon="📝" label="Auto Transcription" sub="Google free speech API" right={<Toggle value={recSettings.autoTranscribe} onChange={function(v){setRecSettings(function(p){return {...p,autoTranscribe:v};});}} color={C.cyan} />} />
+            <div style={{ opacity:0.5 }}>
+              <Row icon="👥" label="Speaker Identification" sub="Needs a paid diarization API — not available on the free tier yet" right={<span style={{ fontSize:9,fontWeight:700,color:C.amber,background:"rgba(245,158,11,0.15)",borderRadius:99,padding:"3px 8px" }}>COMING SOON</span>} />
+            </div>
+            <Row icon="💾" label="Auto Save Recording" sub="Save automatically when you stop, no tap needed" right={<Toggle value={recSettings.autoSave} onChange={function(v){setRecSettings(function(p){return {...p,autoSave:v};});}} color={C.cyan} />} />
           </div>
         </Section>
 
@@ -756,12 +921,21 @@ function SettingsScreen({ notifEnabled, setNotifEnabled }) {
 }
 
 // ── MAIN APP ──────────────────────────────────────────────────────────────────
+function loadStored(key, fallback) {
+  try {
+    var raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch (e) { return fallback; }
+}
+
 export default function App() {
   var [notes, setNotes] = useState(INIT_NOTES);
   var [screen, setScreen] = useState("home");
   var [activeNote, setActiveNote] = useState(null);
   var [tab, setTab] = useState("home");
-  var [notifEnabled, setNotifEnabled] = useState(false);
+  var [notifEnabled, setNotifEnabled] = useState(function(){ return loadStored("jotting_notifEnabled", false); });
+  var [notifs, setNotifs] = useState(function(){ return loadStored("jotting_notifs", {study:true,assignment:false,daily:true,recording:false}); });
+  var [recSettings, setRecSettings] = useState(function(){ return loadStored("jotting_recSettings", {noise:true,autoTranscribe:true,speakerID:false,autoSave:false}); });
 
   useEffect(function(){
     // Request notification permission on first load
@@ -771,6 +945,22 @@ export default function App() {
       }, 3000);
     }
   }, []);
+
+  // Persist settings so they survive a reload, and actually (de)schedule each
+  // reminder for real whenever the master switch or an individual toggle changes.
+  useEffect(function(){ try{ localStorage.setItem("jotting_notifEnabled", JSON.stringify(notifEnabled)); }catch(e){} }, [notifEnabled]);
+  useEffect(function(){ try{ localStorage.setItem("jotting_notifs", JSON.stringify(notifs)); }catch(e){} }, [notifs]);
+  useEffect(function(){ try{ localStorage.setItem("jotting_recSettings", JSON.stringify(recSettings)); }catch(e){} }, [recSettings]);
+
+  useEffect(function(){
+    Object.keys(REMINDER_CONFIG).forEach(function(key){
+      if (notifEnabled && notifs[key]) {
+        scheduleDailyReminder(key);
+      } else {
+        cancelReminder(key);
+      }
+    });
+  }, [notifEnabled, notifs]);
 
   function go(s,t){ setScreen(s); if(t)setTab(t); }
   function saveNote(note){ setNotes(function(n){return [note,...n];}); go("home","home"); sendNotification("Note Saved!","Your note has been saved to Jotting AI"); }
@@ -790,15 +980,16 @@ export default function App() {
       <style>{"\n@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');\n*{box-sizing:border-box;font-family:'DM Sans',sans-serif;}\nbody{margin:0;background:#06081A;}\nbutton,textarea,input{font-family:'DM Sans',sans-serif;}\n::-webkit-scrollbar{width:0;}\ninput::placeholder,textarea::placeholder{color:#4B5563;}\n@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}\n@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0.4)}50%{box-shadow:0 0 0 20px rgba(239,68,68,0)}}\n@keyframes wv{from{transform:scaleY(0.3)}to{transform:scaleY(1.2)}}\n@keyframes dot{from{opacity:0.3;transform:scale(0.7)}to{opacity:1;transform:scale(1)}}\n"}</style>
       <div style={{ width:"100%", maxWidth:400, minHeight:"calc(100vh - 40px)", background:C.bg, borderRadius:36, overflow:"hidden", display:"flex", flexDirection:"column", boxShadow:"0 24px 80px rgba(6,182,212,0.12), 0 0 0 1px rgba(255,255,255,0.06)" }}>
         <div style={{ flex:1, display:"flex", flexDirection:"column", overflowY:"auto", minHeight:0 }}>
-          {screen==="home"&&<HomeScreen notes={notes} onNote={function(n){setActiveNote(n);go("detail");}} onVoice={function(){go("voice","new");}} onDraw={function(){go("draw");}} onAIWrite={function(){go("aiwrite");}} onScan={function(){alert("Camera scan coming soon!");}} />}
+          {screen==="home"&&<HomeScreen notes={notes} onNote={function(n){setActiveNote(n);go("detail");}} onVoice={function(){go("voice","new");}} onDraw={function(){go("draw");}} onAIWrite={function(){go("aiwrite");}} onScan={function(){go("scan");}} />}
           {screen==="library"&&<LibraryScreen notes={notes} onNote={function(n){setActiveNote(n);go("detail");}} onDelete={deleteNote} />}
           {screen==="dashboard"&&<DashboardScreen notes={notes} />}
           {screen==="detail"&&activeNote&&<NoteDetail note={activeNote} onBack={function(){go(tab==="library"?"library":"home",tab);}} onDelete={deleteNote} />}
-          {screen==="voice"&&<VoiceNoteScreen onBack={function(){go("home","home");}} onSave={saveNote} />}
+          {screen==="voice"&&<VoiceNoteScreen onBack={function(){go("home","home");}} onSave={saveNote} recSettings={recSettings} />}
           {screen==="draw"&&<DrawScreen onBack={function(){go("home","home");}} />}
           {screen==="aiwrite"&&<AIWriteScreen onBack={function(){go("home","home");}} onSave={saveNote} />}
+          {screen==="scan"&&<ScanDocScreen onBack={function(){go("home","home");}} onSave={saveNote} />}
           {screen==="ai"&&<AIScreen />}
-          {screen==="settings"&&<SettingsScreen notifEnabled={notifEnabled} setNotifEnabled={setNotifEnabled} />}
+          {screen==="settings"&&<SettingsScreen notifEnabled={notifEnabled} setNotifEnabled={setNotifEnabled} notifs={notifs} setNotifs={setNotifs} recSettings={recSettings} setRecSettings={setRecSettings} />}
         </div>
         <div style={{ background:C.card2, borderTop:"1px solid "+C.border, padding:"10px 10px 16px", display:"flex", justifyContent:"space-around", alignItems:"center", flexShrink:0 }}>
           {NAV.map(function(item){
