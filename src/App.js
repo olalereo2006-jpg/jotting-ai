@@ -7,7 +7,48 @@ const C = {
   red: "#F87171", text: "#F1F5F9", muted: "#64748B", soft: "#94A3B8",
 };
 
-const CLAUDE_KEY = "YOUR_CLAUDE_KEY_HERE";
+const GEMINI_KEY = "AQ.Ab8RN6IbBnG7ziM4LHDj1Cuh8qr_uo2XKtRH3XxWnFdGA2zoww";
+const GEMINI_MODEL = "gemini-2.5-flash";
+
+// Shared helpers for calling Google's free Gemini API (text-only and vision).
+async function callGeminiText(promptText, maxTokens){
+  var res = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":generateContent?key="+GEMINI_KEY,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: promptText }] }],
+        generationConfig: { maxOutputTokens: maxTokens || 800 }
+      })
+    }
+  );
+  var data = await res.json();
+  var text = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+  if(!text){ throw new Error((data && data.error && data.error.message) || "No response from Gemini"); }
+  return text;
+}
+
+async function callGeminiVision(base64, mediaType, promptText, maxTokens){
+  var res = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":generateContent?key="+GEMINI_KEY,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [
+          { inline_data: { mime_type: mediaType, data: base64 } },
+          { text: promptText }
+        ] }],
+        generationConfig: { maxOutputTokens: maxTokens || 1200 }
+      })
+    }
+  );
+  var data = await res.json();
+  var text = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+  if(!text){ throw new Error((data && data.error && data.error.message) || "No response from Gemini"); }
+  return text;
+}
 
 const INIT_NOTES = [
   { id: 1, title: "Physics: Kinematics", course: "PHY 101", color: "#06B6D4", bg: "rgba(6,182,212,0.12)", date: "Today", tag: "Lecture", words: 120, preview: "Kinematics is the study of motion. v = u + at is the fundamental equation.", content: "Kinematics is the study of motion without considering forces.\n\nKey Equations:\nv = u + at\ns = ut + half at squared\n\nVelocity is the rate of change of displacement.\nAcceleration is the rate of change of velocity." },
@@ -573,7 +614,7 @@ function AIWriteScreen({ onBack, onSave }) {
   var [prompt, setPrompt] = useState(""); var [result, setResult] = useState(""); var [loading, setLoading] = useState(false); var [course, setCourse] = useState("General");
   var courses = ["General","PHY 101","MTH 101","COS 102","ENG 201","CHM 102"];
   var suggestions = ["Summarize Newton laws of motion","Write notes on Data Structures","Explain Organic Chemistry basics","Create outline for Kinematics"];
-  async function generate(text){ var q=text||prompt; if(!q.trim())return; setLoading(true); setResult(""); try{ var res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":CLAUDE_KEY,"anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:800,messages:[{role:"user",content:"Write clear structured student notes with bullet points and headers for: "+q}]})}); var data=await res.json(); setResult(data.content[0].text); }catch(e){ setResult("Notes on: "+q+"\n\nKey Point 1: Important definition\nKey Point 2: Another point\n\nAdd Claude API key for real AI!"); } setLoading(false); }
+  async function generate(text){ var q=text||prompt; if(!q.trim())return; setLoading(true); setResult(""); try{ var out = await callGeminiText("Write clear structured student notes with bullet points and headers for: "+q, 800); setResult(out); }catch(e){ setResult("Notes on: "+q+"\n\nKey Point 1: Important definition\nKey Point 2: Another point\n\nAdd your Gemini API key to enable real AI!"); } setLoading(false); }
   return (
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
       <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
@@ -622,29 +663,15 @@ function ScanDocScreen({ onBack, onSave }) {
     if(!image) return;
     setLoading(true); setError(""); setResult("");
     try{
-      var res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type":"application/json", "x-api-key":CLAUDE_KEY, "anthropic-version":"2023-06-01" },
-        body: JSON.stringify({
-          model: "claude-haiku-4-5-20251001",
-          max_tokens: 1200,
-          messages: [{
-            role: "user",
-            content: [
-              { type:"image", source:{ type:"base64", media_type:image.mediaType, data:image.base64 } },
-              { type:"text", text:"Transcribe all readable text from this document/page image into clean, well-organized student notes. Keep headers, bullet points and structure where relevant. Return only the notes text, no preamble." }
-            ]
-          }]
-        })
-      });
-      var data = await res.json();
-      if(data && data.content && data.content[0] && data.content[0].text){
-        setResult(data.content[0].text);
-      } else {
-        throw new Error("no content");
-      }
+      var out = await callGeminiVision(
+        image.base64,
+        image.mediaType,
+        "Transcribe all readable text from this document/page image into clean, well-organized student notes. Keep headers, bullet points and structure where relevant. Return only the notes text, no preamble.",
+        1200
+      );
+      setResult(out);
     }catch(e){
-      setError("Couldn't reach Claude (check the API key in the code, or your connection). Add your Claude API key to CLAUDE_KEY to enable real scanning.");
+      setError("Couldn't reach Gemini (check the API key in the code, or your connection). Add your Gemini API key to GEMINI_KEY to enable real scanning.");
     }
     setLoading(false);
   }
@@ -705,7 +732,7 @@ function ScanDocScreen({ onBack, onSave }) {
 // ── NOTE DETAIL ───────────────────────────────────────────────────────────────
 function NoteDetail({ note, onBack, onDelete }) {
   var [view, setView] = useState("note"); var [summary, setSummary] = useState(null); var [quiz, setQuiz] = useState([]); var [quizIdx, setQuizIdx] = useState(0); var [selected, setSelected] = useState(null); var [score, setScore] = useState(0); var [quizDone, setQuizDone] = useState(false); var [loading, setLoading] = useState(false);
-  async function callAI(p){ var res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":CLAUDE_KEY,"anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:800,messages:[{role:"user",content:p}]})}); var data=await res.json(); return data.content[0].text; }
+  async function callAI(p){ return await callGeminiText(p, 800); }
   async function generateSummary(){ setLoading(true); setView("summary"); try{ var raw=await callAI("Summarize these notes. Return ONLY JSON: {\"summary\":\"...\",\"keyPoints\":[\"...\"],\"tags\":[\"...\"]} NOTES: "+note.content); setSummary(JSON.parse(raw.split("```json").join("").split("```").join("").trim())); }catch(e){ setSummary({summary:"This covers "+note.title+".",keyPoints:["Review definitions","Practice problems"],tags:[note.course,note.tag]}); } setLoading(false); }
   async function generateQuiz(){ setLoading(true); setView("quiz"); try{ var raw=await callAI("Create 5 MCQ from these notes. Return ONLY JSON: [{\"question\":\"...\",\"options\":[\"A\",\"B\",\"C\",\"D\"],\"answer\":0}] NOTES: "+note.content); var q=JSON.parse(raw.split("```json").join("").split("```").join("").trim()); setQuiz(q); setQuizIdx(0); setSelected(null); setScore(0); setQuizDone(false); }catch(e){ setQuiz([{question:"What is the main topic?",options:[note.course,"History","Math","Art"],answer:0}]); } setLoading(false); }
   function pick(i){ if(selected!==null)return; setSelected(i); if(i===quiz[quizIdx].answer)setScore(function(s){return s+1;}); setTimeout(function(){if(quizIdx+1<quiz.length){setQuizIdx(function(q){return q+1;});setSelected(null);}else setQuizDone(true);},900); }
@@ -788,7 +815,7 @@ function AIScreen() {
   var [messages, setMessages] = useState([{role:"ai",text:"Hi Samuel! 👋 I am your AI study assistant. Ask me to summarize notes, explain concepts, or create study plans!"}]);
   var [input, setInput] = useState(""); var [loading, setLoading] = useState(false); var endRef = useRef(null);
   useEffect(function(){endRef.current&&endRef.current.scrollIntoView({behavior:"smooth"});},[messages]);
-  async function send(){ if(!input.trim())return; var q=input.trim(); setInput(""); setMessages(function(m){return [...m,{role:"user",text:q}];}); setLoading(true); try{ var res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":CLAUDE_KEY,"anthropic-version":"2023-06-01"},body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:600,messages:[{role:"user",content:"You are a helpful AI study assistant for a Nigerian university student named Samuel. Be concise and helpful: "+q}]})}); var data=await res.json(); setMessages(function(m){return [...m,{role:"ai",text:data.content[0].text}];}); }catch(e){ setMessages(function(m){return [...m,{role:"ai",text:"Add your Claude API key to enable real AI!"}];}); } setLoading(false); }
+  async function send(){ if(!input.trim())return; var q=input.trim(); setInput(""); setMessages(function(m){return [...m,{role:"user",text:q}];}); setLoading(true); try{ var out = await callGeminiText("You are a helpful AI study assistant for a Nigerian university student named Samuel. Be concise and helpful: "+q, 600); setMessages(function(m){return [...m,{role:"ai",text:out}];}); }catch(e){ setMessages(function(m){return [...m,{role:"ai",text:"Add your Gemini API key to enable real AI!"}];}); } setLoading(false); }
   return (
     <div style={{ flex:1,display:"flex",flexDirection:"column",background:C.bg }}>
       <div style={{ background:C.card,padding:"16px 20px",borderBottom:"1px solid "+C.border }}><div style={{ display:"flex",alignItems:"center",gap:10 }}><div style={{ width:40,height:40,borderRadius:12,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20 }}>🤖</div><div><div style={{ fontWeight:800,fontSize:16,color:C.text }}>AI Assistant</div><div style={{ fontSize:11,color:C.green,fontWeight:600 }}>Claude AI</div></div></div></div>
