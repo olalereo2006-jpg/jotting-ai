@@ -26,7 +26,7 @@ const C = {
   red: "#F87171", text: "#F1F5F9", muted: "#64748B", soft: "#94A3B8",
 };
 
-const GEMINI_KEY = "AQ.Ab8RN6IORW0Tq4W7RsdfTpwFaO_X7NJ83_J-54taxMdfA1_cMw";
+const GEMINI_KEY = "";
 const GEMINI_MODEL = "gemini-2.5-flash";
 
 async function callGeminiText(promptText, maxTokens) {
