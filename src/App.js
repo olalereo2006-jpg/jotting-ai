@@ -662,7 +662,7 @@ function SettingsScreen({ user, onLogout }) {
               {user&&user.photoURL?<img src={user.photoURL} alt="profile" style={{ width:60,height:60,objectFit:"cover" }}/>:"👤"}
             </div>
             <div style={{ flex:1 }}>
-              <div style={{ fontWeight:800,fontSize:18,color:C.text }}>{user&&user.displayName||"Student"}</div>
+              <div style={{ fontWeight:800,fontSize:18,color:C.text }}>{(user&&user.displayName)||"Student"}</div>
               <div style={{ fontSize:13,color:C.muted }}>{user&&user.email}</div>
               <div style={{ fontSize:11,color:C.green,marginTop:2 }}>✅ Verified Account</div>
             </div>
@@ -727,8 +727,8 @@ function SettingsScreen({ user, onLogout }) {
 
         <Section id="account" icon="👤" title="Account" color="#34D399">
           <div style={{ marginTop:12 }}>
-            <Row icon="✉️" label="Email" sub={user&&user.email||"Not logged in"}/>
-            <Row icon="👤" label="Display Name" sub={user&&user.displayName||"Not set"}/>
+            <Row icon="✉️" label="Email" sub={(user&&user.email)||"Not logged in"}/>
+            <Row icon="👤" label="Display Name" sub={(user&&user.displayName)||"Not set"}/>
             <Row icon="✅" label="Email Verified" sub={user&&user.emailVerified?"Your email is verified":"Email not verified yet"} right={<span style={{ fontSize:13,color:user&&user.emailVerified?C.green:C.amber }}>{user&&user.emailVerified?"✓":"Pending"}</span>}/>
             <div onClick={onLogout} style={{ display:"flex",alignItems:"center",justifyContent:"center",padding:"14px",marginTop:12,background:"rgba(248,113,113,0.1)",borderRadius:12,cursor:"pointer",border:"1px solid "+C.red+"30" }}>
               <span style={{ fontSize:14,fontWeight:700,color:C.red }}>🚪 Logout</span>
