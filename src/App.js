@@ -310,17 +310,87 @@ function LoginScreen({ onLogin }) {
 // ── VOICE SCREEN ──────────────────────────────────────────────────────────────
 function VoiceNoteScreen({ onBack, onSave }) {
   var [isRecording,setIsRecording]=useState(false);var [isPaused,setIsPaused]=useState(false);var [elapsed,setElapsed]=useState(0);var [title,setTitle]=useState("");var [courses,setCourses]=useState(["General"]);var [course,setCourse]=useState("General");var [status,setStatus]=useState("Tap microphone to start recording");var [showAddCourse,setShowAddCourse]=useState(false);var [newCourse,setNewCourse]=useState("");var [transcript,setTranscript]=useState("");
-  var timerRef=useRef(null);var recognitionRef=useRef(null);var allTextRef=useRef("");var isActiveRef=useRef(false);
+  var timerRef=useRef(null);var recognitionRef=useRef(null);var allTextRef=useRef("");var isActiveRef=useRef(false);var sessionIdRef=useRef(0);
   var fmt=function(s){return String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0");};
   function addCourse(){var c=newCourse.trim().toUpperCase();if(!c||courses.includes(c))return;setCourses(function(p){return[...p,c];});setNewCourse("");setShowAddCourse(false);}
   function removeCourse(c){if(c==="General")return;setCourses(function(p){return p.filter(function(x){return x!==c;});});if(course===c)setCourse("General");}
-  function createRecognition(baseText){var SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR)return null;var r=new SR();r.continuous=true;r.interimResults=true;r.lang="en-US";var sessionNew="";r.onresult=function(e){var final="";var interim="";for(var i=0;i<e.results.length;i++){if(e.results[i].isFinal){final+=e.results[i][0].transcript+" ";}else{interim=e.results[i][0].transcript;}}sessionNew=final;allTextRef.current=baseText+sessionNew;setTranscript(baseText+sessionNew+interim);setStatus("Listening... speak clearly");};r.onerror=function(e){if(e.error==="no-speech"||e.error==="aborted")return;};r.onend=function(){if(isActiveRef.current){var newBase=baseText+sessionNew;allTextRef.current=newBase;setTimeout(function(){if(isActiveRef.current){var next=createRecognition(newBase);if(next){recognitionRef.current=next;try{next.start();}catch(err){}}}},400);}else{setStatus("Recording complete");}};return r;}
-  function startRecording(){var SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){setStatus("Please use Chrome browser!");return;}allTextRef.current="";setTranscript("");isActiveRef.current=true;setIsRecording(true);setIsPaused(false);setElapsed(0);timerRef.current=setInterval(function(){setElapsed(function(e){return e+1;});},1000);var r=createRecognition("");if(r){recognitionRef.current=r;try{r.start();}catch(e){}}}
-  function pauseRecording(){isActiveRef.current=false;setIsPaused(true);clearInterval(timerRef.current);try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}setStatus("Paused");}
-  function resumeRecording(){isActiveRef.current=true;setIsPaused(false);timerRef.current=setInterval(function(){setElapsed(function(e){return e+1;});},1000);var r=createRecognition(allTextRef.current);if(r){recognitionRef.current=r;try{r.start();}catch(e){}}setStatus("Resumed...");}
-  function stopRecording(){isActiveRef.current=false;setIsRecording(false);setIsPaused(false);clearInterval(timerRef.current);try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}setStatus("Recording complete");}
+  function mergeNoDupe(base,addition){
+    if(!base) return addition;
+    if(!addition) return base;
+    var baseWords=base.trim().split(/\s+/);
+    var addWords=addition.trim().split(/\s+/);
+    var maxOverlap=Math.min(6,baseWords.length,addWords.length);
+    for(var len=maxOverlap;len>0;len--){
+      var tail=baseWords.slice(baseWords.length-len).join(" ").toLowerCase();
+      var head=addWords.slice(0,len).join(" ").toLowerCase();
+      if(tail===head){ return base+" "+addWords.slice(len).join(" "); }
+    }
+    return base+" "+addition;
+  }
+  function createRecognition(baseText,sessionId){
+    var SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR)return null;
+    var r=new SR();r.continuous=true;r.interimResults=true;r.lang="en-US";
+    var sessionNew="";
+    r.onresult=function(e){
+      if(sessionIdRef.current!==sessionId) return;
+      var final="";var interim="";
+      for(var i=e.resultIndex;i<e.results.length;i++){
+        if(e.results[i].isFinal){ final+=e.results[i][0].transcript+" "; }
+        else{ interim+=e.results[i][0].transcript; }
+      }
+      if(final){ sessionNew=mergeNoDupe(sessionNew,final); }
+      var combined=mergeNoDupe(baseText,sessionNew);
+      allTextRef.current=combined;
+      setTranscript((combined+" "+interim).replace(/\s+/g," ").trim());
+      setStatus("Listening... speak clearly");
+    };
+    r.onerror=function(e){ if(e.error==="no-speech"||e.error==="aborted")return; };
+    r.onend=function(){
+      if(sessionIdRef.current!==sessionId) return;
+      if(isActiveRef.current){
+        var newBase=mergeNoDupe(baseText,sessionNew);
+        allTextRef.current=newBase;
+        setTimeout(function(){
+          if(isActiveRef.current&&sessionIdRef.current===sessionId){
+            var newId=sessionId+1;
+            sessionIdRef.current=newId;
+            var next=createRecognition(newBase,newId);
+            if(next){ recognitionRef.current=next; try{next.start();}catch(err){} }
+          }
+        },300);
+      } else { setStatus("Recording complete"); }
+    };
+    return r;
+  }
+  function startRecording(){
+    var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+    if(!SR){setStatus("Please use Chrome browser!");return;}
+    allTextRef.current="";setTranscript("");isActiveRef.current=true;
+    setIsRecording(true);setIsPaused(false);setElapsed(0);
+    timerRef.current=setInterval(function(){setElapsed(function(e){return e+1;});},1000);
+    var newId=sessionIdRef.current+1;
+    sessionIdRef.current=newId;
+    var r=createRecognition("",newId);
+    if(r){ recognitionRef.current=r; try{r.start();}catch(e){} }
+  }
+  function pauseRecording(){isActiveRef.current=false;setIsPaused(true);sessionIdRef.current++;clearInterval(timerRef.current);try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}setStatus("Paused");}
+  function resumeRecording(){
+    isActiveRef.current=true;setIsPaused(false);
+    timerRef.current=setInterval(function(){setElapsed(function(e){return e+1;});},1000);
+    var newId=sessionIdRef.current+1;
+    sessionIdRef.current=newId;
+    var r=createRecognition(allTextRef.current,newId);
+    if(r){ recognitionRef.current=r; try{r.start();}catch(e){} }
+    setStatus("Resumed...");
+  }
+  function stopRecording(){isActiveRef.current=false;setIsRecording(false);setIsPaused(false);sessionIdRef.current++;clearInterval(timerRef.current);try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}setStatus("Recording complete");}
   useEffect(function(){return function(){isActiveRef.current=false;clearInterval(timerRef.current);try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}};}, []);
-  function saveNote(){if(!transcript.trim()){alert("Record something first!");return;}onSave({id:Date.now(),title:title||("Voice Note - "+new Date().toLocaleDateString()),course,color:"#06B6D4",bg:"rgba(6,182,212,0.12)",date:"Today",tag:"Lecture",words:transcript.split(" ").length,preview:transcript.slice(0,100),content:transcript});}
+  function saveNote(){
+    if(!transcript.trim()){alert("Record something first!");return;}
+    try{
+      onSave({id:Date.now(),title:title||("Voice Note - "+new Date().toLocaleDateString()),course,color:"#06B6D4",bg:"rgba(6,182,212,0.12)",date:"Today",tag:"Lecture",words:transcript.split(" ").length,preview:transcript.slice(0,100),content:transcript});
+    }catch(e){ alert("Couldn't save the note — check your connection and try again."); }
+  }
   return(
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
       <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
@@ -329,10 +399,6 @@ function VoiceNoteScreen({ onBack, onSave }) {
         <button onClick={saveNote} style={{ background:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:"#fff",border:"none",borderRadius:10,padding:"8px 18px",fontWeight:800,fontSize:14,cursor:"pointer" }}>Save</button>
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:20 }}>
-        <div style={{ background:"linear-gradient(135deg,rgba(52,211,153,0.1),rgba(6,182,212,0.1))",borderRadius:14,padding:"10px 16px",marginBottom:16,border:"1px solid rgba(52,211,153,0.2)",display:"flex",alignItems:"center",gap:10 }}>
-          <span style={{ fontSize:20 }}>🆓</span>
-          <div><div style={{ fontWeight:700,fontSize:13,color:C.green }}>Google Free Speech API</div><div style={{ fontSize:11,color:C.muted }}>Completely free - no API key needed</div></div>
-        </div>
         <input value={title} onChange={function(e){setTitle(e.target.value);}} placeholder="Note title (optional)..." style={{ width:"100%",padding:"13px 16px",borderRadius:12,border:"1px solid "+C.border,fontSize:15,fontWeight:700,background:C.card,color:C.text,outline:"none",marginBottom:14,boxSizing:"border-box" }}/>
         <div style={{ marginBottom:16 }}>
           <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10 }}><span style={{ fontSize:13,fontWeight:700,color:C.soft }}>Select Course</span><button onClick={function(){setShowAddCourse(function(s){return !s;});}} style={{ background:C.cyan+"20",border:"1px solid "+C.cyan+"40",borderRadius:8,padding:"5px 12px",color:C.cyan,fontSize:12,fontWeight:700,cursor:"pointer" }}>+ Add Course</button></div>
@@ -779,11 +845,12 @@ export default function App() {
 
   async function saveNote(note) {
     var newNote = {...note, userId: user&&user.uid};
-    // Save to Firestore
-    if (user) {
-      var firestoreId = await saveNoteToCloud(user.uid, newNote);
-      if (firestoreId) newNote.firestoreId = firestoreId;
-    }
+    try{
+      if (user) {
+        var firestoreId = await saveNoteToCloud(user.uid, newNote);
+        if (firestoreId) newNote.firestoreId = firestoreId;
+      }
+    }catch(e){ console.error("Cloud save failed, keeping note locally:", e); }
     setNotes(function(n){ return [newNote,...n]; });
     go("home","home");
   }
