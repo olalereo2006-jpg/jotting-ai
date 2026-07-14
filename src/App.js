@@ -54,7 +54,9 @@ async function callGeminiVision(base64, mediaType, promptText, maxTokens) {
 // ── Firestore helpers ─────────────────────────────────────────────────────────
 async function saveNoteToCloud(userId, note) {
   try {
-    var docRef = await addDoc(collection(db, "notes"), { ...note, userId, createdAt: Date.now() });
+    var writePromise = addDoc(collection(db, "notes"), { ...note, userId, createdAt: Date.now() });
+    var timeoutPromise = new Promise(function(_, reject){ setTimeout(function(){ reject(new Error("Firestore write timed out")); }, 8000); });
+    var docRef = await Promise.race([writePromise, timeoutPromise]);
     return docRef.id;
   } catch(e) { console.error("Save error:", e); return null; }
 }
@@ -843,16 +845,19 @@ export default function App() {
 
   function go(s,t){ setScreen(s); if(t)setTab(t); }
 
-  async function saveNote(note) {
+  function saveNote(note) {
     var newNote = {...note, userId: user&&user.uid};
-    try{
-      if (user) {
-        var firestoreId = await saveNoteToCloud(user.uid, newNote);
-        if (firestoreId) newNote.firestoreId = firestoreId;
-      }
-    }catch(e){ console.error("Cloud save failed, keeping note locally:", e); }
     setNotes(function(n){ return [newNote,...n]; });
     go("home","home");
+    // Sync to Firestore in the background — a slow/broken connection should
+    // never block the user from saving and moving on.
+    if (user) {
+      saveNoteToCloud(user.uid, newNote).then(function(firestoreId){
+        if (firestoreId) {
+          setNotes(function(n){ return n.map(function(x){ return x.id===newNote.id ? {...x, firestoreId:firestoreId} : x; }); });
+        }
+      }).catch(function(e){ console.error("Background cloud save failed:", e); });
+    }
   }
 
   async function deleteNote(id) {
