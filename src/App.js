@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { initializeApp } from "firebase/app";
 import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, sendPasswordResetEmail, GoogleAuthProvider, signInWithPopup } from "firebase/auth";
-import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, query, where, orderBy } from "firebase/firestore";
+import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, query, where } from "firebase/firestore";
 
 // ── Firebase Config ───────────────────────────────────────────────────────────
 const firebaseConfig = {
@@ -26,8 +26,8 @@ const C = {
   red: "#F87171", text: "#F1F5F9", muted: "#64748B", soft: "#94A3B8",
 };
 
-const GEMINI_KEY = "YOUR_GEMINI_KEY_HERE";
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_KEY = "AQ.Ab8RN6I2nJUkGrrtyn9AuImOjXwxBcJClNzrf4cgMDjAIvjdKw";
+const GEMINI_MODEL = "gemini-flash-latest";
 
 async function callGeminiText(promptText, maxTokens) {
   var res = await fetch(
@@ -54,21 +54,37 @@ async function callGeminiVision(base64, mediaType, promptText, maxTokens) {
 // ── Firestore helpers ─────────────────────────────────────────────────────────
 async function saveNoteToCloud(userId, note) {
   try {
-    var docRef = await addDoc(collection(db, "notes"), { ...note, userId, createdAt: Date.now() });
+    var writePromise = addDoc(collection(db, "notes"), { ...note, userId, createdAt: Date.now() });
+    var timeoutPromise = new Promise(function(_, reject){ setTimeout(function(){ reject(new Error("Firestore write timed out")); }, 8000); });
+    var docRef = await Promise.race([writePromise, timeoutPromise]);
     return docRef.id;
   } catch(e) { console.error("Save error:", e); return null; }
 }
 
 async function loadNotesFromCloud(userId) {
   try {
-    var q = query(collection(db, "notes"), where("userId","==",userId), orderBy("createdAt","desc"));
+    var q = query(collection(db, "notes"), where("userId","==",userId));
     var snap = await getDocs(q);
-    return snap.docs.map(function(d){ return {...d.data(), firestoreId:d.id}; });
+    var list = snap.docs.map(function(d){ return {...d.data(), firestoreId:d.id}; });
+    list.sort(function(a,b){ return (b.createdAt||0) - (a.createdAt||0); });
+    return list;
   } catch(e) { console.error("Load error:", e); return []; }
 }
 
 async function deleteNoteFromCloud(firestoreId) {
   try { await deleteDoc(doc(db, "notes", firestoreId)); } catch(e) { console.error("Delete error:", e); }
+}
+
+// Local durable cache: notes always land here immediately, independent of Firestore's
+// success/speed, so a refresh never loses what you just saved.
+function loadNotesLocal(userId) {
+  try {
+    var raw = localStorage.getItem("jotting_notes_"+userId);
+    return raw ? JSON.parse(raw) : [];
+  } catch(e) { return []; }
+}
+function persistNotesLocal(userId, notesList) {
+  try { localStorage.setItem("jotting_notes_"+userId, JSON.stringify(notesList)); } catch(e){}
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -310,29 +326,125 @@ function LoginScreen({ onLogin }) {
 // ── VOICE SCREEN ──────────────────────────────────────────────────────────────
 function VoiceNoteScreen({ onBack, onSave }) {
   var [isRecording,setIsRecording]=useState(false);var [isPaused,setIsPaused]=useState(false);var [elapsed,setElapsed]=useState(0);var [title,setTitle]=useState("");var [courses,setCourses]=useState(["General"]);var [course,setCourse]=useState("General");var [status,setStatus]=useState("Tap microphone to start recording");var [showAddCourse,setShowAddCourse]=useState(false);var [newCourse,setNewCourse]=useState("");var [transcript,setTranscript]=useState("");
-  var timerRef=useRef(null);var recognitionRef=useRef(null);var allTextRef=useRef("");var isActiveRef=useRef(false);
+  var [polishing,setPolishing]=useState(false);var [rawTranscript,setRawTranscript]=useState("");var [polishedTranscript,setPolishedTranscript]=useState("");var [viewMode,setViewMode]=useState("live");
+  var timerRef=useRef(null);var recognitionRef=useRef(null);var allTextRef=useRef("");var isActiveRef=useRef(false);var sessionIdRef=useRef(0);
   var fmt=function(s){return String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0");};
   function addCourse(){var c=newCourse.trim().toUpperCase();if(!c||courses.includes(c))return;setCourses(function(p){return[...p,c];});setNewCourse("");setShowAddCourse(false);}
   function removeCourse(c){if(c==="General")return;setCourses(function(p){return p.filter(function(x){return x!==c;});});if(course===c)setCourse("General");}
-  function createRecognition(baseText){var SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR)return null;var r=new SR();r.continuous=true;r.interimResults=true;r.lang="en-US";var sessionNew="";r.onresult=function(e){var final="";var interim="";for(var i=0;i<e.results.length;i++){if(e.results[i].isFinal){final+=e.results[i][0].transcript+" ";}else{interim=e.results[i][0].transcript;}}sessionNew=final;allTextRef.current=baseText+sessionNew;setTranscript(baseText+sessionNew+interim);setStatus("Listening... speak clearly");};r.onerror=function(e){if(e.error==="no-speech"||e.error==="aborted")return;};r.onend=function(){if(isActiveRef.current){var newBase=baseText+sessionNew;allTextRef.current=newBase;setTimeout(function(){if(isActiveRef.current){var next=createRecognition(newBase);if(next){recognitionRef.current=next;try{next.start();}catch(err){}}}},400);}else{setStatus("Recording complete");}};return r;}
-  function startRecording(){var SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){setStatus("Please use Chrome browser!");return;}allTextRef.current="";setTranscript("");isActiveRef.current=true;setIsRecording(true);setIsPaused(false);setElapsed(0);timerRef.current=setInterval(function(){setElapsed(function(e){return e+1;});},1000);var r=createRecognition("");if(r){recognitionRef.current=r;try{r.start();}catch(e){}}}
-  function pauseRecording(){isActiveRef.current=false;setIsPaused(true);clearInterval(timerRef.current);try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}setStatus("Paused");}
-  function resumeRecording(){isActiveRef.current=true;setIsPaused(false);timerRef.current=setInterval(function(){setElapsed(function(e){return e+1;});},1000);var r=createRecognition(allTextRef.current);if(r){recognitionRef.current=r;try{r.start();}catch(e){}}setStatus("Resumed...");}
-  function stopRecording(){isActiveRef.current=false;setIsRecording(false);setIsPaused(false);clearInterval(timerRef.current);try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}setStatus("Recording complete");}
+  function mergeNoDupe(base,addition){
+    if(!base) return addition;
+    if(!addition) return base;
+    var baseWords=base.trim().split(/\s+/);
+    var addWords=addition.trim().split(/\s+/);
+    var maxOverlap=Math.min(6,baseWords.length,addWords.length);
+    for(var len=maxOverlap;len>0;len--){
+      var tail=baseWords.slice(baseWords.length-len).join(" ").toLowerCase();
+      var head=addWords.slice(0,len).join(" ").toLowerCase();
+      if(tail===head){ return base+" "+addWords.slice(len).join(" "); }
+    }
+    return base+" "+addition;
+  }
+  function createRecognition(baseText,sessionId){
+    var SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR)return null;
+    var r=new SR();r.continuous=true;r.interimResults=true;r.lang="en-US";
+    var sessionNew="";
+    r.onresult=function(e){
+      if(sessionIdRef.current!==sessionId) return;
+      var final="";var interim="";
+      for(var i=e.resultIndex;i<e.results.length;i++){
+        if(e.results[i].isFinal){ final+=e.results[i][0].transcript+" "; }
+        else{ interim+=e.results[i][0].transcript; }
+      }
+      if(final){ sessionNew=mergeNoDupe(sessionNew,final); }
+      var combined=mergeNoDupe(baseText,sessionNew);
+      allTextRef.current=combined;
+      setTranscript((combined+" "+interim).replace(/\s+/g," ").trim());
+      setStatus("Listening... speak clearly");
+    };
+    r.onerror=function(e){ if(e.error==="no-speech"||e.error==="aborted")return; };
+    r.onend=function(){
+      if(sessionIdRef.current!==sessionId) return;
+      if(isActiveRef.current){
+        var newBase=mergeNoDupe(baseText,sessionNew);
+        allTextRef.current=newBase;
+        setTimeout(function(){
+          if(isActiveRef.current&&sessionIdRef.current===sessionId){
+            var newId=sessionId+1;
+            sessionIdRef.current=newId;
+            var next=createRecognition(newBase,newId);
+            if(next){ recognitionRef.current=next; try{next.start();}catch(err){} }
+          }
+        },300);
+      } else { setStatus("Recording complete"); }
+    };
+    return r;
+  }
+  function startRecording(){
+    var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+    if(!SR){setStatus("Please use Chrome browser!");return;}
+    allTextRef.current="";setTranscript("");isActiveRef.current=true;
+    setIsRecording(true);setIsPaused(false);setElapsed(0);
+    timerRef.current=setInterval(function(){setElapsed(function(e){return e+1;});},1000);
+    var newId=sessionIdRef.current+1;
+    sessionIdRef.current=newId;
+    var r=createRecognition("",newId);
+    if(r){ recognitionRef.current=r; try{r.start();}catch(e){} }
+  }
+  function pauseRecording(){isActiveRef.current=false;setIsPaused(true);sessionIdRef.current++;clearInterval(timerRef.current);try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}setStatus("Paused");}
+  function resumeRecording(){
+    isActiveRef.current=true;setIsPaused(false);
+    timerRef.current=setInterval(function(){setElapsed(function(e){return e+1;});},1000);
+    var newId=sessionIdRef.current+1;
+    sessionIdRef.current=newId;
+    var r=createRecognition(allTextRef.current,newId);
+    if(r){ recognitionRef.current=r; try{r.start();}catch(e){} }
+    setStatus("Resumed...");
+  }
+  function stopRecording(){
+    isActiveRef.current=false;setIsRecording(false);setIsPaused(false);sessionIdRef.current++;clearInterval(timerRef.current);
+    try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}
+    setStatus("Recording complete");
+    setTimeout(function(){
+      var finalText=allTextRef.current;
+      if(finalText&&finalText.trim()){
+        setRawTranscript(finalText);
+        polishTranscript(finalText);
+      }
+    },400); // small delay lets the recognizer's last final result settle first
+  }
+  async function polishTranscript(raw){
+    setPolishing(true);
+    setStatus("✨ Polishing your notes with AI...");
+    try{
+      var cleaned=await callGeminiText("This is a raw speech-to-text transcript from a student's voice note. It may contain repeated words, filler words, and no punctuation. Rewrite it into clean, well-organized notes with proper punctuation and paragraph or bullet structure. Preserve all the actual content and meaning without adding new information. Return only the cleaned notes text, no preamble or explanation.\n\nTranscript:\n"+raw,1200);
+      setPolishedTranscript(cleaned);
+      setTranscript(cleaned);
+      setViewMode("polished");
+      setStatus("✨ Notes polished! Review and save, or view the original below.");
+    }catch(e){
+      setStatus("Couldn't reach Gemini to polish (check your API key) — showing your raw transcript.");
+    }
+    setPolishing(false);
+  }
+  function toggleTranscriptView(){
+    if(viewMode==="polished"){ setTranscript(rawTranscript); setViewMode("raw"); }
+    else { setTranscript(polishedTranscript||rawTranscript); setViewMode("polished"); }
+  }
   useEffect(function(){return function(){isActiveRef.current=false;clearInterval(timerRef.current);try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}};}, []);
-  function saveNote(){if(!transcript.trim()){alert("Record something first!");return;}onSave({id:Date.now(),title:title||("Voice Note - "+new Date().toLocaleDateString()),course,color:"#06B6D4",bg:"rgba(6,182,212,0.12)",date:"Today",tag:"Lecture",words:transcript.split(" ").length,preview:transcript.slice(0,100),content:transcript});}
+  function saveNote(){
+    if(!transcript.trim()){alert("Record something first!");return;}
+    try{
+      onSave({id:Date.now(),title:title||("Voice Note - "+new Date().toLocaleDateString()),course,color:"#06B6D4",bg:"rgba(6,182,212,0.12)",date:"Today",tag:"Lecture",words:transcript.split(" ").length,preview:transcript.slice(0,100),content:transcript});
+    }catch(e){ alert("Couldn't save the note — check your connection and try again."); }
+  }
   return(
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
       <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
         <button onClick={onBack} style={backBtn}>←</button>
         <span style={{ fontWeight:800,fontSize:16,color:C.text }}>Voice Recording</span>
-        <button onClick={saveNote} style={{ background:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:"#fff",border:"none",borderRadius:10,padding:"8px 18px",fontWeight:800,fontSize:14,cursor:"pointer" }}>Save</button>
+        <button onClick={saveNote} disabled={polishing} style={{ background:polishing?C.card2:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:polishing?C.muted:"#fff",border:"none",borderRadius:10,padding:"8px 18px",fontWeight:800,fontSize:14,cursor:polishing?"default":"pointer" }}>{polishing?"Polishing...":"Save"}</button>
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:20 }}>
-        <div style={{ background:"linear-gradient(135deg,rgba(52,211,153,0.1),rgba(6,182,212,0.1))",borderRadius:14,padding:"10px 16px",marginBottom:16,border:"1px solid rgba(52,211,153,0.2)",display:"flex",alignItems:"center",gap:10 }}>
-          <span style={{ fontSize:20 }}>🆓</span>
-          <div><div style={{ fontWeight:700,fontSize:13,color:C.green }}>Google Free Speech API</div><div style={{ fontSize:11,color:C.muted }}>Completely free - no API key needed</div></div>
-        </div>
         <input value={title} onChange={function(e){setTitle(e.target.value);}} placeholder="Note title (optional)..." style={{ width:"100%",padding:"13px 16px",borderRadius:12,border:"1px solid "+C.border,fontSize:15,fontWeight:700,background:C.card,color:C.text,outline:"none",marginBottom:14,boxSizing:"border-box" }}/>
         <div style={{ marginBottom:16 }}>
           <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10 }}><span style={{ fontSize:13,fontWeight:700,color:C.soft }}>Select Course</span><button onClick={function(){setShowAddCourse(function(s){return !s;});}} style={{ background:C.cyan+"20",border:"1px solid "+C.cyan+"40",borderRadius:8,padding:"5px 12px",color:C.cyan,fontSize:12,fontWeight:700,cursor:"pointer" }}>+ Add Course</button></div>
@@ -350,10 +462,10 @@ function VoiceNoteScreen({ onBack, onSave }) {
         </div>
         <div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+(transcript?C.cyan+"40":C.border) }}>
           <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12 }}>
-            <div style={{ display:"flex",alignItems:"center",gap:8 }}><span style={{ fontWeight:700,fontSize:14,color:C.cyan }}>📝 Live Transcript</span>{isRecording&&!isPaused&&<div style={{ width:8,height:8,borderRadius:"50%",background:C.red,animation:"pulse 1s ease-in-out infinite" }}/>}</div>
-            <div style={{ display:"flex",gap:8 }}>{transcript&&<button onClick={function(){allTextRef.current="";setTranscript("");}} style={{ background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:12,fontWeight:600 }}>Clear</button>}{transcript&&<button onClick={function(){navigator.clipboard&&navigator.clipboard.writeText(transcript);}} style={{ background:C.card2,border:"none",borderRadius:8,padding:"4px 10px",color:C.cyan,cursor:"pointer",fontSize:12,fontWeight:600 }}>Copy</button>}</div>
+            <div style={{ display:"flex",alignItems:"center",gap:8 }}><span style={{ fontWeight:700,fontSize:14,color:C.cyan }}>{polishedTranscript&&viewMode==="polished"?"✨ AI-Polished Notes":"📝 Live Transcript"}</span>{isRecording&&!isPaused&&<div style={{ width:8,height:8,borderRadius:"50%",background:C.red,animation:"pulse 1s ease-in-out infinite" }}/>}{polishing&&<div style={{ width:8,height:8,borderRadius:"50%",background:C.cyan,animation:"pulse 1s ease-in-out infinite" }}/>}</div>
+            <div style={{ display:"flex",gap:8 }}>{polishedTranscript&&!isRecording&&<button onClick={toggleTranscriptView} style={{ background:C.card2,border:"none",borderRadius:8,padding:"4px 10px",color:C.amber,cursor:"pointer",fontSize:12,fontWeight:600 }}>{viewMode==="polished"?"View Original":"View Polished"}</button>}{transcript&&<button onClick={function(){allTextRef.current="";setTranscript("");setRawTranscript("");setPolishedTranscript("");setViewMode("live");}} style={{ background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:12,fontWeight:600 }}>Clear</button>}{transcript&&<button onClick={function(){navigator.clipboard&&navigator.clipboard.writeText(transcript);}} style={{ background:C.card2,border:"none",borderRadius:8,padding:"4px 10px",color:C.cyan,cursor:"pointer",fontSize:12,fontWeight:600 }}>Copy</button>}</div>
           </div>
-          <div style={{ minHeight:120,fontSize:14,lineHeight:1.9,color:transcript?C.text:C.muted }}>{transcript||"Tap Start Recording — your words appear here instantly..."}</div>
+          <div style={{ minHeight:120,fontSize:14,lineHeight:1.9,color:transcript?C.text:C.muted }}>{polishing?"✨ Polishing your notes with AI...":(transcript||"Tap Start Recording — your words appear here instantly...")}</div>
           {transcript&&(<div style={{ marginTop:10,paddingTop:10,borderTop:"1px solid "+C.border,display:"flex",justifyContent:"space-between" }}><span style={{ fontSize:11,color:C.muted }}>{transcript.split(" ").filter(function(w){return w;}).length} words</span><span style={{ fontSize:11,color:C.muted }}>{transcript.length} chars</span></div>)}
         </div>
       </div>
@@ -753,45 +865,71 @@ export default function App() {
 
   // Listen for auth state
   useEffect(function() {
-    var unsub = onAuthStateChanged(auth, async function(firebaseUser) {
+    var unsub = onAuthStateChanged(auth, function(firebaseUser) {
       if (firebaseUser) {
         setUser(firebaseUser);
-        // Load notes from Firestore
+        setAuthLoading(false); // don't make the user wait for notes to load too
+        var cached = loadNotesLocal(firebaseUser.uid);
+        if (cached.length > 0) setNotes(cached);
         setCloudLoading(true);
-        var cloudNotes = await loadNotesFromCloud(firebaseUser.uid);
-        if (cloudNotes.length > 0) {
-          setNotes(cloudNotes);
-        }
-        setCloudLoading(false);
-        // Check if first time user
+        loadNotesFromCloud(firebaseUser.uid).then(function(cloudNotes){
+          setNotes(function(prev){
+            // Keep any note that hasn't made it to the cloud yet (no firestoreId),
+            // and merge with what the cloud has, so nothing already on-screen is lost.
+            var unsynced = prev.filter(function(n){ return !n.firestoreId; });
+            var byId = {};
+            unsynced.concat(cloudNotes).forEach(function(n){ byId[n.id] = n; });
+            var merged = Object.values(byId);
+            merged.sort(function(a,b){ return (b.createdAt||0) - (a.createdAt||0); });
+            persistNotesLocal(firebaseUser.uid, merged);
+            return merged;
+          });
+          setCloudLoading(false);
+        });
         var isNew = !localStorage.getItem("jotting_seen_"+firebaseUser.uid);
         if (isNew) { setShowOnboarding(true); localStorage.setItem("jotting_seen_"+firebaseUser.uid,"1"); }
       } else {
         setUser(null);
         setNotes([]);
+        setAuthLoading(false);
       }
-      setAuthLoading(false);
     });
     return unsub;
   }, []);
 
   function go(s,t){ setScreen(s); if(t)setTab(t); }
 
-  async function saveNote(note) {
-    var newNote = {...note, userId: user&&user.uid};
-    // Save to Firestore
-    if (user) {
-      var firestoreId = await saveNoteToCloud(user.uid, newNote);
-      if (firestoreId) newNote.firestoreId = firestoreId;
-    }
-    setNotes(function(n){ return [newNote,...n]; });
+  function saveNote(note) {
+    var newNote = {...note, userId: user&&user.uid, createdAt: note.createdAt || Date.now()};
+    setNotes(function(n){
+      var updated = [newNote, ...n];
+      if (user) persistNotesLocal(user.uid, updated);
+      return updated;
+    });
     go("home","home");
+    // Sync to Firestore in the background — a slow/broken connection should
+    // never block the user from saving and moving on.
+    if (user) {
+      saveNoteToCloud(user.uid, newNote).then(function(firestoreId){
+        if (firestoreId) {
+          setNotes(function(n){
+            var updated = n.map(function(x){ return x.id===newNote.id ? {...x, firestoreId:firestoreId} : x; });
+            persistNotesLocal(user.uid, updated);
+            return updated;
+          });
+        }
+      }).catch(function(e){ console.error("Background cloud save failed:", e); });
+    }
   }
 
   async function deleteNote(id) {
     var note = notes.find(function(n){ return n.id===id; });
     if (note&&note.firestoreId) await deleteNoteFromCloud(note.firestoreId);
-    setNotes(function(n){ return n.filter(function(x){ return x.id!==id; }); });
+    setNotes(function(n){
+      var updated = n.filter(function(x){ return x.id!==id; });
+      if (user) persistNotesLocal(user.uid, updated);
+      return updated;
+    });
     if (screen==="detail") go(tab==="library"?"library":"home",tab);
   }
 
