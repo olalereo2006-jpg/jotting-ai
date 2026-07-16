@@ -29,8 +29,19 @@ const C = {
 const GEMINI_KEY = "AQ.Ab8RN6I2nJUkGrrtyn9AuImOjXwxBcJClNzrf4cgMDjAIvjdKw";
 const GEMINI_MODEL = "gemini-flash-latest";
 
+// Gemini's servers occasionally return 503 (temporarily overloaded) — this retries
+// a couple of times with a short growing delay before giving up for real.
+async function fetchWithRetry(url, options, retries) {
+  retries = retries==null ? 2 : retries;
+  for (var attempt=0; attempt<=retries; attempt++) {
+    var res = await fetch(url, options);
+    if (res.status !== 503 || attempt===retries) return res;
+    await new Promise(function(r){ setTimeout(r, 800*(attempt+1)); });
+  }
+}
+
 async function callGeminiText(promptText, maxTokens) {
-  var res = await fetch(
+  var res = await fetchWithRetry(
     "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":generateContent?key="+GEMINI_KEY,
     { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ contents:[{role:"user",parts:[{text:promptText}]}], generationConfig:{maxOutputTokens:maxTokens||800} }) }
   );
@@ -41,7 +52,7 @@ async function callGeminiText(promptText, maxTokens) {
 }
 
 async function callGeminiVision(base64, mediaType, promptText, maxTokens) {
-  var res = await fetch(
+  var res = await fetchWithRetry(
     "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":generateContent?key="+GEMINI_KEY,
     { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ contents:[{role:"user",parts:[{inline_data:{mime_type:mediaType,data:base64}},{text:promptText}]}], generationConfig:{maxOutputTokens:maxTokens||1200} }) }
   );
