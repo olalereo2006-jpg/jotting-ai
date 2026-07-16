@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { initializeApp } from "firebase/app";
 import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, sendPasswordResetEmail, GoogleAuthProvider, signInWithPopup } from "firebase/auth";
-import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, query, where, orderBy } from "firebase/firestore";
+import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, query, where } from "firebase/firestore";
 
 // ── Firebase Config ───────────────────────────────────────────────────────────
 const firebaseConfig = {
@@ -63,9 +63,11 @@ async function saveNoteToCloud(userId, note) {
 
 async function loadNotesFromCloud(userId) {
   try {
-    var q = query(collection(db, "notes"), where("userId","==",userId), orderBy("createdAt","desc"));
+    var q = query(collection(db, "notes"), where("userId","==",userId));
     var snap = await getDocs(q);
-    return snap.docs.map(function(d){ return {...d.data(), firestoreId:d.id}; });
+    var list = snap.docs.map(function(d){ return {...d.data(), firestoreId:d.id}; });
+    list.sort(function(a,b){ return (b.createdAt||0) - (a.createdAt||0); });
+    return list;
   } catch(e) { console.error("Load error:", e); return []; }
 }
 
@@ -821,24 +823,22 @@ export default function App() {
 
   // Listen for auth state
   useEffect(function() {
-    var unsub = onAuthStateChanged(auth, async function(firebaseUser) {
+    var unsub = onAuthStateChanged(auth, function(firebaseUser) {
       if (firebaseUser) {
         setUser(firebaseUser);
-        // Load notes from Firestore
+        setAuthLoading(false); // don't make the user wait for notes to load too
         setCloudLoading(true);
-        var cloudNotes = await loadNotesFromCloud(firebaseUser.uid);
-        if (cloudNotes.length > 0) {
-          setNotes(cloudNotes);
-        }
-        setCloudLoading(false);
-        // Check if first time user
+        loadNotesFromCloud(firebaseUser.uid).then(function(cloudNotes){
+          if (cloudNotes.length > 0) setNotes(cloudNotes);
+          setCloudLoading(false);
+        });
         var isNew = !localStorage.getItem("jotting_seen_"+firebaseUser.uid);
         if (isNew) { setShowOnboarding(true); localStorage.setItem("jotting_seen_"+firebaseUser.uid,"1"); }
       } else {
         setUser(null);
         setNotes([]);
+        setAuthLoading(false);
       }
-      setAuthLoading(false);
     });
     return unsub;
   }, []);
