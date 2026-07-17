@@ -51,6 +51,22 @@ async function callGeminiText(promptText, maxTokens) {
   return text;
 }
 
+// Full multi-turn chat: `contents` is the whole conversation so far (each turn
+// {role:"user"|"model", parts:[{text}]}), so Gemini actually remembers context
+// across messages instead of treating every question in isolation.
+async function callGeminiChat(contents, systemInstruction, maxTokens) {
+  var body = { contents: contents, generationConfig: { maxOutputTokens: maxTokens||800 } };
+  if (systemInstruction) body.systemInstruction = { parts:[{ text: systemInstruction }] };
+  var res = await fetchWithRetry(
+    "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":generateContent?key="+GEMINI_KEY,
+    { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body) }
+  );
+  var data = await res.json();
+  var text = data&&data.candidates&&data.candidates[0]&&data.candidates[0].content&&data.candidates[0].content.parts&&data.candidates[0].content.parts[0]&&data.candidates[0].content.parts[0].text;
+  if (!text) throw new Error((data&&data.error&&data.error.message)||"No response from Gemini");
+  return text;
+}
+
 async function callGeminiVision(base64, mediaType, promptText, maxTokens) {
   var res = await fetchWithRetry(
     "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":generateContent?key="+GEMINI_KEY,
@@ -831,23 +847,84 @@ function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, user })
 }
 
 // ── AI CHAT ───────────────────────────────────────────────────────────────────
-function AIScreen() {
-  var [messages,setMessages]=useState([{role:"ai",text:"Hi! 👋 I am your AI study assistant. Ask me to summarize notes, explain concepts, or create study plans!"}]);
-  var [input,setInput]=useState("");var [loading,setLoading]=useState(false);var endRef=useRef(null);
+function AIScreen({ notes }) {
+  var greeting={role:"ai",text:"Hi! 👋 I'm your AI study assistant. Ask me anything, or tap 📎 to attach one of your notes and we can go through it together."};
+  var [messages,setMessages]=useState([greeting]);
+  var [input,setInput]=useState("");var [loading,setLoading]=useState(false);var [showPicker,setShowPicker]=useState(false);var [pickerSearch,setPickerSearch]=useState("");
+  var endRef=useRef(null);
   useEffect(function(){endRef.current&&endRef.current.scrollIntoView({behavior:"smooth"});},[messages]);
-  async function send(){if(!input.trim())return;var q=input.trim();setInput("");setMessages(function(m){return[...m,{role:"user",text:q}];});setLoading(true);try{var res=await callGeminiText("You are a helpful AI study assistant for a Nigerian university student. Be concise and helpful: "+q,600);setMessages(function(m){return[...m,{role:"ai",text:res}];});}catch(e){setMessages(function(m){return[...m,{role:"ai",text:"Add your Gemini API key to enable real AI!"}];});}setLoading(false);}
+
+  function newChat(){ setMessages([greeting]); setInput(""); }
+
+  function attachNote(note){
+    setShowPicker(false);
+    var attachMsg = {
+      role:"user",
+      text:"📎 Attached note: \""+note.title+"\"",
+      apiText:"Here is my lecture note titled \""+note.title+"\" (course: "+note.course+"):\n\n"+note.content+"\n\nPlease help me understand it — I'll ask questions about it."
+    };
+    var updated = messages.concat([attachMsg]);
+    setMessages(updated);
+    askGemini(updated, true);
+  }
+
+  async function send(){
+    var q = input.trim();
+    if(!q) return;
+    setInput("");
+    var updated = messages.concat([{role:"user",text:q}]);
+    setMessages(updated);
+    askGemini(updated, false);
+  }
+
+  async function askGemini(history, isAutoOpener){
+    setLoading(true);
+    try{
+      var contents = history.map(function(m){ return { role: m.role==="ai"?"model":"user", parts:[{text: m.apiText||m.text}] }; });
+      if(isAutoOpener){
+        contents.push({ role:"user", parts:[{text:"Give a short, friendly opening — acknowledge the note and ask what they'd like help with (a summary, explaining a specific part, or quiz questions)."}] });
+      }
+      var reply = await callGeminiChat(contents, "You are a friendly, encouraging AI study assistant for a Nigerian university student. Be clear and concise. When a lecture note has been attached to the conversation, ground your answers in it.", 700);
+      setMessages(function(m){ return [...m,{role:"ai",text:reply}]; });
+    }catch(e){
+      setMessages(function(m){ return [...m,{role:"ai",text:"Couldn't reach Gemini — check your API key or connection and try again."}]; });
+    }
+    setLoading(false);
+  }
+
+  var filteredNotes = notes.filter(function(n){ return n.title.toLowerCase().includes(pickerSearch.toLowerCase())||n.course.toLowerCase().includes(pickerSearch.toLowerCase()); });
+
   return(
-    <div style={{ flex:1,display:"flex",flexDirection:"column",background:C.bg }}>
-      <div style={{ background:C.card,padding:"16px 20px",borderBottom:"1px solid "+C.border }}><div style={{ display:"flex",alignItems:"center",gap:10 }}><div style={{ width:40,height:40,borderRadius:12,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20 }}>🤖</div><div><div style={{ fontWeight:800,fontSize:16,color:C.text }}>AI Assistant</div><div style={{ fontSize:11,color:C.green,fontWeight:600 }}>Gemini AI</div></div></div></div>
+    <div style={{ flex:1,display:"flex",flexDirection:"column",background:C.bg,position:"relative" }}>
+      <div style={{ background:C.card,padding:"16px 20px",borderBottom:"1px solid "+C.border,display:"flex",justifyContent:"space-between",alignItems:"center" }}>
+        <div style={{ display:"flex",alignItems:"center",gap:10 }}><div style={{ width:40,height:40,borderRadius:12,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20 }}>🤖</div><div><div style={{ fontWeight:800,fontSize:16,color:C.text }}>AI Assistant</div><div style={{ fontSize:11,color:C.green,fontWeight:600 }}>Gemini AI</div></div></div>
+        <button onClick={newChat} style={{ background:C.card2,border:"none",borderRadius:10,padding:"7px 12px",color:C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>🔄 New Chat</button>
+      </div>
       <div style={{ flex:1,overflowY:"auto",padding:"16px 16px 8px" }}>
         {messages.map(function(m,i){return<div key={i} style={{ display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start",marginBottom:12 }}>{m.role==="ai"&&<div style={{ width:32,height:32,borderRadius:10,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,marginRight:8,flexShrink:0,marginTop:2 }}>🤖</div>}<div style={{ maxWidth:"80%",background:m.role==="user"?"linear-gradient(135deg,#06B6D4,#A78BFA)":C.card2,borderRadius:m.role==="user"?"18px 18px 4px 18px":"18px 18px 18px 4px",padding:"12px 16px",border:m.role==="ai"?"1px solid "+C.border:"none" }}><p style={{ margin:0,fontSize:14,color:C.text,lineHeight:1.7,whiteSpace:"pre-wrap" }}>{m.text}</p></div></div>;})}
         {loading&&<div style={{ display:"flex",gap:4,alignItems:"center",marginLeft:40 }}>{[0,1,2].map(function(i){return<div key={i} style={{ width:8,height:8,borderRadius:"50%",background:C.cyan,animation:"dot "+(0.5+i*0.15)+"s ease-in-out infinite alternate" }}/>;})}</div>}
         <div ref={endRef}/>
       </div>
-      <div style={{ padding:"12px 16px 16px",background:C.card2,borderTop:"1px solid "+C.border,display:"flex",gap:10 }}>
-        <input value={input} onChange={function(e){setInput(e.target.value);}} onKeyDown={function(e){if(e.key==="Enter")send();}} placeholder="Ask anything..." style={{ flex:1,padding:"12px 16px",borderRadius:14,border:"1px solid "+C.border,fontSize:14,background:C.bg,color:C.text,outline:"none" }}/>
-        <button onClick={send} style={{ width:48,height:48,borderRadius:14,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",border:"none",cursor:"pointer",fontSize:20,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>↑</button>
+      <div style={{ padding:"12px 16px 16px",background:C.card2,borderTop:"1px solid "+C.border,display:"flex",gap:8 }}>
+        <button onClick={function(){setShowPicker(true);}} title="Attach a note" style={{ width:48,height:48,borderRadius:14,background:C.card,border:"1px solid "+C.border,cursor:"pointer",fontSize:18,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>📎</button>
+        <input value={input} onChange={function(e){setInput(e.target.value);}} onKeyDown={function(e){if(e.key==="Enter")send();}} placeholder="Ask anything..." style={{ flex:1,padding:"12px 16px",borderRadius:14,border:"1px solid "+C.border,fontSize:14,background:C.bg,color:C.text,outline:"none",minWidth:0 }}/>
+        <button onClick={function(){send();}} style={{ width:48,height:48,borderRadius:14,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",border:"none",cursor:"pointer",fontSize:20,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>↑</button>
       </div>
+      {showPicker&&(
+        <div style={{ position:"absolute",inset:0,background:"rgba(10,15,30,0.85)",display:"flex",flexDirection:"column",justifyContent:"flex-end",zIndex:20 }} onClick={function(){setShowPicker(false);}}>
+          <div style={{ background:C.card,borderRadius:"20px 20px 0 0",padding:20,maxHeight:"70vh",display:"flex",flexDirection:"column" }} onClick={function(e){e.stopPropagation();}}>
+            <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14 }}><span style={{ fontWeight:800,fontSize:16,color:C.text }}>Attach a note</span><button onClick={function(){setShowPicker(false);}} style={{ background:"none",border:"none",color:C.muted,fontSize:18,cursor:"pointer" }}>✕</button></div>
+            <input value={pickerSearch} onChange={function(e){setPickerSearch(e.target.value);}} placeholder="Search notes, courses..." style={{ width:"100%",padding:"11px 14px",borderRadius:12,border:"1px solid "+C.border,fontSize:13,background:C.bg,color:C.text,outline:"none",marginBottom:14,boxSizing:"border-box" }}/>
+            <div style={{ overflowY:"auto" }}>
+              {filteredNotes.length===0&&<div style={{ textAlign:"center",color:C.muted,fontSize:13,padding:"20px 0" }}>No notes match.</div>}
+              {filteredNotes.map(function(n){return<button key={n.id} onClick={function(){attachNote(n);}} style={{ width:"100%",textAlign:"left",background:C.card2,border:"1px solid "+C.border,borderRadius:12,padding:"12px 14px",marginBottom:8,cursor:"pointer" }}>
+                <div style={{ fontWeight:700,fontSize:14,color:C.text,marginBottom:3 }}>{n.title}</div>
+                <div style={{ display:"flex",gap:8,alignItems:"center" }}><span style={{ fontSize:10,color:n.color,fontWeight:700,background:n.bg,borderRadius:99,padding:"2px 8px" }}>{n.course}</span><span style={{ fontSize:11,color:C.muted }}>{formatRelativeDate(n.id)}</span></div>
+              </button>;})}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -920,50 +997,7 @@ function SettingsScreen({ user, onLogout }) {
 
         <Section id="ai" icon="🤖" title="AI Settings" color="#A78BFA">
           <div style={{ marginTop:12 }}>
-            <div style={{ marginBottom:14 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>AI MODEL</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{["Gemini","Claude","GPT-4"].map(function(m){return<button key={m} onClick={function(){setAiModel(m);}} style={{ padding:"8px 16px",borderRadius:10,border:"2px solid",borderColor:aiModel===m?C.purple:C.border,background:aiModel===m?C.purple:C.card,color:aiModel===m?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{m}</button>;})}</div></div>
-            <div style={{ marginBottom:14 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>WRITING STYLE</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{["Academic","Simple","Detailed"].map(function(s){return<button key={s} onClick={function(){setAiStyle(s);}} style={{ padding:"8px 16px",borderRadius:10,border:"2px solid",borderColor:aiStyle===s?C.purple:C.border,background:aiStyle===s?C.purple:C.card,color:aiStyle===s?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{s}</button>;})}</div></div>
-            <Row icon="🌐" label="AI Response Language" sub="English"/>
-            <Row icon="📏" label="AI Summary Length" sub="Medium"/>
-            <Row icon="📵" label="Offline AI Mode" sub="Available on Pro" right={<span style={{ background:"rgba(245,158,11,0.15)",color:C.amber,borderRadius:99,padding:"3px 10px",fontSize:11,fontWeight:700 }}>PRO</span>}/>
-          </div>
-        </Section>
-
-        <Section id="privacy" icon="🔒" title="Privacy and Security" color="#F87171">
-          <div style={{ marginTop:12 }}>{[["👆","fingerprint","Fingerprint Unlock","Use fingerprint to unlock"],["👤","face","Face Unlock","Unlock with face recognition"],["🔢","pin","PIN Lock","Set a 4-digit PIN"],["⏱","autoLock","Auto Lock","Lock after 1 minute"],["📁","hiddenFolder","Hidden Notes Folder","Keep private notes hidden"],["🔐","encrypt","Encrypt Notes","End-to-end encryption"]].map(function(item){return<Row key={item[1]} icon={item[0]} label={item[2]} sub={item[3]} right={<Toggle value={privacy[item[1]]} onChange={function(v){setPrivacy(function(p){return{...p,[item[1]]:v};});}} color={C.red}/>}/>;})}</div>
-        </Section>
-
-        <Section id="about" icon="ℹ️" title="About" color="#06B6D4">
-          <div style={{ marginTop:12 }}>
-            <Row icon="📱" label="App Version" sub="v4.0.0 - Login Edition" right={<span style={{ fontSize:13,color:C.muted }}>v4.0</span>}/>
-            <Row icon="🆕" label="What's New" sub="Login, Firebase, Cloud sync!"/>
-            <Row icon="🔏" label="Privacy Policy" sub="How we handle your data"/>
-            <Row icon="📜" label="Terms of Service" sub="Rules and conditions"/>
-            <Row icon="💬" label="Contact Support" sub="Get help from our team"/>
-            <Row icon="⭐" label="Rate the App" onPress={function(){alert("Thank you! Rating coming soon!");}}/>
-            <Row icon="📤" label="Share the App" onPress={function(){if(navigator.share){navigator.share({title:"Jotting AI",text:"Check out this AI note-taking app!",url:"https://notewave12.netlify.app"});}else{alert("Link: notewave12.netlify.app");}}}/>
-            <Row icon="🐛" label="Report a Bug" onPress={function(){alert("Report bugs to: samuel@gmail.com");}}/>
-            <div style={{ textAlign:"center",marginTop:16,color:C.muted,fontSize:12 }}>Jotting AI v4.0 - Built with love by Samuel</div>
-          </div>
-        </Section>
-
-        <Section id="account" icon="👤" title="Account" color="#34D399">
-          <div style={{ marginTop:12 }}>
-            <Row icon="✉️" label="Email" sub={(user&&user.email)||"Not logged in"}/>
-            <Row icon="👤" label="Display Name" sub={(user&&user.displayName)||"Not set"}/>
-            <Row icon="✅" label="Email Verified" sub={user&&user.emailVerified?"Your email is verified":"Email not verified yet"} right={<span style={{ fontSize:13,color:user&&user.emailVerified?C.green:C.amber }}>{user&&user.emailVerified?"✓":"Pending"}</span>}/>
-            <div onClick={onLogout} style={{ display:"flex",alignItems:"center",justifyContent:"center",padding:"14px",marginTop:12,background:"rgba(248,113,113,0.1)",borderRadius:12,cursor:"pointer",border:"1px solid "+C.red+"30" }}>
-              <span style={{ fontSize:14,fontWeight:700,color:C.red }}>🚪 Logout</span>
-            </div>
-          </div>
-        </Section>
-      </div>
-    </div>
-  );
-}
-
-// ── MAIN APP ──────────────────────────────────────────────────────────────────
-export default function App() {
-  var [user, setUser] = useState(null);
+            <div style={{ marginBottom:14 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>AI MODEL</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{["Gemini","Claude","GPT-4"].map(function(m){return<button key={m} onClick={function(){setAiModel(m);}} style={{ padding:"8px 16px",borderRadius:10,border:"2px solid",borderColor:aiModel===m?C.purple:C.border,background:aiModel===m?C.purple:C.card,color:aiModel===m?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{m}</button>;}  var [user, setUser] = useState(null);
   var [authLoading, setAuthLoading] = useState(true);
   var [showOnboarding, setShowOnboarding] = useState(false);
   var [notes, setNotes] = useState([]);
@@ -1107,7 +1141,7 @@ export default function App() {
           {screen==="draw"&&<DrawScreen onBack={function(){go("home","home");}}/>}
           {screen==="aiwrite"&&<AIWriteScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
           {screen==="scan"&&<ScanDocScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
-          {screen==="ai"&&<AIScreen/>}
+          {screen==="ai"&&<AIScreen notes={notes}/>}
           {screen==="settings"&&<SettingsScreen user={user} onLogout={handleLogout}/>}
         </div>
         <div style={{ background:C.card2,borderTop:"1px solid "+C.border,padding:"10px 10px 16px",display:"flex",justifyContent:"space-around",alignItems:"center",flexShrink:0 }}>
@@ -1122,4 +1156,4 @@ export default function App() {
       </div>
     </div>
   );
-   }
+}
