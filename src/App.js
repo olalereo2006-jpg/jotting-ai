@@ -33,7 +33,7 @@ const GEMINI_MODEL = "gemini-flash-latest";
 // a couple of times with a short growing delay before giving up for real.
 async function fetchWithRetry(url, options, retries) {
   retries = retries==null ? 2 : retries;
-  for (var attempt=0; attempt<=retries; attempt++) {
+  for (let attempt=0; attempt<=retries; attempt++) {
     var res = await fetch(url, options);
     if (res.status !== 503 || attempt===retries) return res;
     await new Promise(function(r){ setTimeout(r, 800*(attempt+1)); });
@@ -340,7 +340,7 @@ function VoiceNoteScreen({ onBack, onSave }) {
   var [polishing,setPolishing]=useState(false);var [rawTranscript,setRawTranscript]=useState("");var [polishedTranscript,setPolishedTranscript]=useState("");var [viewMode,setViewMode]=useState("live");
   var [recovered,setRecovered]=useState(null); // a checkpoint found from an interrupted session
   var [interrupted,setInterrupted]=useState(false); // tab went background/locked mid-recording
-  var timerRef=useRef(null);var recognitionRef=useRef(null);var allTextRef=useRef("");var isActiveRef=useRef(false);var sessionIdRef=useRef(0);var checkpointRef=useRef(null);
+  var timerRef=useRef(null);var recognitionRef=useRef(null);var allTextRef=useRef("");var isActiveRef=useRef(false);var sessionIdRef=useRef(0);var createRecognitionRef=useRef(null);
   var fmt=function(s){return String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0");};
   function addCourse(){var c=newCourse.trim().toUpperCase();if(!c||courses.includes(c))return;setCourses(function(p){return[...p,c];});setNewCourse("");setShowAddCourse(false);}
   function removeCourse(c){if(c==="General")return;setCourses(function(p){return p.filter(function(x){return x!==c;});});if(course===c)setCourse("General");}
@@ -391,7 +391,7 @@ function VoiceNoteScreen({ onBack, onSave }) {
         setStatus("Resuming...");
         sessionIdRef.current++;
         var newId = sessionIdRef.current;
-        var r = createRecognition(allTextRef.current, newId);
+        var r = createRecognitionRef.current(allTextRef.current, newId);
         if (r) { recognitionRef.current = r; try{ r.start(); }catch(e){} }
       }
     }
@@ -446,6 +446,7 @@ function VoiceNoteScreen({ onBack, onSave }) {
     };
     return r;
   }
+  useEffect(function(){ createRecognitionRef.current = createRecognition; }); // no dep array: refreshes every render, always current
   function startRecording(){
     var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
     if(!SR){setStatus("Please use Chrome browser!");return;}
@@ -1029,7 +1030,7 @@ export default function App() {
     {id:"settings",icon:"⚙️",label:"Settings",s:"settings"},
   ];
 
-  //  Loading spinner
+  // Loading spinner
   if (authLoading) {
     return (
       <div style={{ minHeight:"100vh",background:"#06081A",display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:16 }}>
