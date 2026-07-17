@@ -27,10 +27,21 @@ const C = {
 };
 
 const GEMINI_KEY = "YOUR_GEMINI_KEY_HERE";
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODEL = "gemini-flash-latest";
+
+// Gemini's servers occasionally return 503 (temporarily overloaded) — this retries
+// a couple of times with a short growing delay before giving up for real.
+async function fetchWithRetry(url, options, retries) {
+  retries = retries==null ? 2 : retries;
+  for (var attempt=0; attempt<=retries; attempt++) {
+    var res = await fetch(url, options);
+    if (res.status !== 503 || attempt===retries) return res;
+    await new Promise(function(r){ setTimeout(r, 800*(attempt+1)); });
+  }
+}
 
 async function callGeminiText(promptText, maxTokens) {
-  var res = await fetch(
+  var res = await fetchWithRetry(
     "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":generateContent?key="+GEMINI_KEY,
     { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ contents:[{role:"user",parts:[{text:promptText}]}], generationConfig:{maxOutputTokens:maxTokens||800} }) }
   );
@@ -41,7 +52,7 @@ async function callGeminiText(promptText, maxTokens) {
 }
 
 async function callGeminiVision(base64, mediaType, promptText, maxTokens) {
-  var res = await fetch(
+  var res = await fetchWithRetry(
     "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":generateContent?key="+GEMINI_KEY,
     { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ contents:[{role:"user",parts:[{inline_data:{mime_type:mediaType,data:base64}},{text:promptText}]}], generationConfig:{maxOutputTokens:maxTokens||1200} }) }
   );
@@ -73,6 +84,18 @@ async function loadNotesFromCloud(userId) {
 
 async function deleteNoteFromCloud(firestoreId) {
   try { await deleteDoc(doc(db, "notes", firestoreId)); } catch(e) { console.error("Delete error:", e); }
+}
+
+// Local durable cache: notes always land here immediately, independent of Firestore's
+// success/speed, so a refresh never loses what you just saved.
+function loadNotesLocal(userId) {
+  try {
+    var raw = localStorage.getItem("jotting_notes_"+userId);
+    return raw ? JSON.parse(raw) : [];
+  } catch(e) { return []; }
+}
+function persistNotesLocal(userId, notesList) {
+  try { localStorage.setItem("jotting_notes_"+userId, JSON.stringify(notesList)); } catch(e){}
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -314,10 +337,67 @@ function LoginScreen({ onLogin }) {
 // ── VOICE SCREEN ──────────────────────────────────────────────────────────────
 function VoiceNoteScreen({ onBack, onSave }) {
   var [isRecording,setIsRecording]=useState(false);var [isPaused,setIsPaused]=useState(false);var [elapsed,setElapsed]=useState(0);var [title,setTitle]=useState("");var [courses,setCourses]=useState(["General"]);var [course,setCourse]=useState("General");var [status,setStatus]=useState("Tap microphone to start recording");var [showAddCourse,setShowAddCourse]=useState(false);var [newCourse,setNewCourse]=useState("");var [transcript,setTranscript]=useState("");
-  var timerRef=useRef(null);var recognitionRef=useRef(null);var allTextRef=useRef("");var isActiveRef=useRef(false);var sessionIdRef=useRef(0);
+  var [polishing,setPolishing]=useState(false);var [rawTranscript,setRawTranscript]=useState("");var [polishedTranscript,setPolishedTranscript]=useState("");var [viewMode,setViewMode]=useState("live");
+  var [recovered,setRecovered]=useState(null); // a checkpoint found from an interrupted session
+  var [interrupted,setInterrupted]=useState(false); // tab went background/locked mid-recording
+  var timerRef=useRef(null);var recognitionRef=useRef(null);var allTextRef=useRef("");var isActiveRef=useRef(false);var sessionIdRef=useRef(0);var checkpointRef=useRef(null);
   var fmt=function(s){return String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0");};
   function addCourse(){var c=newCourse.trim().toUpperCase();if(!c||courses.includes(c))return;setCourses(function(p){return[...p,c];});setNewCourse("");setShowAddCourse(false);}
   function removeCourse(c){if(c==="General")return;setCourses(function(p){return p.filter(function(x){return x!==c;});});if(course===c)setCourse("General");}
+
+  // Crash recovery: if a checkpoint from an earlier, never-finished recording is
+  // sitting in local storage (app closed/crashed mid-lecture), offer to restore it.
+  useEffect(function(){
+    try{
+      var raw = localStorage.getItem("jotting_voice_checkpoint");
+      if (raw) {
+        var saved = JSON.parse(raw);
+        if (saved && saved.text && saved.text.trim()) setRecovered(saved);
+      }
+    }catch(e){}
+  }, []);
+  function restoreCheckpoint(){
+    if(!recovered) return;
+    allTextRef.current = recovered.text;
+    setTranscript(recovered.text);
+    setTitle(recovered.title||"");
+    setRecovered(null);
+    try{ localStorage.removeItem("jotting_voice_checkpoint"); }catch(e){}
+  }
+  function discardCheckpoint(){
+    setRecovered(null);
+    try{ localStorage.removeItem("jotting_voice_checkpoint"); }catch(e){}
+  }
+  function saveCheckpoint(){
+    try{ localStorage.setItem("jotting_voice_checkpoint", JSON.stringify({ text: allTextRef.current, title: title, ts: Date.now() })); }catch(e){}
+  }
+  function clearCheckpoint(){
+    try{ localStorage.removeItem("jotting_voice_checkpoint"); }catch(e){}
+  }
+
+  // If the tab gets backgrounded or the phone locks mid-recording, the browser will
+  // pause/kill the mic — that's an OS-level limit no website can override. The best
+  // we can do: notice it happened, tell the user clearly, and pick back up automatically
+  // (keeping everything already transcribed) the moment they return.
+  useEffect(function(){
+    function handleVisibility(){
+      if (document.hidden) {
+        if (isActiveRef.current) {
+          setInterrupted(true);
+          setStatus("⏸️ Paused — screen locked or app left. Reopen to continue.");
+        }
+      } else if (interrupted && isActiveRef.current) {
+        setInterrupted(false);
+        setStatus("Resuming...");
+        sessionIdRef.current++;
+        var newId = sessionIdRef.current;
+        var r = createRecognition(allTextRef.current, newId);
+        if (r) { recognitionRef.current = r; try{ r.start(); }catch(e){} }
+      }
+    }
+    document.addEventListener("visibilitychange", handleVisibility);
+    return function(){ document.removeEventListener("visibilitychange", handleVisibility); };
+  }, [interrupted]);
   function mergeNoDupe(base,addition){
     if(!base) return addition;
     if(!addition) return base;
@@ -371,7 +451,11 @@ function VoiceNoteScreen({ onBack, onSave }) {
     if(!SR){setStatus("Please use Chrome browser!");return;}
     allTextRef.current="";setTranscript("");isActiveRef.current=true;
     setIsRecording(true);setIsPaused(false);setElapsed(0);
-    timerRef.current=setInterval(function(){setElapsed(function(e){return e+1;});},1000);
+    clearCheckpoint();
+    timerRef.current=setInterval(function(){
+      setElapsed(function(e){return e+1;});
+      saveCheckpoint(); // runs every second alongside the timer — cheap, and means at most ~1s is ever at risk
+    },1000);
     var newId=sessionIdRef.current+1;
     sessionIdRef.current=newId;
     var r=createRecognition("",newId);
@@ -380,19 +464,49 @@ function VoiceNoteScreen({ onBack, onSave }) {
   function pauseRecording(){isActiveRef.current=false;setIsPaused(true);sessionIdRef.current++;clearInterval(timerRef.current);try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}setStatus("Paused");}
   function resumeRecording(){
     isActiveRef.current=true;setIsPaused(false);
-    timerRef.current=setInterval(function(){setElapsed(function(e){return e+1;});},1000);
+    timerRef.current=setInterval(function(){setElapsed(function(e){return e+1;});saveCheckpoint();},1000);
     var newId=sessionIdRef.current+1;
     sessionIdRef.current=newId;
     var r=createRecognition(allTextRef.current,newId);
     if(r){ recognitionRef.current=r; try{r.start();}catch(e){} }
     setStatus("Resumed...");
   }
-  function stopRecording(){isActiveRef.current=false;setIsRecording(false);setIsPaused(false);sessionIdRef.current++;clearInterval(timerRef.current);try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}setStatus("Recording complete");}
+  function stopRecording(){
+    isActiveRef.current=false;setIsRecording(false);setIsPaused(false);sessionIdRef.current++;clearInterval(timerRef.current);
+    try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}
+    setStatus("Recording complete");
+    setTimeout(function(){
+      var finalText=allTextRef.current;
+      if(finalText&&finalText.trim()){
+        setRawTranscript(finalText);
+        polishTranscript(finalText);
+      }
+    },400); // small delay lets the recognizer's last final result settle first
+  }
+  async function polishTranscript(raw){
+    setPolishing(true);
+    setStatus("✨ Polishing your notes with AI...");
+    try{
+      var cleaned=await callGeminiText("This is a raw speech-to-text transcript from a student's voice note. It may contain repeated words, filler words, and no punctuation. Rewrite it into clean, well-organized notes with proper punctuation and paragraph or bullet structure. Preserve all the actual content and meaning without adding new information. Return only the cleaned notes text, no preamble or explanation.\n\nTranscript:\n"+raw,1200);
+      setPolishedTranscript(cleaned);
+      setTranscript(cleaned);
+      setViewMode("polished");
+      setStatus("✨ Notes polished! Review and save, or view the original below.");
+    }catch(e){
+      setStatus("Couldn't reach Gemini to polish (check your API key) — showing your raw transcript.");
+    }
+    setPolishing(false);
+  }
+  function toggleTranscriptView(){
+    if(viewMode==="polished"){ setTranscript(rawTranscript); setViewMode("raw"); }
+    else { setTranscript(polishedTranscript||rawTranscript); setViewMode("polished"); }
+  }
   useEffect(function(){return function(){isActiveRef.current=false;clearInterval(timerRef.current);try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}};}, []);
   function saveNote(){
     if(!transcript.trim()){alert("Record something first!");return;}
     try{
       onSave({id:Date.now(),title:title||("Voice Note - "+new Date().toLocaleDateString()),course,color:"#06B6D4",bg:"rgba(6,182,212,0.12)",date:"Today",tag:"Lecture",words:transcript.split(" ").length,preview:transcript.slice(0,100),content:transcript});
+      clearCheckpoint();
     }catch(e){ alert("Couldn't save the note — check your connection and try again."); }
   }
   return(
@@ -400,9 +514,19 @@ function VoiceNoteScreen({ onBack, onSave }) {
       <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
         <button onClick={onBack} style={backBtn}>←</button>
         <span style={{ fontWeight:800,fontSize:16,color:C.text }}>Voice Recording</span>
-        <button onClick={saveNote} style={{ background:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:"#fff",border:"none",borderRadius:10,padding:"8px 18px",fontWeight:800,fontSize:14,cursor:"pointer" }}>Save</button>
+        <button onClick={saveNote} disabled={polishing} style={{ background:polishing?C.card2:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:polishing?C.muted:"#fff",border:"none",borderRadius:10,padding:"8px 18px",fontWeight:800,fontSize:14,cursor:polishing?"default":"pointer" }}>{polishing?"Polishing...":"Save"}</button>
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:20 }}>
+        {recovered&&(
+          <div style={{ background:"rgba(245,158,11,0.1)",border:"1px solid rgba(245,158,11,0.3)",borderRadius:14,padding:16,marginBottom:16 }}>
+            <div style={{ fontWeight:800,fontSize:13,color:C.amber,marginBottom:6 }}>⚠️ Recovered an unfinished recording</div>
+            <div style={{ fontSize:12,color:C.muted,marginBottom:10 }}>Looks like a previous recording didn't get saved — probably the app closed or your phone locked mid-session. Want to bring it back?</div>
+            <div style={{ display:"flex",gap:8 }}>
+              <button onClick={restoreCheckpoint} style={{ flex:1,background:C.amber,color:"#0A0F1E",border:"none",borderRadius:10,padding:"9px",fontWeight:800,cursor:"pointer",fontSize:13 }}>Restore it</button>
+              <button onClick={discardCheckpoint} style={{ flex:1,background:"none",border:"1px solid "+C.border,borderRadius:10,padding:"9px",color:C.muted,fontWeight:700,cursor:"pointer",fontSize:13 }}>Discard</button>
+            </div>
+          </div>
+        )}
         <input value={title} onChange={function(e){setTitle(e.target.value);}} placeholder="Note title (optional)..." style={{ width:"100%",padding:"13px 16px",borderRadius:12,border:"1px solid "+C.border,fontSize:15,fontWeight:700,background:C.card,color:C.text,outline:"none",marginBottom:14,boxSizing:"border-box" }}/>
         <div style={{ marginBottom:16 }}>
           <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10 }}><span style={{ fontSize:13,fontWeight:700,color:C.soft }}>Select Course</span><button onClick={function(){setShowAddCourse(function(s){return !s;});}} style={{ background:C.cyan+"20",border:"1px solid "+C.cyan+"40",borderRadius:8,padding:"5px 12px",color:C.cyan,fontSize:12,fontWeight:700,cursor:"pointer" }}>+ Add Course</button></div>
@@ -420,10 +544,10 @@ function VoiceNoteScreen({ onBack, onSave }) {
         </div>
         <div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+(transcript?C.cyan+"40":C.border) }}>
           <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12 }}>
-            <div style={{ display:"flex",alignItems:"center",gap:8 }}><span style={{ fontWeight:700,fontSize:14,color:C.cyan }}>📝 Live Transcript</span>{isRecording&&!isPaused&&<div style={{ width:8,height:8,borderRadius:"50%",background:C.red,animation:"pulse 1s ease-in-out infinite" }}/>}</div>
-            <div style={{ display:"flex",gap:8 }}>{transcript&&<button onClick={function(){allTextRef.current="";setTranscript("");}} style={{ background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:12,fontWeight:600 }}>Clear</button>}{transcript&&<button onClick={function(){navigator.clipboard&&navigator.clipboard.writeText(transcript);}} style={{ background:C.card2,border:"none",borderRadius:8,padding:"4px 10px",color:C.cyan,cursor:"pointer",fontSize:12,fontWeight:600 }}>Copy</button>}</div>
+            <div style={{ display:"flex",alignItems:"center",gap:8 }}><span style={{ fontWeight:700,fontSize:14,color:C.cyan }}>{polishedTranscript&&viewMode==="polished"?"✨ AI-Polished Notes":"📝 Live Transcript"}</span>{isRecording&&!isPaused&&<div style={{ width:8,height:8,borderRadius:"50%",background:C.red,animation:"pulse 1s ease-in-out infinite" }}/>}{polishing&&<div style={{ width:8,height:8,borderRadius:"50%",background:C.cyan,animation:"pulse 1s ease-in-out infinite" }}/>}</div>
+            <div style={{ display:"flex",gap:8 }}>{polishedTranscript&&!isRecording&&<button onClick={toggleTranscriptView} style={{ background:C.card2,border:"none",borderRadius:8,padding:"4px 10px",color:C.amber,cursor:"pointer",fontSize:12,fontWeight:600 }}>{viewMode==="polished"?"View Original":"View Polished"}</button>}{transcript&&<button onClick={function(){allTextRef.current="";setTranscript("");setRawTranscript("");setPolishedTranscript("");setViewMode("live");}} style={{ background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:12,fontWeight:600 }}>Clear</button>}{transcript&&<button onClick={function(){navigator.clipboard&&navigator.clipboard.writeText(transcript);}} style={{ background:C.card2,border:"none",borderRadius:8,padding:"4px 10px",color:C.cyan,cursor:"pointer",fontSize:12,fontWeight:600 }}>Copy</button>}</div>
           </div>
-          <div style={{ minHeight:120,fontSize:14,lineHeight:1.9,color:transcript?C.text:C.muted }}>{transcript||"Tap Start Recording — your words appear here instantly..."}</div>
+          <div style={{ minHeight:120,fontSize:14,lineHeight:1.9,color:transcript?C.text:C.muted }}>{polishing?"✨ Polishing your notes with AI...":(transcript||"Tap Start Recording — your words appear here instantly...")}</div>
           {transcript&&(<div style={{ marginTop:10,paddingTop:10,borderTop:"1px solid "+C.border,display:"flex",justifyContent:"space-between" }}><span style={{ fontSize:11,color:C.muted }}>{transcript.split(" ").filter(function(w){return w;}).length} words</span><span style={{ fontSize:11,color:C.muted }}>{transcript.length} chars</span></div>)}
         </div>
       </div>
@@ -827,9 +951,21 @@ export default function App() {
       if (firebaseUser) {
         setUser(firebaseUser);
         setAuthLoading(false); // don't make the user wait for notes to load too
+        var cached = loadNotesLocal(firebaseUser.uid);
+        if (cached.length > 0) setNotes(cached);
         setCloudLoading(true);
         loadNotesFromCloud(firebaseUser.uid).then(function(cloudNotes){
-          if (cloudNotes.length > 0) setNotes(cloudNotes);
+          setNotes(function(prev){
+            // Keep any note that hasn't made it to the cloud yet (no firestoreId),
+            // and merge with what the cloud has, so nothing already on-screen is lost.
+            var unsynced = prev.filter(function(n){ return !n.firestoreId; });
+            var byId = {};
+            unsynced.concat(cloudNotes).forEach(function(n){ byId[n.id] = n; });
+            var merged = Object.values(byId);
+            merged.sort(function(a,b){ return (b.createdAt||0) - (a.createdAt||0); });
+            persistNotesLocal(firebaseUser.uid, merged);
+            return merged;
+          });
           setCloudLoading(false);
         });
         var isNew = !localStorage.getItem("jotting_seen_"+firebaseUser.uid);
@@ -846,15 +982,23 @@ export default function App() {
   function go(s,t){ setScreen(s); if(t)setTab(t); }
 
   function saveNote(note) {
-    var newNote = {...note, userId: user&&user.uid};
-    setNotes(function(n){ return [newNote,...n]; });
+    var newNote = {...note, userId: user&&user.uid, createdAt: note.createdAt || Date.now()};
+    setNotes(function(n){
+      var updated = [newNote, ...n];
+      if (user) persistNotesLocal(user.uid, updated);
+      return updated;
+    });
     go("home","home");
     // Sync to Firestore in the background — a slow/broken connection should
     // never block the user from saving and moving on.
     if (user) {
       saveNoteToCloud(user.uid, newNote).then(function(firestoreId){
         if (firestoreId) {
-          setNotes(function(n){ return n.map(function(x){ return x.id===newNote.id ? {...x, firestoreId:firestoreId} : x; }); });
+          setNotes(function(n){
+            var updated = n.map(function(x){ return x.id===newNote.id ? {...x, firestoreId:firestoreId} : x; });
+            persistNotesLocal(user.uid, updated);
+            return updated;
+          });
         }
       }).catch(function(e){ console.error("Background cloud save failed:", e); });
     }
@@ -863,7 +1007,11 @@ export default function App() {
   async function deleteNote(id) {
     var note = notes.find(function(n){ return n.id===id; });
     if (note&&note.firestoreId) await deleteNoteFromCloud(note.firestoreId);
-    setNotes(function(n){ return n.filter(function(x){ return x.id!==id; }); });
+    setNotes(function(n){
+      var updated = n.filter(function(x){ return x.id!==id; });
+      if (user) persistNotesLocal(user.uid, updated);
+      return updated;
+    });
     if (screen==="detail") go(tab==="library"?"library":"home",tab);
   }
 
@@ -881,7 +1029,7 @@ export default function App() {
     {id:"settings",icon:"⚙️",label:"Settings",s:"settings"},
   ];
 
-  // Loading spinner
+  //  Loading spinner
   if (authLoading) {
     return (
       <div style={{ minHeight:"100vh",background:"#06081A",display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:16 }}>
@@ -947,4 +1095,4 @@ export default function App() {
       </div>
     </div>
   );
-}
+            }
