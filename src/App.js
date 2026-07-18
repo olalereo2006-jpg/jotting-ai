@@ -26,7 +26,7 @@ const C = {
   red: "#F87171", text: "#F1F5F9", muted: "#64748B", soft: "#94A3B8",
 };
 
-const GEMINI_KEY = "AQ.Ab8RN6I2nJUkGrrtyn9AuImOjXwxBcJClNzrf4cgMDjAIvjdKw";
+const GEMINI_KEY = "YOUR_GEMINI_KEY_HERE";
 const GEMINI_MODEL = "gemini-flash-latest";
 
 // Gemini's servers occasionally return 503 (temporarily overloaded) — this retries
@@ -996,9 +996,10 @@ function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings
             <div style={{ opacity:0.5 }}>
               <Row icon="👥" label="Speaker Identification" sub="Needs a paid diarization service — not available yet" right={<span style={{ fontSize:9,fontWeight:700,color:C.amber,background:"rgba(245,158,11,0.15)",borderRadius:99,padding:"3px 8px" }}>COMING SOON</span>}/>
             </div>
-          </div>
-            </section>
-                <Section id="ai" icon="🤖" title="AI Settings" color="#A78BFA">
+            </div>
+        </Section>
+
+        <Section id="ai" icon="🤖" title="AI Settings" color="#A78BFA">
           <div style={{ marginTop:12 }}>
             <div style={{ marginBottom:14 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>AI MODEL</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{["Gemini","Claude","GPT-4"].map(function(m){return<button key={m} onClick={function(){setAiModel(m);}} style={{ padding:"8px 16px",borderRadius:10,border:"2px solid",borderColor:aiModel===m?C.purple:C.border,background:aiModel===m?C.purple:C.card,color:aiModel===m?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{m}</button>;})}</div></div>
             <div style={{ marginBottom:14 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>WRITING STYLE</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{["Academic","Simple","Detailed"].map(function(s){return<button key={s} onClick={function(){setAiStyle(s);}} style={{ padding:"8px 16px",borderRadius:10,border:"2px solid",borderColor:aiStyle===s?C.purple:C.border,background:aiStyle===s?C.purple:C.card,color:aiStyle===s?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{s}</button>;})}</div></div>
@@ -1209,4 +1210,4 @@ export default function App() {
       </div>
     </div>
   );
-                                                                                                                                                                                                                                    }
+}
