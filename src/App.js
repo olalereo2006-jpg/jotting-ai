@@ -78,6 +78,19 @@ async function callGeminiVision(base64, mediaType, promptText, maxTokens) {
   return text;
 }
 
+// Gemini can listen to real recorded audio directly and produce text from it —
+// this powers the record-then-transcribe flow (full transcript / smart notes / summary).
+async function callGeminiAudio(base64, mediaType, promptText, maxTokens) {
+  var res = await fetchWithRetry(
+    "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":generateContent?key="+GEMINI_KEY,
+    { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ contents:[{role:"user",parts:[{inline_data:{mime_type:mediaType,data:base64}},{text:promptText}]}], generationConfig:{maxOutputTokens:maxTokens||2000} }) }
+  );
+  var data = await res.json();
+  var text = data&&data.candidates&&data.candidates[0]&&data.candidates[0].content&&data.candidates[0].content.parts&&data.candidates[0].content.parts[0]&&data.candidates[0].content.parts[0].text;
+  if (!text) throw new Error((data&&data.error&&data.error.message)||"No response from Gemini");
+  return text;
+}
+
 // ── Firestore helpers ─────────────────────────────────────────────────────────
 async function saveNoteToCloud(userId, note) {
   try {
@@ -371,222 +384,210 @@ function LoginScreen({ onLogin }) {
 }
 
 // ── VOICE SCREEN ──────────────────────────────────────────────────────────────
-function VoiceNoteScreen({ onBack, onSave }) {
-  var [isRecording,setIsRecording]=useState(false);var [isPaused,setIsPaused]=useState(false);var [elapsed,setElapsed]=useState(0);var [title,setTitle]=useState("");var [courses,setCourses]=useState(["General"]);var [course,setCourse]=useState("General");var [status,setStatus]=useState("Tap microphone to start recording");var [showAddCourse,setShowAddCourse]=useState(false);var [newCourse,setNewCourse]=useState("");var [transcript,setTranscript]=useState("");
-  var [polishing,setPolishing]=useState(false);var [rawTranscript,setRawTranscript]=useState("");var [polishedTranscript,setPolishedTranscript]=useState("");var [viewMode,setViewMode]=useState("live");
-  var [recovered,setRecovered]=useState(null); // a checkpoint found from an interrupted session
-  var [interrupted,setInterrupted]=useState(false); // tab went background/locked mid-recording
-  var timerRef=useRef(null);var recognitionRef=useRef(null);var allTextRef=useRef("");var isActiveRef=useRef(false);var sessionIdRef=useRef(0);var createRecognitionRef=useRef(null);
+function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings }) {
+  recQuality = recQuality || "Medium";
+  recSettings = recSettings || { noise:true, autoTranscribe:false, speakerID:false, autoSave:false };
+  var QUALITY_BITRATE = { Low:16000, Medium:32000, High:64000 };
+  var MAX_AUDIO_BYTES = 18 * 1024 * 1024; // safety margin under Gemini's 20MB inline request cap
+
+  var [phase,setPhase]=useState("idle"); // idle | recording | paused | stopped | transcribing | reviewing
+  var [elapsed,setElapsed]=useState(0);
+  var [title,setTitle]=useState("");var [courses,setCourses]=useState(["General"]);var [course,setCourse]=useState("General");
+  var [showAddCourse,setShowAddCourse]=useState(false);var [newCourse,setNewCourse]=useState("");
+  var [status,setStatus]=useState("Tap Start Recording to begin");
+  var [wantFull,setWantFull]=useState(true);var [wantSmart,setWantSmart]=useState(true);var [wantSummary,setWantSummary]=useState(true);
+  var [outputs,setOutputs]=useState({full:"",smart:"",summary:""});
+  var [activeTab,setActiveTab]=useState(null);
+  var [audioSizeWarning,setAudioSizeWarning]=useState("");
+  var [saving,setSaving]=useState(false);
+
+  var timerRef=useRef(null);
+  var mediaRecorderRef=useRef(null);
+  var streamRef=useRef(null);
+  var chunksRef=useRef([]);
+  var audioBlobRef=useRef(null);
+  var mimeTypeRef=useRef("audio/webm");
+
   var fmt=function(s){return String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0");};
   function addCourse(){var c=newCourse.trim().toUpperCase();if(!c||courses.includes(c))return;setCourses(function(p){return[...p,c];});setNewCourse("");setShowAddCourse(false);}
   function removeCourse(c){if(c==="General")return;setCourses(function(p){return p.filter(function(x){return x!==c;});});if(course===c)setCourse("General");}
 
-  // Crash recovery: if a checkpoint from an earlier, never-finished recording is
-  // sitting in local storage (app closed/crashed mid-lecture), offer to restore it.
   useEffect(function(){
-    try{
-      var raw = localStorage.getItem("jotting_voice_checkpoint");
-      if (raw) {
-        var saved = JSON.parse(raw);
-        if (saved && saved.text && saved.text.trim()) setRecovered(saved);
-      }
-    }catch(e){}
+    return function(){
+      clearInterval(timerRef.current);
+      try{ mediaRecorderRef.current && mediaRecorderRef.current.state!=="inactive" && mediaRecorderRef.current.stop(); }catch(e){}
+      try{ streamRef.current && streamRef.current.getTracks().forEach(function(t){t.stop();}); }catch(e){}
+    };
   }, []);
-  function restoreCheckpoint(){
-    if(!recovered) return;
-    allTextRef.current = recovered.text;
-    setTranscript(recovered.text);
-    setTitle(recovered.title||"");
-    setRecovered(null);
-    try{ localStorage.removeItem("jotting_voice_checkpoint"); }catch(e){}
-  }
-  function discardCheckpoint(){
-    setRecovered(null);
-    try{ localStorage.removeItem("jotting_voice_checkpoint"); }catch(e){}
-  }
-  function saveCheckpoint(){
-    try{ localStorage.setItem("jotting_voice_checkpoint", JSON.stringify({ text: allTextRef.current, title: title, ts: Date.now() })); }catch(e){}
-  }
-  function clearCheckpoint(){
-    try{ localStorage.removeItem("jotting_voice_checkpoint"); }catch(e){}
-  }
 
-  // If the tab gets backgrounded or the phone locks mid-recording, the browser will
-  // pause/kill the mic — that's an OS-level limit no website can override. The best
-  // we can do: notice it happened, tell the user clearly, and pick back up automatically
-  // (keeping everything already transcribed) the moment they return.
-  useEffect(function(){
-    function handleVisibility(){
-      if (document.hidden) {
-        if (isActiveRef.current) {
-          setInterrupted(true);
-          setStatus("⏸️ Paused — screen locked or app left. Reopen to continue.");
+  async function startRecording(){
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){ setStatus("Your browser doesn't support audio recording."); return; }
+    try{
+      var stream = await navigator.mediaDevices.getUserMedia({ audio: { noiseSuppression: !!recSettings.noise, echoCancellation:true } });
+      streamRef.current = stream;
+      var mimeType = "audio/webm";
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported){
+        if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) mimeType = "audio/webm;codecs=opus";
+        else if (MediaRecorder.isTypeSupported("audio/mp4")) mimeType = "audio/mp4";
+      }
+      mimeTypeRef.current = mimeType;
+      chunksRef.current = [];
+      var recorder = new MediaRecorder(stream, { mimeType: mimeType, audioBitsPerSecond: QUALITY_BITRATE[recQuality]||32000 });
+      recorder.ondataavailable = function(e){ if(e.data && e.data.size>0) chunksRef.current.push(e.data); };
+      recorder.onstop = function(){
+        audioBlobRef.current = new Blob(chunksRef.current, { type: mimeTypeRef.current });
+        if (audioBlobRef.current.size > MAX_AUDIO_BYTES) {
+          setAudioSizeWarning("This recording is quite long (~"+Math.round(audioBlobRef.current.size/1024/1024)+"MB). Transcription may fail — consider recording shorter sessions if this happens.");
+        } else {
+          setAudioSizeWarning("");
         }
-      } else if (interrupted && isActiveRef.current) {
-        setInterrupted(false);
-        setStatus("Resuming...");
-        sessionIdRef.current++;
-        var newId = sessionIdRef.current;
-        var r = createRecognitionRef.current(allTextRef.current, newId);
-        if (r) { recognitionRef.current = r; try{ r.start(); }catch(e){} }
-      }
+      };
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+      setPhase("recording");
+      setElapsed(0);
+      setStatus("Recording...");
+      timerRef.current = setInterval(function(){ setElapsed(function(e){return e+1;}); }, 1000);
+    }catch(e){
+      setStatus("Couldn't access the microphone — check your browser's mic permission.");
     }
-    document.addEventListener("visibilitychange", handleVisibility);
-    return function(){ document.removeEventListener("visibilitychange", handleVisibility); };
-  }, [interrupted]);
-  function mergeNoDupe(base,addition){
-    if(!base) return addition;
-    if(!addition) return base;
-    var baseWords=base.trim().split(/\s+/);
-    var addWords=addition.trim().split(/\s+/);
-    var maxOverlap=Math.min(6,baseWords.length,addWords.length);
-    for(var len=maxOverlap;len>0;len--){
-      var tail=baseWords.slice(baseWords.length-len).join(" ").toLowerCase();
-      var head=addWords.slice(0,len).join(" ").toLowerCase();
-      if(tail===head){ return base+" "+addWords.slice(len).join(" "); }
-    }
-    return base+" "+addition;
   }
-  function createRecognition(baseText,sessionId){
-    var SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR)return null;
-    var r=new SR();r.continuous=true;r.interimResults=true;r.lang="en-US";
-    var sessionNew="";
-    r.onresult=function(e){
-      if(sessionIdRef.current!==sessionId) return;
-      var final="";var interim="";
-      for(var i=e.resultIndex;i<e.results.length;i++){
-        if(e.results[i].isFinal){ final+=e.results[i][0].transcript+" "; }
-        else{ interim+=e.results[i][0].transcript; }
-      }
-      if(final){ sessionNew=mergeNoDupe(sessionNew,final); }
-      var combined=mergeNoDupe(baseText,sessionNew);
-      allTextRef.current=combined;
-      setTranscript((combined+" "+interim).replace(/\s+/g," ").trim());
-      setStatus("Listening... speak clearly");
-    };
-    r.onerror=function(e){ if(e.error==="no-speech"||e.error==="aborted")return; };
-    r.onend=function(){
-      if(sessionIdRef.current!==sessionId) return;
-      if(isActiveRef.current){
-        var newBase=mergeNoDupe(baseText,sessionNew);
-        allTextRef.current=newBase;
-        setTimeout(function(){
-          if(isActiveRef.current&&sessionIdRef.current===sessionId){
-            var newId=sessionId+1;
-            sessionIdRef.current=newId;
-            var next=createRecognition(newBase,newId);
-            if(next){ recognitionRef.current=next; try{next.start();}catch(err){} }
-          }
-        },300);
-      } else { setStatus("Recording complete"); }
-    };
-    return r;
+  function pauseRecording(){
+    try{ mediaRecorderRef.current.pause(); }catch(e){}
+    clearInterval(timerRef.current);
+    setPhase("paused");
+    setStatus("Paused");
   }
-  useEffect(function(){ createRecognitionRef.current = createRecognition; }); // no dep array: refreshes every render, always current
-  function startRecording(){
-    var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-    if(!SR){setStatus("Please use Chrome browser!");return;}
-    allTextRef.current="";setTranscript("");isActiveRef.current=true;
-    setIsRecording(true);setIsPaused(false);setElapsed(0);
-    clearCheckpoint();
-    timerRef.current=setInterval(function(){
-      setElapsed(function(e){return e+1;});
-      saveCheckpoint(); // runs every second alongside the timer — cheap, and means at most ~1s is ever at risk
-    },1000);
-    var newId=sessionIdRef.current+1;
-    sessionIdRef.current=newId;
-    var r=createRecognition("",newId);
-    if(r){ recognitionRef.current=r; try{r.start();}catch(e){} }
-  }
-  function pauseRecording(){isActiveRef.current=false;setIsPaused(true);sessionIdRef.current++;clearInterval(timerRef.current);try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}setStatus("Paused");}
   function resumeRecording(){
-    isActiveRef.current=true;setIsPaused(false);
-    timerRef.current=setInterval(function(){setElapsed(function(e){return e+1;});saveCheckpoint();},1000);
-    var newId=sessionIdRef.current+1;
-    sessionIdRef.current=newId;
-    var r=createRecognition(allTextRef.current,newId);
-    if(r){ recognitionRef.current=r; try{r.start();}catch(e){} }
-    setStatus("Resumed...");
+    try{ mediaRecorderRef.current.resume(); }catch(e){}
+    timerRef.current = setInterval(function(){ setElapsed(function(e){return e+1;}); }, 1000);
+    setPhase("recording");
+    setStatus("Recording...");
   }
   function stopRecording(){
-    isActiveRef.current=false;setIsRecording(false);setIsPaused(false);sessionIdRef.current++;clearInterval(timerRef.current);
-    try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}
-    setStatus("Recording complete");
-    setTimeout(function(){
-      var finalText=allTextRef.current;
-      if(finalText&&finalText.trim()){
-        setRawTranscript(finalText);
-        polishTranscript(finalText);
-      }
-    },400); // small delay lets the recognizer's last final result settle first
-  }
-  async function polishTranscript(raw){
-    setPolishing(true);
-    setStatus("✨ Polishing your notes with AI...");
-    try{
-      var cleaned=await callGeminiText("This is a raw speech-to-text transcript from a student's voice note. It may contain repeated words, filler words, and no punctuation. Rewrite it into clean, well-organized notes with proper punctuation and paragraph or bullet structure. Preserve all the actual content and meaning without adding new information. Return only the cleaned notes text, no preamble or explanation.\n\nTranscript:\n"+raw,1200);
-      setPolishedTranscript(cleaned);
-      setTranscript(cleaned);
-      setViewMode("polished");
-      setStatus("✨ Notes polished! Review and save, or view the original below.");
-    }catch(e){
-      setStatus("Couldn't reach Gemini to polish (check your API key) — showing your raw transcript.");
+    clearInterval(timerRef.current);
+    try{ mediaRecorderRef.current && mediaRecorderRef.current.stop(); }catch(e){}
+    try{ streamRef.current && streamRef.current.getTracks().forEach(function(t){t.stop();}); }catch(e){}
+    setPhase("stopped");
+    setStatus("Recording saved — choose what you'd like from it.");
+    if (recSettings.autoTranscribe) {
+      // small delay so onstop finishes building the blob first
+      setTimeout(function(){ transcribe(); }, 300);
     }
-    setPolishing(false);
   }
-  function toggleTranscriptView(){
-    if(viewMode==="polished"){ setTranscript(rawTranscript); setViewMode("raw"); }
-    else { setTranscript(polishedTranscript||rawTranscript); setViewMode("polished"); }
+
+  function blobToBase64(blob){
+    return new Promise(function(resolve,reject){
+      var reader = new FileReader();
+      reader.onloadend = function(){ resolve(reader.result.split(",")[1]); };
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
   }
-  useEffect(function(){return function(){isActiveRef.current=false;clearInterval(timerRef.current);try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}};}, []);
-  function saveNote(){
-    if(!transcript.trim()){alert("Record something first!");return;}
+
+  async function transcribe(){
+    if(!audioBlobRef.current){ setStatus("Record something first!"); return; }
+    if(!wantFull && !wantSmart && !wantSummary){ setStatus("Pick at least one output type."); return; }
+    setPhase("transcribing");
+    setStatus("✨ Transcribing your recording with AI...");
     try{
-      onSave({id:Date.now(),title:title||("Voice Note - "+new Date().toLocaleDateString()),course,color:"#06B6D4",bg:"rgba(6,182,212,0.12)",tag:"Lecture",words:transcript.split(" ").length,preview:transcript.slice(0,100),content:transcript});
-      clearCheckpoint();
-    }catch(e){ alert("Couldn't save the note — check your connection and try again."); }
+      var base64 = await blobToBase64(audioBlobRef.current);
+      var mediaType = mimeTypeRef.current.split(";")[0];
+      var jobs=[];
+      if(wantFull) jobs.push(["full", callGeminiAudio(base64, mediaType, "Transcribe this lecture recording verbatim, word for word, as accurately as you can. Add natural paragraph breaks where the speaker's train of thought shifts. Return only the transcript, no preamble.", 3000)]);
+      if(wantSmart) jobs.push(["smart", callGeminiAudio(base64, mediaType, "Listen to this lecture recording and turn it into clean, well-organized study notes — headers and bullet points, only the important points, skip filler and repetition. Return only the notes, no preamble.", 2000)]);
+      if(wantSummary) jobs.push(["summary", callGeminiAudio(base64, mediaType, "Listen to this lecture recording and write a concise one-page revision summary covering only the core ideas and key takeaways a student needs to remember. Return only the summary, no preamble.", 900)]);
+      var results = await Promise.allSettled(jobs.map(function(j){return j[1];}));
+      var next = {full:"",smart:"",summary:""};
+      var firstKey=null;
+      results.forEach(function(r,i){
+        var key=jobs[i][0];
+        if(r.status==="fulfilled"){ next[key]=r.value; if(!firstKey)firstKey=key; }
+        else { next[key]="⚠️ Couldn't generate this — "+(r.reason&&r.reason.message?r.reason.message:"try again."); }
+      });
+      setOutputs(next);
+      setActiveTab(firstKey||"full");
+      setPhase("reviewing");
+      setStatus("Review below, edit anything, then save.");
+      if (recSettings.autoSave && firstKey) {
+        setTimeout(function(){ saveNote(next[firstKey]); }, 300);
+      }
+    }catch(e){
+      setStatus("Couldn't reach Gemini to transcribe — check your API key or connection.");
+      setPhase("stopped");
+    }
   }
+
+  function saveNote(overrideContent){
+    var content = overrideContent!=null ? overrideContent : (activeTab?outputs[activeTab]:"");
+    if(!content || !content.trim()){ alert("Nothing to save yet!"); return; }
+    setSaving(true);
+    try{
+      onSave({id:Date.now(),title:title||("Voice Note - "+new Date().toLocaleDateString()),course,color:"#06B6D4",bg:"rgba(6,182,212,0.12)",tag:"Lecture",words:content.split(" ").length,preview:content.slice(0,100),content:content});
+    }catch(e){ alert("Couldn't save the note — check your connection and try again."); }
+    setSaving(false);
+  }
+
+  var TAB_LABELS = { full:"📝 Full Transcript", smart:"📚 Smart Notes", summary:"📄 Summary" };
+  var checkedTabs = ["full","smart","summary"].filter(function(k){ return (k==="full"&&wantFull)||(k==="smart"&&wantSmart)||(k==="summary"&&wantSummary); });
+
   return(
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
       <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
         <button onClick={onBack} style={backBtn}>←</button>
         <span style={{ fontWeight:800,fontSize:16,color:C.text }}>Voice Recording</span>
-        <button onClick={saveNote} disabled={polishing} style={{ background:polishing?C.card2:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:polishing?C.muted:"#fff",border:"none",borderRadius:10,padding:"8px 18px",fontWeight:800,fontSize:14,cursor:polishing?"default":"pointer" }}>{polishing?"Polishing...":"Save"}</button>
+        {phase==="reviewing"
+          ? <button onClick={function(){saveNote();}} disabled={saving} style={{ background:saving?C.card2:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:saving?C.muted:"#fff",border:"none",borderRadius:10,padding:"8px 18px",fontWeight:800,fontSize:14,cursor:saving?"default":"pointer" }}>{saving?"Saving...":"Save"}</button>
+          : <div style={{ width:64 }}/>}
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:20 }}>
-        {recovered&&(
-          <div style={{ background:"rgba(245,158,11,0.1)",border:"1px solid rgba(245,158,11,0.3)",borderRadius:14,padding:16,marginBottom:16 }}>
-            <div style={{ fontWeight:800,fontSize:13,color:C.amber,marginBottom:6 }}>⚠️ Recovered an unfinished recording</div>
-            <div style={{ fontSize:12,color:C.muted,marginBottom:10 }}>Looks like a previous recording didn't get saved — probably the app closed or your phone locked mid-session. Want to bring it back?</div>
-            <div style={{ display:"flex",gap:8 }}>
-              <button onClick={restoreCheckpoint} style={{ flex:1,background:C.amber,color:"#0A0F1E",border:"none",borderRadius:10,padding:"9px",fontWeight:800,cursor:"pointer",fontSize:13 }}>Restore it</button>
-              <button onClick={discardCheckpoint} style={{ flex:1,background:"none",border:"1px solid "+C.border,borderRadius:10,padding:"9px",color:C.muted,fontWeight:700,cursor:"pointer",fontSize:13 }}>Discard</button>
-            </div>
-          </div>
-        )}
         <input value={title} onChange={function(e){setTitle(e.target.value);}} placeholder="Note title (optional)..." style={{ width:"100%",padding:"13px 16px",borderRadius:12,border:"1px solid "+C.border,fontSize:15,fontWeight:700,background:C.card,color:C.text,outline:"none",marginBottom:14,boxSizing:"border-box" }}/>
         <div style={{ marginBottom:16 }}>
           <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10 }}><span style={{ fontSize:13,fontWeight:700,color:C.soft }}>Select Course</span><button onClick={function(){setShowAddCourse(function(s){return !s;});}} style={{ background:C.cyan+"20",border:"1px solid "+C.cyan+"40",borderRadius:8,padding:"5px 12px",color:C.cyan,fontSize:12,fontWeight:700,cursor:"pointer" }}>+ Add Course</button></div>
           {showAddCourse&&(<div style={{ background:C.card2,borderRadius:14,padding:14,marginBottom:12,border:"1px solid "+C.cyan+"30" }}><div style={{ display:"flex",gap:8 }}><input value={newCourse} onChange={function(e){setNewCourse(e.target.value);}} onKeyDown={function(e){if(e.key==="Enter")addCourse();}} placeholder="e.g. BIO 201" style={{ flex:1,padding:"10px 14px",borderRadius:10,border:"1px solid "+C.border,background:C.bg,color:C.text,outline:"none",fontSize:14 }}/><button onClick={addCourse} style={{ background:C.cyan,border:"none",borderRadius:10,padding:"10px 16px",color:"#0A0F1E",fontWeight:800,cursor:"pointer" }}>Add</button><button onClick={function(){setShowAddCourse(false);}} style={{ background:C.card,border:"1px solid "+C.border,borderRadius:10,padding:"10px 12px",color:C.muted,cursor:"pointer" }}>X</button></div></div>)}
           <div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{courses.map(function(c){return(<div key={c} style={{ display:"flex" }}><button onClick={function(){setCourse(c);}} style={{ padding:"7px 14px",borderRadius:c==="General"?99:"99px 0 0 99px",border:"2px solid",borderColor:course===c?C.cyan:C.border,borderRight:c!=="General"?"none":undefined,background:course===c?C.cyan:C.card,color:course===c?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{c}</button>{c!=="General"&&<button onClick={function(){removeCourse(c);}} style={{ padding:"7px 8px",borderRadius:"0 99px 99px 0",border:"2px solid",borderColor:course===c?C.cyan:C.border,borderLeft:"none",background:course===c?C.cyan:C.card,color:C.red,fontSize:11,cursor:"pointer" }}>X</button>}</div>);})}</div>
         </div>
-        <div style={{ background:C.card,borderRadius:24,padding:"28px 20px",border:"2px solid "+(isRecording&&!isPaused?C.red:isPaused?C.amber:C.border),marginBottom:16,textAlign:"center" }}>
-          <div onClick={!isRecording?startRecording:undefined} style={{ width:110,height:110,borderRadius:"50%",background:isRecording?(isPaused?"linear-gradient(135deg,#F59E0B,#FCD34D)":"linear-gradient(135deg,#EF4444,#F87171)"):"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 20px",cursor:!isRecording?"pointer":"default",fontSize:46,boxShadow:isRecording&&!isPaused?"0 0 0 14px rgba(239,68,68,0.12)":"0 8px 32px rgba(6,182,212,0.35)",animation:isRecording&&!isPaused?"pulse 1.5s ease-in-out infinite":"none" }}>{isPaused?"⏸":"🎙️"}</div>
-          {isRecording&&<div style={{ fontSize:40,fontWeight:800,color:isPaused?C.amber:C.red,marginBottom:12,fontFamily:"monospace",letterSpacing:3 }}>{fmt(elapsed)}</div>}
-          <div style={{ display:"flex",justifyContent:"center",marginBottom:14 }}><Wave active={isRecording&&!isPaused} color={isRecording&&!isPaused?"#EF4444":C.cyan} size={1.6}/></div>
-          <p style={{ color:isRecording?(isPaused?C.amber:C.red):C.muted,fontSize:14,fontWeight:600,margin:"0 0 20px" }}>{status}</p>
+
+        <div style={{ background:C.card,borderRadius:24,padding:"28px 20px",border:"2px solid "+(phase==="recording"?C.red:phase==="paused"?C.amber:C.border),marginBottom:16,textAlign:"center" }}>
+          <div onClick={phase==="idle"?startRecording:undefined} style={{ width:110,height:110,borderRadius:"50%",background:phase==="recording"?"linear-gradient(135deg,#EF4444,#F87171)":phase==="paused"?"linear-gradient(135deg,#F59E0B,#FCD34D)":"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 20px",cursor:phase==="idle"?"pointer":"default",fontSize:46,boxShadow:phase==="recording"?"0 0 0 14px rgba(239,68,68,0.12)":"0 8px 32px rgba(6,182,212,0.35)",animation:phase==="recording"?"pulse 1.5s ease-in-out infinite":"none" }}>{phase==="paused"?"⏸":"🎙️"}</div>
+          {(phase==="recording"||phase==="paused")&&<div style={{ fontSize:40,fontWeight:800,color:phase==="paused"?C.amber:C.red,marginBottom:12,fontFamily:"monospace",letterSpacing:3 }}>⏱ {fmt(elapsed)}</div>}
+          <div style={{ display:"flex",justifyContent:"center",marginBottom:14 }}><Wave active={phase==="recording"} color={phase==="recording"?"#EF4444":C.cyan} size={1.6}/></div>
+          <p style={{ color:phase==="recording"?C.red:phase==="paused"?C.amber:C.muted,fontSize:14,fontWeight:600,margin:"0 0 20px" }}>{status}</p>
           <div style={{ display:"flex",gap:10,justifyContent:"center" }}>
-            {!isRecording?(<button onClick={startRecording} style={{ background:"linear-gradient(135deg,#EF4444,#F87171)",color:"#fff",border:"none",borderRadius:14,padding:"14px 36px",fontWeight:800,fontSize:15,cursor:"pointer",boxShadow:"0 4px 20px rgba(239,68,68,0.4)" }}>Start Recording</button>):(<div style={{ display:"flex",gap:10 }}>{!isPaused?<button onClick={pauseRecording} style={{ background:C.amber,color:"#0A0F1E",border:"none",borderRadius:14,padding:"13px 24px",fontWeight:800,fontSize:14,cursor:"pointer" }}>⏸ Pause</button>:<button onClick={resumeRecording} style={{ background:C.green,color:"#0A0F1E",border:"none",borderRadius:14,padding:"13px 24px",fontWeight:800,fontSize:14,cursor:"pointer" }}>▶ Resume</button>}<button onClick={stopRecording} style={{ background:"rgba(248,113,113,0.15)",color:C.red,border:"2px solid "+C.red+"40",borderRadius:14,padding:"13px 24px",fontWeight:800,fontSize:14,cursor:"pointer" }}>⏹ Stop</button></div>)}
+            {phase==="idle"&&<button onClick={startRecording} style={{ background:"linear-gradient(135deg,#EF4444,#F87171)",color:"#fff",border:"none",borderRadius:14,padding:"14px 36px",fontWeight:800,fontSize:15,cursor:"pointer",boxShadow:"0 4px 20px rgba(239,68,68,0.4)" }}>🎤 Start Recording</button>}
+            {(phase==="recording"||phase==="paused")&&<div style={{ display:"flex",gap:10 }}>
+              {phase==="recording"?<button onClick={pauseRecording} style={{ background:C.amber,color:"#0A0F1E",border:"none",borderRadius:14,padding:"13px 24px",fontWeight:800,fontSize:14,cursor:"pointer" }}>⏸ Pause</button>:<button onClick={resumeRecording} style={{ background:C.green,color:"#0A0F1E",border:"none",borderRadius:14,padding:"13px 24px",fontWeight:800,fontSize:14,cursor:"pointer" }}>▶ Resume</button>}
+              <button onClick={stopRecording} style={{ background:"rgba(248,113,113,0.15)",color:C.red,border:"2px solid "+C.red+"40",borderRadius:14,padding:"13px 24px",fontWeight:800,fontSize:14,cursor:"pointer" }}>⏹ Stop Recording</button>
+            </div>}
           </div>
         </div>
-        <div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+(transcript?C.cyan+"40":C.border) }}>
-          <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12 }}>
-            <div style={{ display:"flex",alignItems:"center",gap:8 }}><span style={{ fontWeight:700,fontSize:14,color:C.cyan }}>{polishedTranscript&&viewMode==="polished"?"✨ AI-Polished Notes":"📝 Live Transcript"}</span>{isRecording&&!isPaused&&<div style={{ width:8,height:8,borderRadius:"50%",background:C.red,animation:"pulse 1s ease-in-out infinite" }}/>}{polishing&&<div style={{ width:8,height:8,borderRadius:"50%",background:C.cyan,animation:"pulse 1s ease-in-out infinite" }}/>}</div>
-            <div style={{ display:"flex",gap:8 }}>{polishedTranscript&&!isRecording&&<button onClick={toggleTranscriptView} style={{ background:C.card2,border:"none",borderRadius:8,padding:"4px 10px",color:C.amber,cursor:"pointer",fontSize:12,fontWeight:600 }}>{viewMode==="polished"?"View Original":"View Polished"}</button>}{transcript&&<button onClick={function(){allTextRef.current="";setTranscript("");setRawTranscript("");setPolishedTranscript("");setViewMode("live");}} style={{ background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:12,fontWeight:600 }}>Clear</button>}{transcript&&<button onClick={function(){navigator.clipboard&&navigator.clipboard.writeText(transcript);}} style={{ background:C.card2,border:"none",borderRadius:8,padding:"4px 10px",color:C.cyan,cursor:"pointer",fontSize:12,fontWeight:600 }}>Copy</button>}</div>
+
+        {(phase==="stopped"||phase==="transcribing"||phase==="reviewing")&&(
+          <div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+C.border,marginBottom:16 }}>
+            {audioSizeWarning&&<div style={{ background:"rgba(245,158,11,0.1)",border:"1px solid rgba(245,158,11,0.3)",borderRadius:10,padding:10,fontSize:12,color:C.amber,marginBottom:14 }}>⚠️ {audioSizeWarning}</div>}
+            <div style={{ fontWeight:800,fontSize:14,color:C.text,marginBottom:12 }}>Choose Output</div>
+            {[["full",wantFull,setWantFull,"📝 Full Transcript","Everything the lecturer said"],["smart",wantSmart,setWantSmart,"📚 Smart Notes","Only the important points"],["summary",wantSummary,setWantSummary,"📄 Summary","One-page revision notes"]].map(function(item){return(
+              <label key={item[0]} style={{ display:"flex",alignItems:"center",gap:12,padding:"10px 0",cursor:phase==="transcribing"?"default":"pointer",opacity:phase==="transcribing"?0.6:1 }}>
+                <input type="checkbox" checked={item[1]} disabled={phase==="transcribing"} onChange={function(e){item[2](e.target.checked);}} style={{ width:20,height:20,accentColor:C.cyan }}/>
+                <div><div style={{ fontWeight:700,fontSize:14,color:C.text }}>{item[3]}</div><div style={{ fontSize:12,color:C.muted }}>{item[4]}</div></div>
+              </label>
+            );})}
+            {phase!=="reviewing"&&<button onClick={transcribe} disabled={phase==="transcribing"} style={{ width:"100%",marginTop:14,background:phase==="transcribing"?C.card2:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:phase==="transcribing"?C.muted:"#fff",border:"none",borderRadius:14,padding:"14px",fontWeight:800,fontSize:15,cursor:phase==="transcribing"?"default":"pointer" }}>{phase==="transcribing"?"✨ Transcribing...":"✨ Transcribe"}</button>}
           </div>
-          <div style={{ minHeight:120,fontSize:14,lineHeight:1.9,color:transcript?C.text:C.muted }}>{polishing?"✨ Polishing your notes with AI...":(transcript||"Tap Start Recording — your words appear here instantly...")}</div>
-          {transcript&&(<div style={{ marginTop:10,paddingTop:10,borderTop:"1px solid "+C.border,display:"flex",justifyContent:"space-between" }}><span style={{ fontSize:11,color:C.muted }}>{transcript.split(" ").filter(function(w){return w;}).length} words</span><span style={{ fontSize:11,color:C.muted }}>{transcript.length} chars</span></div>)}
-        </div>
+        )}
+
+        {phase==="reviewing"&&(
+          <div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+C.cyan+"40" }}>
+            <div style={{ display:"flex",gap:8,marginBottom:14,flexWrap:"wrap" }}>
+              {checkedTabs.map(function(k){return<button key={k} onClick={function(){setActiveTab(k);}} style={{ padding:"7px 14px",borderRadius:99,border:"none",background:activeTab===k?C.cyan:C.card2,color:activeTab===k?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{TAB_LABELS[k]}</button>;})}
+            </div>
+            <textarea value={activeTab?outputs[activeTab]:""} onChange={function(e){var v=e.target.value;setOutputs(function(o){var n={...o};n[activeTab]=v;return n;});}} style={{ width:"100%",minHeight:280,background:"transparent",border:"none",color:C.text,fontSize:14,lineHeight:1.9,outline:"none",resize:"none",fontFamily:"inherit",boxSizing:"border-box" }}/>
+            <div style={{ marginTop:10,paddingTop:10,borderTop:"1px solid "+C.border,display:"flex",justifyContent:"space-between" }}>
+              <span style={{ fontSize:11,color:C.muted }}>{(activeTab&&outputs[activeTab]?outputs[activeTab].split(" ").filter(function(w){return w;}).length:0)} words</span>
+              <button onClick={function(){navigator.clipboard&&activeTab&&navigator.clipboard.writeText(outputs[activeTab]);}} style={{ background:"none",border:"none",color:C.cyan,cursor:"pointer",fontSize:12,fontWeight:600 }}>Copy</button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -795,7 +796,7 @@ function DashboardScreen({ notes, user }) {
 }
 
 // ── HOME ──────────────────────────────────────────────────────────────────────
-function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, user }) {
+function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, onChat, user }) {
   var [search,setSearch]=useState("");var [filter,setFilter]=useState("All");
   var filters=["All","Lecture","Study","Business","Personal"];
   var filtered=notes.filter(function(n){return(n.title.toLowerCase().includes(search.toLowerCase())||n.course.toLowerCase().includes(search.toLowerCase()))&&(filter==="All"||n.tag===filter);});
@@ -828,8 +829,8 @@ function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, user })
         </div>
         <div style={{ marginBottom:22 }}>
           <p style={{ fontWeight:800,fontSize:16,color:C.text,margin:"0 0 14px" }}>Quick Actions</p>
-          <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:10 }}>
-            {[["🎙️","Voice\nNote",C.cyan,onVoice],["✨","AI\nWrite",C.purple,onAIWrite],["📷","Scan\nDoc",C.amber,onScan],["🖊️","Draw",C.green,onDraw]].map(function(item){return<button key={item[1]} onClick={item[3]} style={{ background:C.card,border:"1px solid "+item[2]+"30",borderRadius:14,padding:"14px 8px",cursor:"pointer",textAlign:"center" }}><div style={{ width:38,height:38,borderRadius:10,background:item[2]+"20",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 8px",fontSize:20 }}>{item[0]}</div><span style={{ fontSize:11,fontWeight:700,color:C.soft,whiteSpace:"pre-line",lineHeight:1.3 }}>{item[1]}</span></button>;}) }
+          <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10 }}>
+            {[["🎙️","Voice\nNote",C.cyan,onVoice],["✨","AI\nWrite",C.purple,onAIWrite],["💬","AI\nChat",C.cyan,onChat],["📷","Scan\nDoc",C.amber,onScan],["🖊️","Draw",C.green,onDraw]].map(function(item){return<button key={item[1]} onClick={item[3]} style={{ background:C.card,border:"1px solid "+item[2]+"30",borderRadius:14,padding:"14px 8px",cursor:"pointer",textAlign:"center" }}><div style={{ width:38,height:38,borderRadius:10,background:item[2]+"20",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 8px",fontSize:20 }}>{item[0]}</div><span style={{ fontSize:11,fontWeight:700,color:C.soft,whiteSpace:"pre-line",lineHeight:1.3 }}>{item[1]}</span></button>;}) }
           </div>
         </div>
         <div style={{ display:"flex",gap:8,marginBottom:16,overflowX:"auto",paddingBottom:4 }}>
@@ -847,7 +848,7 @@ function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, user })
 }
 
 // ── AI CHAT ───────────────────────────────────────────────────────────────────
-function AIScreen({ notes }) {
+function AIScreen({ notes, onBack }) {
   var greeting={role:"ai",text:"Hi! 👋 I'm your AI study assistant. Ask me anything, or tap 📎 to attach one of your notes and we can go through it together."};
   var [messages,setMessages]=useState([greeting]);
   var [input,setInput]=useState("");var [loading,setLoading]=useState(false);var [showPicker,setShowPicker]=useState(false);var [pickerSearch,setPickerSearch]=useState("");
@@ -897,7 +898,7 @@ function AIScreen({ notes }) {
   return(
     <div style={{ flex:1,display:"flex",flexDirection:"column",background:C.bg,position:"relative" }}>
       <div style={{ background:C.card,padding:"16px 20px",borderBottom:"1px solid "+C.border,display:"flex",justifyContent:"space-between",alignItems:"center" }}>
-        <div style={{ display:"flex",alignItems:"center",gap:10 }}><div style={{ width:40,height:40,borderRadius:12,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20 }}>🤖</div><div><div style={{ fontWeight:800,fontSize:16,color:C.text }}>AI Assistant</div><div style={{ fontSize:11,color:C.green,fontWeight:600 }}>Gemini AI</div></div></div>
+        <div style={{ display:"flex",alignItems:"center",gap:10 }}><button onClick={onBack} style={backBtn}>←</button><div style={{ width:40,height:40,borderRadius:12,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20 }}>🤖</div><div><div style={{ fontWeight:800,fontSize:16,color:C.text }}>AI Assistant</div><div style={{ fontSize:11,color:C.green,fontWeight:600 }}>Gemini AI</div></div></div>
         <button onClick={newChat} style={{ background:C.card2,border:"none",borderRadius:10,padding:"7px 12px",color:C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>🔄 New Chat</button>
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:"16px 16px 8px" }}>
@@ -930,14 +931,12 @@ function AIScreen({ notes }) {
 }
 
 // ── SETTINGS ──────────────────────────────────────────────────────────────────
-function SettingsScreen({ user, onLogout }) {
+function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings, setRecSettings }) {
   var [openSection,setOpenSection]=useState(null);
   var [lang,setLang]=useState("English");
   var [aiModel,setAiModel]=useState("Gemini");
   var [aiStyle,setAiStyle]=useState("Academic");
-  var [recQuality,setRecQuality]=useState("High");
   var [notifs,setNotifs]=useState({study:true,assignment:false,daily:true,recording:false});
-  var [recSettings,setRecSettings]=useState({noise:true,autoTranscribe:true,speakerID:false,autoSave:true});
   var [privacy,setPrivacy]=useState({fingerprint:false,face:false,pin:false,autoLock:true,hiddenFolder:false,encrypt:false});
 
   function Section({ id, icon, title, color, children }) {
@@ -990,14 +989,17 @@ function SettingsScreen({ user, onLogout }) {
 
         <Section id="rec" icon="🎤" title="Recording Settings" color="#06B6D4">
           <div style={{ marginTop:12 }}>
-            <div style={{ marginBottom:12 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>RECORDING QUALITY</div><div style={{ display:"flex",gap:8 }}>{["Low","Medium","High"].map(function(q){return<button key={q} onClick={function(){setRecQuality(q);}} style={{ flex:1,padding:"8px",borderRadius:10,border:"2px solid",borderColor:recQuality===q?C.cyan:C.border,background:recQuality===q?C.cyan:C.card,color:recQuality===q?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{q}</button>;})}</div></div>
-            {[["🔇","noise","Noise Reduction","Filter background noise"],["📝","autoTranscribe","Auto Transcription","Google free speech API"],["👥","speakerID","Speaker Identification","Identify different speakers"],["💾","autoSave","Auto Save Recording","Save recordings automatically"]].map(function(item){return<Row key={item[1]} icon={item[0]} label={item[2]} sub={item[3]} right={<Toggle value={recSettings[item[1]]} onChange={function(v){setRecSettings(function(p){return{...p,[item[1]]:v};});}} color={C.cyan}/>}/>;}) }
+            <div style={{ marginBottom:12 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>RECORDING QUALITY</div><div style={{ display:"flex",gap:8 }}>{["Low","Medium","High"].map(function(q){return<button key={q} onClick={function(){setRecQuality(q);}} style={{ flex:1,padding:"8px",borderRadius:10,border:"2px solid",borderColor:recQuality===q?C.cyan:C.border,background:recQuality===q?C.cyan:C.card,color:recQuality===q?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{q}</button>;})}</div><div style={{ fontSize:11,color:C.muted,marginTop:6 }}>Higher quality sounds better but makes a bigger audio file — matters if a lecture runs long.</div></div>
+            <Row icon="🔇" label="Noise Reduction" sub="Requests a noise-suppressed mic when you record" right={<Toggle value={recSettings.noise} onChange={function(v){setRecSettings(function(p){return{...p,noise:v};});}} color={C.cyan}/>}/>
+            <Row icon="✨" label="Auto-Transcribe" sub="Start transcribing automatically the moment you stop recording" right={<Toggle value={recSettings.autoTranscribe} onChange={function(v){setRecSettings(function(p){return{...p,autoTranscribe:v};});}} color={C.cyan}/>}/>
+            <Row icon="💾" label="Auto Save" sub="Save the note automatically once transcription finishes" right={<Toggle value={recSettings.autoSave} onChange={function(v){setRecSettings(function(p){return{...p,autoSave:v};});}} color={C.cyan}/>}/>
+            <div style={{ opacity:0.5 }}>
+              <Row icon="👥" label="Speaker Identification" sub="Needs a paid diarization service — not available yet" right={<span style={{ fontSize:9,fontWeight:700,color:C.amber,background:"rgba(245,158,11,0.15)",borderRadius:99,padding:"3px 8px" }}>COMING SOON</span>}/>
+            </div>
           </div>
-        </Section>
-
-        <Section id="ai" icon="🤖" title="AI Settings" color="#A78BFA">
+                <Section id="ai" icon="🤖" title="AI Settings" color="#A78BFA">
           <div style={{ marginTop:12 }}>
-     <div style={{ marginBottom:14 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>AI MODEL</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{["Gemini","Claude","GPT-4"].map(function(m){return<button key={m} onClick={function(){setAiModel(m);}} style={{ padding:"8px 16px",borderRadius:10,border:"2px solid",borderColor:aiModel===m?C.purple:C.border,background:aiModel===m?C.purple:C.card,color:aiModel===m?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{m}</button>;})}</div></div>
+            <div style={{ marginBottom:14 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>AI MODEL</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{["Gemini","Claude","GPT-4"].map(function(m){return<button key={m} onClick={function(){setAiModel(m);}} style={{ padding:"8px 16px",borderRadius:10,border:"2px solid",borderColor:aiModel===m?C.purple:C.border,background:aiModel===m?C.purple:C.card,color:aiModel===m?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{m}</button>;})}</div></div>
             <div style={{ marginBottom:14 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>WRITING STYLE</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{["Academic","Simple","Detailed"].map(function(s){return<button key={s} onClick={function(){setAiStyle(s);}} style={{ padding:"8px 16px",borderRadius:10,border:"2px solid",borderColor:aiStyle===s?C.purple:C.border,background:aiStyle===s?C.purple:C.card,color:aiStyle===s?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{s}</button>;})}</div></div>
             <Row icon="🌐" label="AI Response Language" sub="English"/>
             <Row icon="📏" label="AI Summary Length" sub="Medium"/>
@@ -1048,6 +1050,13 @@ export default function App() {
   var [screen, setScreen] = useState("home");
   var [activeNote, setActiveNote] = useState(null);
   var [tab, setTab] = useState("home");
+  var [recQuality, setRecQuality] = useState(function(){ try{ return localStorage.getItem("jotting_recQuality")||"Medium"; }catch(e){ return "Medium"; } });
+  var [recSettings, setRecSettings] = useState(function(){
+    try{ var raw=localStorage.getItem("jotting_recSettings"); return raw?JSON.parse(raw):{noise:true,autoTranscribe:false,speakerID:false,autoSave:false}; }
+    catch(e){ return {noise:true,autoTranscribe:false,speakerID:false,autoSave:false}; }
+  });
+  useEffect(function(){ try{ localStorage.setItem("jotting_recQuality", recQuality); }catch(e){} }, [recQuality]);
+  useEffect(function(){ try{ localStorage.setItem("jotting_recSettings", JSON.stringify(recSettings)); }catch(e){} }, [recSettings]);
 
   // Listen for auth state
   useEffect(function() {
@@ -1176,16 +1185,16 @@ export default function App() {
       <div style={{ width:"100%",maxWidth:400,minHeight:"calc(100vh - 40px)",background:C.bg,borderRadius:36,overflow:"hidden",display:"flex",flexDirection:"column",boxShadow:"0 24px 80px rgba(6,182,212,0.12), 0 0 0 1px rgba(255,255,255,0.06)" }}>
         {cloudLoading&&<div style={{ background:"rgba(6,182,212,0.1)",padding:"10px",textAlign:"center",fontSize:12,color:C.cyan,fontWeight:600 }}>☁️ Syncing your notes...</div>}
         <div style={{ flex:1,display:"flex",flexDirection:"column",overflowY:"auto",minHeight:0 }}>
-          {screen==="home"&&<HomeScreen notes={notes} user={user} onNote={function(n){setActiveNote(n);go("detail");}} onVoice={function(){go("voice","new");}} onDraw={function(){go("draw");}} onAIWrite={function(){go("aiwrite");}} onScan={function(){go("scan");}}/>}
+          {screen==="home"&&<HomeScreen notes={notes} user={user} onNote={function(n){setActiveNote(n);go("detail");}} onVoice={function(){go("voice","new");}} onDraw={function(){go("draw");}} onAIWrite={function(){go("aiwrite");}} onScan={function(){go("scan");}} onChat={function(){go("ai");}}/>}
           {screen==="library"&&<LibraryScreen notes={notes} onNote={function(n){setActiveNote(n);go("detail");}} onDelete={deleteNote}/>}
           {screen==="dashboard"&&<DashboardScreen notes={notes} user={user}/>}
           {screen==="detail"&&activeNote&&<NoteDetail note={activeNote} onBack={function(){go(tab==="library"?"library":"home",tab);}} onDelete={deleteNote}/>}
-          {screen==="voice"&&<VoiceNoteScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
+          {screen==="voice"&&<VoiceNoteScreen onBack={function(){go("home","home");}} onSave={saveNote} recQuality={recQuality} recSettings={recSettings}/>}
           {screen==="draw"&&<DrawScreen onBack={function(){go("home","home");}}/>}
           {screen==="aiwrite"&&<AIWriteScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
           {screen==="scan"&&<ScanDocScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
-          {screen==="ai"&&<AIScreen notes={notes}/>}
-          {screen==="settings"&&<SettingsScreen user={user} onLogout={handleLogout}/>}
+          {screen==="ai"&&<AIScreen notes={notes} onBack={function(){go("home","home");}}/>}
+          {screen==="settings"&&<SettingsScreen user={user} onLogout={handleLogout} recQuality={recQuality} setRecQuality={setRecQuality} recSettings={recSettings} setRecSettings={setRecSettings}/>}
         </div>
         <div style={{ background:C.card2,borderTop:"1px solid "+C.border,padding:"10px 10px 16px",display:"flex",justifyContent:"space-around",alignItems:"center",flexShrink:0 }}>
           {NAV.map(function(item){return(
@@ -1199,4 +1208,4 @@ export default function App() {
       </div>
     </div>
   );
-}               
+                                                                                                                                                                                                                                    }
