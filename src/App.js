@@ -26,7 +26,7 @@ const C = {
   red: "#F87171", text: "#F1F5F9", muted: "#64748B", soft: "#94A3B8",
 };
 
-const GEMINI_KEY = "AQ.Ab8RN6I2nJUkGrrtyn9AuImOjXwxBcJClNzrf4cgMDjAIvjdKw";
+const GEMINI_KEY = "YOUR_GEMINI_KEY_HERE";
 const GEMINI_MODEL = "gemini-flash-latest";
 
 // Gemini's servers occasionally return 503 (temporarily overloaded) — this retries
@@ -997,7 +997,50 @@ function SettingsScreen({ user, onLogout }) {
 
         <Section id="ai" icon="🤖" title="AI Settings" color="#A78BFA">
           <div style={{ marginTop:12 }}>
-            <div style={{ marginBottom:14 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>AI MODEL</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{["Gemini","Claude","GPT-4"].map(function(m){return<button key={m} onClick={function(){setAiModel(m);}} style={{ padding:"8px 16px",borderRadius:10,border:"2px solid",borderColor:aiModel===m?C.purple:C.border,background:aiModel===m?C.purple:C.card,color:aiModel===m?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{m}</button>;}  var [user, setUser] = useState(null);
+     <div style={{ marginBottom:14 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>AI MODEL</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{["Gemini","Claude","GPT-4"].map(function(m){return<button key={m} onClick={function(){setAiModel(m);}} style={{ padding:"8px 16px",borderRadius:10,border:"2px solid",borderColor:aiModel===m?C.purple:C.border,background:aiModel===m?C.purple:C.card,color:aiModel===m?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{m}</button>;})}</div></div>
+            <div style={{ marginBottom:14 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>WRITING STYLE</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{["Academic","Simple","Detailed"].map(function(s){return<button key={s} onClick={function(){setAiStyle(s);}} style={{ padding:"8px 16px",borderRadius:10,border:"2px solid",borderColor:aiStyle===s?C.purple:C.border,background:aiStyle===s?C.purple:C.card,color:aiStyle===s?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{s}</button>;})}</div></div>
+            <Row icon="🌐" label="AI Response Language" sub="English"/>
+            <Row icon="📏" label="AI Summary Length" sub="Medium"/>
+            <Row icon="📵" label="Offline AI Mode" sub="Available on Pro" right={<span style={{ background:"rgba(245,158,11,0.15)",color:C.amber,borderRadius:99,padding:"3px 10px",fontSize:11,fontWeight:700 }}>PRO</span>}/>
+          </div>
+        </Section>
+
+        <Section id="privacy" icon="🔒" title="Privacy and Security" color="#F87171">
+          <div style={{ marginTop:12 }}>{[["👆","fingerprint","Fingerprint Unlock","Use fingerprint to unlock"],["👤","face","Face Unlock","Unlock with face recognition"],["🔢","pin","PIN Lock","Set a 4-digit PIN"],["⏱","autoLock","Auto Lock","Lock after 1 minute"],["📁","hiddenFolder","Hidden Notes Folder","Keep private notes hidden"],["🔐","encrypt","Encrypt Notes","End-to-end encryption"]].map(function(item){return<Row key={item[1]} icon={item[0]} label={item[2]} sub={item[3]} right={<Toggle value={privacy[item[1]]} onChange={function(v){setPrivacy(function(p){return{...p,[item[1]]:v};});}} color={C.red}/>}/>;})}</div>
+        </Section>
+
+        <Section id="about" icon="ℹ️" title="About" color="#06B6D4">
+          <div style={{ marginTop:12 }}>
+            <Row icon="📱" label="App Version" sub="v4.0.0 - Login Edition" right={<span style={{ fontSize:13,color:C.muted }}>v4.0</span>}/>
+            <Row icon="🆕" label="What's New" sub="Login, Firebase, Cloud sync!"/>
+            <Row icon="🔏" label="Privacy Policy" sub="How we handle your data"/>
+            <Row icon="📜" label="Terms of Service" sub="Rules and conditions"/>
+            <Row icon="💬" label="Contact Support" sub="Get help from our team"/>
+            <Row icon="⭐" label="Rate the App" onPress={function(){alert("Thank you! Rating coming soon!");}}/>
+            <Row icon="📤" label="Share the App" onPress={function(){if(navigator.share){navigator.share({title:"Jotting AI",text:"Check out this AI note-taking app!",url:"https://notewave12.netlify.app"});}else{alert("Link: notewave12.netlify.app");}}}/>
+            <Row icon="🐛" label="Report a Bug" onPress={function(){alert("Report bugs to: samuel@gmail.com");}}/>
+            <div style={{ textAlign:"center",marginTop:16,color:C.muted,fontSize:12 }}>Jotting AI v4.0 - Built with love by Samuel</div>
+          </div>
+        </Section>
+
+        <Section id="account" icon="👤" title="Account" color="#34D399">
+          <div style={{ marginTop:12 }}>
+            <Row icon="✉️" label="Email" sub={(user&&user.email)||"Not logged in"}/>
+            <Row icon="👤" label="Display Name" sub={(user&&user.displayName)||"Not set"}/>
+            <Row icon="✅" label="Email Verified" sub={user&&user.emailVerified?"Your email is verified":"Email not verified yet"} right={<span style={{ fontSize:13,color:user&&user.emailVerified?C.green:C.amber }}>{user&&user.emailVerified?"✓":"Pending"}</span>}/>
+            <div onClick={onLogout} style={{ display:"flex",alignItems:"center",justifyContent:"center",padding:"14px",marginTop:12,background:"rgba(248,113,113,0.1)",borderRadius:12,cursor:"pointer",border:"1px solid "+C.red+"30" }}>
+              <span style={{ fontSize:14,fontWeight:700,color:C.red }}>🚪 Logout</span>
+            </div>
+          </div>
+        </Section>
+      </div>
+    </div>
+  );
+}
+
+// ── MAIN APP ──────────────────────────────────────────────────────────────────
+export default function App() {
+  var [user, setUser] = useState(null);
   var [authLoading, setAuthLoading] = useState(true);
   var [showOnboarding, setShowOnboarding] = useState(false);
   var [notes, setNotes] = useState([]);
@@ -1156,4 +1199,4 @@ function SettingsScreen({ user, onLogout }) {
       </div>
     </div>
   );
-}
+}               
