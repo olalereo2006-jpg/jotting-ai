@@ -33,7 +33,7 @@ const GEMINI_MODEL = "gemini-flash-latest";
 // a couple of times with a short growing delay before giving up for real.
 async function fetchWithRetry(url, options, retries) {
   retries = retries==null ? 2 : retries;
-  for (var attempt=0; attempt<=retries; attempt++) {
+  for (let attempt=0; attempt<=retries; attempt++) {
     var res = await fetch(url, options);
     if (res.status !== 503 || attempt===retries) return res;
     await new Promise(function(r){ setTimeout(r, 800*(attempt+1)); });
@@ -51,10 +51,39 @@ async function callGeminiText(promptText, maxTokens) {
   return text;
 }
 
+// Full multi-turn chat: `contents` is the whole conversation so far (each turn
+// {role:"user"|"model", parts:[{text}]}), so Gemini actually remembers context
+// across messages instead of treating every question in isolation.
+async function callGeminiChat(contents, systemInstruction, maxTokens) {
+  var body = { contents: contents, generationConfig: { maxOutputTokens: maxTokens||800 } };
+  if (systemInstruction) body.systemInstruction = { parts:[{ text: systemInstruction }] };
+  var res = await fetchWithRetry(
+    "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":generateContent?key="+GEMINI_KEY,
+    { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body) }
+  );
+  var data = await res.json();
+  var text = data&&data.candidates&&data.candidates[0]&&data.candidates[0].content&&data.candidates[0].content.parts&&data.candidates[0].content.parts[0]&&data.candidates[0].content.parts[0].text;
+  if (!text) throw new Error((data&&data.error&&data.error.message)||"No response from Gemini");
+  return text;
+}
+
 async function callGeminiVision(base64, mediaType, promptText, maxTokens) {
   var res = await fetchWithRetry(
     "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":generateContent?key="+GEMINI_KEY,
     { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ contents:[{role:"user",parts:[{inline_data:{mime_type:mediaType,data:base64}},{text:promptText}]}], generationConfig:{maxOutputTokens:maxTokens||1200} }) }
+  );
+  var data = await res.json();
+  var text = data&&data.candidates&&data.candidates[0]&&data.candidates[0].content&&data.candidates[0].content.parts&&data.candidates[0].content.parts[0]&&data.candidates[0].content.parts[0].text;
+  if (!text) throw new Error((data&&data.error&&data.error.message)||"No response from Gemini");
+  return text;
+}
+
+// Gemini can listen to real recorded audio directly and produce text from it —
+// this powers the record-then-transcribe flow (full transcript / smart notes / summary).
+async function callGeminiAudio(base64, mediaType, promptText, maxTokens) {
+  var res = await fetchWithRetry(
+    "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":generateContent?key="+GEMINI_KEY,
+    { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ contents:[{role:"user",parts:[{inline_data:{mime_type:mediaType,data:base64}},{text:promptText}]}], generationConfig:{maxOutputTokens:maxTokens||2000} }) }
   );
   var data = await res.json();
   var text = data&&data.candidates&&data.candidates[0]&&data.candidates[0].content&&data.candidates[0].content.parts&&data.candidates[0].content.parts[0]&&data.candidates[0].content.parts[0].text;
@@ -84,6 +113,26 @@ async function loadNotesFromCloud(userId) {
 
 async function deleteNoteFromCloud(firestoreId) {
   try { await deleteDoc(doc(db, "notes", firestoreId)); } catch(e) { console.error("Delete error:", e); }
+}
+
+// Notes store their real creation time in `id` (Date.now()) — this turns that into
+// a human label that actually updates as time passes, instead of a frozen "Today".
+function formatRelativeDate(ts) {
+  if (!ts) return "";
+  var now = new Date();
+  var d = new Date(ts);
+  var startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  var startOfNoteDay = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  var dayDiff = Math.round((startOfToday - startOfNoteDay) / 86400000);
+  if (dayDiff === 0) {
+    var minsAgo = Math.floor((now.getTime() - ts) / 60000);
+    if (minsAgo < 1) return "Just now";
+    if (minsAgo < 60) return minsAgo + "m ago";
+    return "Today";
+  }
+  if (dayDiff === 1) return "Yesterday";
+  if (dayDiff < 7) return dayDiff + " days ago";
+  return d.toLocaleDateString(undefined, { month:"short", day:"numeric", year: d.getFullYear()!==now.getFullYear()?"numeric":undefined });
 }
 
 // Local durable cache: notes always land here immediately, independent of Firestore's
@@ -335,125 +384,161 @@ function LoginScreen({ onLogin }) {
 }
 
 // ── VOICE SCREEN ──────────────────────────────────────────────────────────────
-function VoiceNoteScreen({ onBack, onSave }) {
-  var [isRecording,setIsRecording]=useState(false);var [isPaused,setIsPaused]=useState(false);var [elapsed,setElapsed]=useState(0);var [title,setTitle]=useState("");var [courses,setCourses]=useState(["General"]);var [course,setCourse]=useState("General");var [status,setStatus]=useState("Tap microphone to start recording");var [showAddCourse,setShowAddCourse]=useState(false);var [newCourse,setNewCourse]=useState("");var [transcript,setTranscript]=useState("");
-  var [polishing,setPolishing]=useState(false);var [rawTranscript,setRawTranscript]=useState("");var [polishedTranscript,setPolishedTranscript]=useState("");var [viewMode,setViewMode]=useState("live");
-  var timerRef=useRef(null);var recognitionRef=useRef(null);var allTextRef=useRef("");var isActiveRef=useRef(false);var sessionIdRef=useRef(0);
+function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings }) {
+  recQuality = recQuality || "Medium";
+  recSettings = recSettings || { noise:true, autoTranscribe:false, speakerID:false, autoSave:false };
+  var QUALITY_BITRATE = { Low:16000, Medium:32000, High:64000 };
+  var MAX_AUDIO_BYTES = 18 * 1024 * 1024; // safety margin under Gemini's 20MB inline request cap
+
+  var [phase,setPhase]=useState("idle"); // idle | recording | paused | stopped | transcribing | reviewing
+  var [elapsed,setElapsed]=useState(0);
+  var [title,setTitle]=useState("");var [courses,setCourses]=useState(["General"]);var [course,setCourse]=useState("General");
+  var [showAddCourse,setShowAddCourse]=useState(false);var [newCourse,setNewCourse]=useState("");
+  var [status,setStatus]=useState("Tap Start Recording to begin");
+  var [wantFull,setWantFull]=useState(true);var [wantSmart,setWantSmart]=useState(true);var [wantSummary,setWantSummary]=useState(true);
+  var [outputs,setOutputs]=useState({full:"",smart:"",summary:""});
+  var [activeTab,setActiveTab]=useState(null);
+  var [audioSizeWarning,setAudioSizeWarning]=useState("");
+  var [saving,setSaving]=useState(false);
+
+  var timerRef=useRef(null);
+  var mediaRecorderRef=useRef(null);
+  var streamRef=useRef(null);
+  var chunksRef=useRef([]);
+  var audioBlobRef=useRef(null);
+  var mimeTypeRef=useRef("audio/webm");
+
   var fmt=function(s){return String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0");};
   function addCourse(){var c=newCourse.trim().toUpperCase();if(!c||courses.includes(c))return;setCourses(function(p){return[...p,c];});setNewCourse("");setShowAddCourse(false);}
   function removeCourse(c){if(c==="General")return;setCourses(function(p){return p.filter(function(x){return x!==c;});});if(course===c)setCourse("General");}
-  function mergeNoDupe(base,addition){
-    if(!base) return addition;
-    if(!addition) return base;
-    var baseWords=base.trim().split(/\s+/);
-    var addWords=addition.trim().split(/\s+/);
-    var maxOverlap=Math.min(6,baseWords.length,addWords.length);
-    for(var len=maxOverlap;len>0;len--){
-      var tail=baseWords.slice(baseWords.length-len).join(" ").toLowerCase();
-      var head=addWords.slice(0,len).join(" ").toLowerCase();
-      if(tail===head){ return base+" "+addWords.slice(len).join(" "); }
-    }
-    return base+" "+addition;
-  }
-  function createRecognition(baseText,sessionId){
-    var SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR)return null;
-    var r=new SR();r.continuous=true;r.interimResults=true;r.lang="en-US";
-    var sessionNew="";
-    r.onresult=function(e){
-      if(sessionIdRef.current!==sessionId) return;
-      var final="";var interim="";
-      for(var i=e.resultIndex;i<e.results.length;i++){
-        if(e.results[i].isFinal){ final+=e.results[i][0].transcript+" "; }
-        else{ interim+=e.results[i][0].transcript; }
+
+  useEffect(function(){
+    return function(){
+      clearInterval(timerRef.current);
+      try{ mediaRecorderRef.current && mediaRecorderRef.current.state!=="inactive" && mediaRecorderRef.current.stop(); }catch(e){}
+      try{ streamRef.current && streamRef.current.getTracks().forEach(function(t){t.stop();}); }catch(e){}
+    };
+  }, []);
+
+  async function startRecording(){
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){ setStatus("Your browser doesn't support audio recording."); return; }
+    try{
+      var stream = await navigator.mediaDevices.getUserMedia({ audio: { noiseSuppression: !!recSettings.noise, echoCancellation:true } });
+      streamRef.current = stream;
+      var mimeType = "audio/webm";
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported){
+        if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) mimeType = "audio/webm;codecs=opus";
+        else if (MediaRecorder.isTypeSupported("audio/mp4")) mimeType = "audio/mp4";
       }
-      if(final){ sessionNew=mergeNoDupe(sessionNew,final); }
-      var combined=mergeNoDupe(baseText,sessionNew);
-      allTextRef.current=combined;
-      setTranscript((combined+" "+interim).replace(/\s+/g," ").trim());
-      setStatus("Listening... speak clearly");
-    };
-    r.onerror=function(e){ if(e.error==="no-speech"||e.error==="aborted")return; };
-    r.onend=function(){
-      if(sessionIdRef.current!==sessionId) return;
-      if(isActiveRef.current){
-        var newBase=mergeNoDupe(baseText,sessionNew);
-        allTextRef.current=newBase;
-        setTimeout(function(){
-          if(isActiveRef.current&&sessionIdRef.current===sessionId){
-            var newId=sessionId+1;
-            sessionIdRef.current=newId;
-            var next=createRecognition(newBase,newId);
-            if(next){ recognitionRef.current=next; try{next.start();}catch(err){} }
-          }
-        },300);
-      } else { setStatus("Recording complete"); }
-    };
-    return r;
+      mimeTypeRef.current = mimeType;
+      chunksRef.current = [];
+      var recorder = new MediaRecorder(stream, { mimeType: mimeType, audioBitsPerSecond: QUALITY_BITRATE[recQuality]||32000 });
+      recorder.ondataavailable = function(e){ if(e.data && e.data.size>0) chunksRef.current.push(e.data); };
+      recorder.onstop = function(){
+        audioBlobRef.current = new Blob(chunksRef.current, { type: mimeTypeRef.current });
+        if (audioBlobRef.current.size > MAX_AUDIO_BYTES) {
+          setAudioSizeWarning("This recording is quite long (~"+Math.round(audioBlobRef.current.size/1024/1024)+"MB). Transcription may fail — consider recording shorter sessions if this happens.");
+        } else {
+          setAudioSizeWarning("");
+        }
+      };
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+      setPhase("recording");
+      setElapsed(0);
+      setStatus("Recording...");
+      timerRef.current = setInterval(function(){ setElapsed(function(e){return e+1;}); }, 1000);
+    }catch(e){
+      setStatus("Couldn't access the microphone — check your browser's mic permission.");
+    }
   }
-  function startRecording(){
-    var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-    if(!SR){setStatus("Please use Chrome browser!");return;}
-    allTextRef.current="";setTranscript("");isActiveRef.current=true;
-    setIsRecording(true);setIsPaused(false);setElapsed(0);
-    timerRef.current=setInterval(function(){setElapsed(function(e){return e+1;});},1000);
-    var newId=sessionIdRef.current+1;
-    sessionIdRef.current=newId;
-    var r=createRecognition("",newId);
-    if(r){ recognitionRef.current=r; try{r.start();}catch(e){} }
+  function pauseRecording(){
+    try{ mediaRecorderRef.current.pause(); }catch(e){}
+    clearInterval(timerRef.current);
+    setPhase("paused");
+    setStatus("Paused");
   }
-  function pauseRecording(){isActiveRef.current=false;setIsPaused(true);sessionIdRef.current++;clearInterval(timerRef.current);try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}setStatus("Paused");}
   function resumeRecording(){
-    isActiveRef.current=true;setIsPaused(false);
-    timerRef.current=setInterval(function(){setElapsed(function(e){return e+1;});},1000);
-    var newId=sessionIdRef.current+1;
-    sessionIdRef.current=newId;
-    var r=createRecognition(allTextRef.current,newId);
-    if(r){ recognitionRef.current=r; try{r.start();}catch(e){} }
-    setStatus("Resumed...");
+    try{ mediaRecorderRef.current.resume(); }catch(e){}
+    timerRef.current = setInterval(function(){ setElapsed(function(e){return e+1;}); }, 1000);
+    setPhase("recording");
+    setStatus("Recording...");
   }
   function stopRecording(){
-    isActiveRef.current=false;setIsRecording(false);setIsPaused(false);sessionIdRef.current++;clearInterval(timerRef.current);
-    try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}
-    setStatus("Recording complete");
-    setTimeout(function(){
-      var finalText=allTextRef.current;
-      if(finalText&&finalText.trim()){
-        setRawTranscript(finalText);
-        polishTranscript(finalText);
-      }
-    },400); // small delay lets the recognizer's last final result settle first
-  }
-  async function polishTranscript(raw){
-    setPolishing(true);
-    setStatus("✨ Polishing your notes with AI...");
-    try{
-      var cleaned=await callGeminiText("This is a raw speech-to-text transcript from a student's voice note. It may contain repeated words, filler words, and no punctuation. Rewrite it into clean, well-organized notes with proper punctuation and paragraph or bullet structure. Preserve all the actual content and meaning without adding new information. Return only the cleaned notes text, no preamble or explanation.\n\nTranscript:\n"+raw,1200);
-      setPolishedTranscript(cleaned);
-      setTranscript(cleaned);
-      setViewMode("polished");
-      setStatus("✨ Notes polished! Review and save, or view the original below.");
-    }catch(e){
-      setStatus("Couldn't reach Gemini to polish (check your API key) — showing your raw transcript.");
+    clearInterval(timerRef.current);
+    try{ mediaRecorderRef.current && mediaRecorderRef.current.stop(); }catch(e){}
+    try{ streamRef.current && streamRef.current.getTracks().forEach(function(t){t.stop();}); }catch(e){}
+    setPhase("stopped");
+    setStatus("Recording saved — choose what you'd like from it.");
+    if (recSettings.autoTranscribe) {
+      // small delay so onstop finishes building the blob first
+      setTimeout(function(){ transcribe(); }, 300);
     }
-    setPolishing(false);
   }
-  function toggleTranscriptView(){
-    if(viewMode==="polished"){ setTranscript(rawTranscript); setViewMode("raw"); }
-    else { setTranscript(polishedTranscript||rawTranscript); setViewMode("polished"); }
+
+  function blobToBase64(blob){
+    return new Promise(function(resolve,reject){
+      var reader = new FileReader();
+      reader.onloadend = function(){ resolve(reader.result.split(",")[1]); };
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
   }
-  useEffect(function(){return function(){isActiveRef.current=false;clearInterval(timerRef.current);try{recognitionRef.current&&recognitionRef.current.stop();}catch(e){}};}, []);
-  function saveNote(){
-    if(!transcript.trim()){alert("Record something first!");return;}
+
+  async function transcribe(){
+    if(!audioBlobRef.current){ setStatus("Record something first!"); return; }
+    if(!wantFull && !wantSmart && !wantSummary){ setStatus("Pick at least one output type."); return; }
+    setPhase("transcribing");
+    setStatus("✨ Transcribing your recording with AI...");
     try{
-      onSave({id:Date.now(),title:title||("Voice Note - "+new Date().toLocaleDateString()),course,color:"#06B6D4",bg:"rgba(6,182,212,0.12)",date:"Today",tag:"Lecture",words:transcript.split(" ").length,preview:transcript.slice(0,100),content:transcript});
-    }catch(e){ alert("Couldn't save the note — check your connection and try again."); }
+      var base64 = await blobToBase64(audioBlobRef.current);
+      var mediaType = mimeTypeRef.current.split(";")[0];
+      var jobs=[];
+      if(wantFull) jobs.push(["full", callGeminiAudio(base64, mediaType, "Transcribe this lecture recording verbatim, word for word, as accurately as you can. Add natural paragraph breaks where the speaker's train of thought shifts. Return only the transcript, no preamble.", 3000)]);
+      if(wantSmart) jobs.push(["smart", callGeminiAudio(base64, mediaType, "Listen to this lecture recording and turn it into clean, well-organized study notes — headers and bullet points, only the important points, skip filler and repetition. Return only the notes, no preamble.", 2000)]);
+      if(wantSummary) jobs.push(["summary", callGeminiAudio(base64, mediaType, "Listen to this lecture recording and write a concise one-page revision summary covering only the core ideas and key takeaways a student needs to remember. Return only the summary, no preamble.", 900)]);
+      var results = await Promise.allSettled(jobs.map(function(j){return j[1];}));
+      var next = {full:"",smart:"",summary:""};
+      var firstKey=null;
+      results.forEach(function(r,i){
+        var key=jobs[i][0];
+        if(r.status==="fulfilled"){ next[key]=r.value; if(!firstKey)firstKey=key; }
+        else { next[key]="⚠️ Couldn't generate this — "+(r.reason&&r.reason.message?r.reason.message:"try again."); }
+      });
+      setOutputs(next);
+      setActiveTab(firstKey||"full");
+      setPhase("reviewing");
+      setStatus("Review below, edit anything, then save.");
+      if (recSettings.autoSave && firstKey) {
+        setTimeout(function(){ saveNote(next[firstKey]); }, 300);
+      }
+    }catch(e){
+      setStatus("Couldn't reach Gemini to transcribe — check your API key or connection.");
+      setPhase("stopped");
+    }
   }
+
+  function saveNote(overrideContent){
+    var content = overrideContent!=null ? overrideContent : (activeTab?outputs[activeTab]:"");
+    if(!content || !content.trim()){ alert("Nothing to save yet!"); return; }
+    setSaving(true);
+    try{
+      onSave({id:Date.now(),title:title||("Voice Note - "+new Date().toLocaleDateString()),course,color:"#06B6D4",bg:"rgba(6,182,212,0.12)",tag:"Lecture",words:content.split(" ").length,preview:content.slice(0,100),content:content});
+    }catch(e){ alert("Couldn't save the note — check your connection and try again."); }
+    setSaving(false);
+  }
+
+  var TAB_LABELS = { full:"📝 Full Transcript", smart:"📚 Smart Notes", summary:"📄 Summary" };
+  var checkedTabs = ["full","smart","summary"].filter(function(k){ return (k==="full"&&wantFull)||(k==="smart"&&wantSmart)||(k==="summary"&&wantSummary); });
+
   return(
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
       <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
         <button onClick={onBack} style={backBtn}>←</button>
         <span style={{ fontWeight:800,fontSize:16,color:C.text }}>Voice Recording</span>
-        <button onClick={saveNote} disabled={polishing} style={{ background:polishing?C.card2:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:polishing?C.muted:"#fff",border:"none",borderRadius:10,padding:"8px 18px",fontWeight:800,fontSize:14,cursor:polishing?"default":"pointer" }}>{polishing?"Polishing...":"Save"}</button>
+        {phase==="reviewing"
+          ? <button onClick={function(){saveNote();}} disabled={saving} style={{ background:saving?C.card2:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:saving?C.muted:"#fff",border:"none",borderRadius:10,padding:"8px 18px",fontWeight:800,fontSize:14,cursor:saving?"default":"pointer" }}>{saving?"Saving...":"Save"}</button>
+          : <div style={{ width:64 }}/>}
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:20 }}>
         <input value={title} onChange={function(e){setTitle(e.target.value);}} placeholder="Note title (optional)..." style={{ width:"100%",padding:"13px 16px",borderRadius:12,border:"1px solid "+C.border,fontSize:15,fontWeight:700,background:C.card,color:C.text,outline:"none",marginBottom:14,boxSizing:"border-box" }}/>
@@ -462,23 +547,47 @@ function VoiceNoteScreen({ onBack, onSave }) {
           {showAddCourse&&(<div style={{ background:C.card2,borderRadius:14,padding:14,marginBottom:12,border:"1px solid "+C.cyan+"30" }}><div style={{ display:"flex",gap:8 }}><input value={newCourse} onChange={function(e){setNewCourse(e.target.value);}} onKeyDown={function(e){if(e.key==="Enter")addCourse();}} placeholder="e.g. BIO 201" style={{ flex:1,padding:"10px 14px",borderRadius:10,border:"1px solid "+C.border,background:C.bg,color:C.text,outline:"none",fontSize:14 }}/><button onClick={addCourse} style={{ background:C.cyan,border:"none",borderRadius:10,padding:"10px 16px",color:"#0A0F1E",fontWeight:800,cursor:"pointer" }}>Add</button><button onClick={function(){setShowAddCourse(false);}} style={{ background:C.card,border:"1px solid "+C.border,borderRadius:10,padding:"10px 12px",color:C.muted,cursor:"pointer" }}>X</button></div></div>)}
           <div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{courses.map(function(c){return(<div key={c} style={{ display:"flex" }}><button onClick={function(){setCourse(c);}} style={{ padding:"7px 14px",borderRadius:c==="General"?99:"99px 0 0 99px",border:"2px solid",borderColor:course===c?C.cyan:C.border,borderRight:c!=="General"?"none":undefined,background:course===c?C.cyan:C.card,color:course===c?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{c}</button>{c!=="General"&&<button onClick={function(){removeCourse(c);}} style={{ padding:"7px 8px",borderRadius:"0 99px 99px 0",border:"2px solid",borderColor:course===c?C.cyan:C.border,borderLeft:"none",background:course===c?C.cyan:C.card,color:C.red,fontSize:11,cursor:"pointer" }}>X</button>}</div>);})}</div>
         </div>
-        <div style={{ background:C.card,borderRadius:24,padding:"28px 20px",border:"2px solid "+(isRecording&&!isPaused?C.red:isPaused?C.amber:C.border),marginBottom:16,textAlign:"center" }}>
-          <div onClick={!isRecording?startRecording:undefined} style={{ width:110,height:110,borderRadius:"50%",background:isRecording?(isPaused?"linear-gradient(135deg,#F59E0B,#FCD34D)":"linear-gradient(135deg,#EF4444,#F87171)"):"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 20px",cursor:!isRecording?"pointer":"default",fontSize:46,boxShadow:isRecording&&!isPaused?"0 0 0 14px rgba(239,68,68,0.12)":"0 8px 32px rgba(6,182,212,0.35)",animation:isRecording&&!isPaused?"pulse 1.5s ease-in-out infinite":"none" }}>{isPaused?"⏸":"🎙️"}</div>
-          {isRecording&&<div style={{ fontSize:40,fontWeight:800,color:isPaused?C.amber:C.red,marginBottom:12,fontFamily:"monospace",letterSpacing:3 }}>{fmt(elapsed)}</div>}
-          <div style={{ display:"flex",justifyContent:"center",marginBottom:14 }}><Wave active={isRecording&&!isPaused} color={isRecording&&!isPaused?"#EF4444":C.cyan} size={1.6}/></div>
-          <p style={{ color:isRecording?(isPaused?C.amber:C.red):C.muted,fontSize:14,fontWeight:600,margin:"0 0 20px" }}>{status}</p>
+
+        <div style={{ background:C.card,borderRadius:24,padding:"28px 20px",border:"2px solid "+(phase==="recording"?C.red:phase==="paused"?C.amber:C.border),marginBottom:16,textAlign:"center" }}>
+          <div onClick={phase==="idle"?startRecording:undefined} style={{ width:110,height:110,borderRadius:"50%",background:phase==="recording"?"linear-gradient(135deg,#EF4444,#F87171)":phase==="paused"?"linear-gradient(135deg,#F59E0B,#FCD34D)":"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 20px",cursor:phase==="idle"?"pointer":"default",fontSize:46,boxShadow:phase==="recording"?"0 0 0 14px rgba(239,68,68,0.12)":"0 8px 32px rgba(6,182,212,0.35)",animation:phase==="recording"?"pulse 1.5s ease-in-out infinite":"none" }}>{phase==="paused"?"⏸":"🎙️"}</div>
+          {(phase==="recording"||phase==="paused")&&<div style={{ fontSize:40,fontWeight:800,color:phase==="paused"?C.amber:C.red,marginBottom:12,fontFamily:"monospace",letterSpacing:3 }}>⏱ {fmt(elapsed)}</div>}
+          <div style={{ display:"flex",justifyContent:"center",marginBottom:14 }}><Wave active={phase==="recording"} color={phase==="recording"?"#EF4444":C.cyan} size={1.6}/></div>
+          <p style={{ color:phase==="recording"?C.red:phase==="paused"?C.amber:C.muted,fontSize:14,fontWeight:600,margin:"0 0 20px" }}>{status}</p>
           <div style={{ display:"flex",gap:10,justifyContent:"center" }}>
-            {!isRecording?(<button onClick={startRecording} style={{ background:"linear-gradient(135deg,#EF4444,#F87171)",color:"#fff",border:"none",borderRadius:14,padding:"14px 36px",fontWeight:800,fontSize:15,cursor:"pointer",boxShadow:"0 4px 20px rgba(239,68,68,0.4)" }}>Start Recording</button>):(<div style={{ display:"flex",gap:10 }}>{!isPaused?<button onClick={pauseRecording} style={{ background:C.amber,color:"#0A0F1E",border:"none",borderRadius:14,padding:"13px 24px",fontWeight:800,fontSize:14,cursor:"pointer" }}>⏸ Pause</button>:<button onClick={resumeRecording} style={{ background:C.green,color:"#0A0F1E",border:"none",borderRadius:14,padding:"13px 24px",fontWeight:800,fontSize:14,cursor:"pointer" }}>▶ Resume</button>}<button onClick={stopRecording} style={{ background:"rgba(248,113,113,0.15)",color:C.red,border:"2px solid "+C.red+"40",borderRadius:14,padding:"13px 24px",fontWeight:800,fontSize:14,cursor:"pointer" }}>⏹ Stop</button></div>)}
+            {phase==="idle"&&<button onClick={startRecording} style={{ background:"linear-gradient(135deg,#EF4444,#F87171)",color:"#fff",border:"none",borderRadius:14,padding:"14px 36px",fontWeight:800,fontSize:15,cursor:"pointer",boxShadow:"0 4px 20px rgba(239,68,68,0.4)" }}>🎤 Start Recording</button>}
+            {(phase==="recording"||phase==="paused")&&<div style={{ display:"flex",gap:10 }}>
+              {phase==="recording"?<button onClick={pauseRecording} style={{ background:C.amber,color:"#0A0F1E",border:"none",borderRadius:14,padding:"13px 24px",fontWeight:800,fontSize:14,cursor:"pointer" }}>⏸ Pause</button>:<button onClick={resumeRecording} style={{ background:C.green,color:"#0A0F1E",border:"none",borderRadius:14,padding:"13px 24px",fontWeight:800,fontSize:14,cursor:"pointer" }}>▶ Resume</button>}
+              <button onClick={stopRecording} style={{ background:"rgba(248,113,113,0.15)",color:C.red,border:"2px solid "+C.red+"40",borderRadius:14,padding:"13px 24px",fontWeight:800,fontSize:14,cursor:"pointer" }}>⏹ Stop Recording</button>
+            </div>}
           </div>
         </div>
-        <div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+(transcript?C.cyan+"40":C.border) }}>
-          <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12 }}>
-            <div style={{ display:"flex",alignItems:"center",gap:8 }}><span style={{ fontWeight:700,fontSize:14,color:C.cyan }}>{polishedTranscript&&viewMode==="polished"?"✨ AI-Polished Notes":"📝 Live Transcript"}</span>{isRecording&&!isPaused&&<div style={{ width:8,height:8,borderRadius:"50%",background:C.red,animation:"pulse 1s ease-in-out infinite" }}/>}{polishing&&<div style={{ width:8,height:8,borderRadius:"50%",background:C.cyan,animation:"pulse 1s ease-in-out infinite" }}/>}</div>
-            <div style={{ display:"flex",gap:8 }}>{polishedTranscript&&!isRecording&&<button onClick={toggleTranscriptView} style={{ background:C.card2,border:"none",borderRadius:8,padding:"4px 10px",color:C.amber,cursor:"pointer",fontSize:12,fontWeight:600 }}>{viewMode==="polished"?"View Original":"View Polished"}</button>}{transcript&&<button onClick={function(){allTextRef.current="";setTranscript("");setRawTranscript("");setPolishedTranscript("");setViewMode("live");}} style={{ background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:12,fontWeight:600 }}>Clear</button>}{transcript&&<button onClick={function(){navigator.clipboard&&navigator.clipboard.writeText(transcript);}} style={{ background:C.card2,border:"none",borderRadius:8,padding:"4px 10px",color:C.cyan,cursor:"pointer",fontSize:12,fontWeight:600 }}>Copy</button>}</div>
+
+        {(phase==="stopped"||phase==="transcribing"||phase==="reviewing")&&(
+          <div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+C.border,marginBottom:16 }}>
+            {audioSizeWarning&&<div style={{ background:"rgba(245,158,11,0.1)",border:"1px solid rgba(245,158,11,0.3)",borderRadius:10,padding:10,fontSize:12,color:C.amber,marginBottom:14 }}>⚠️ {audioSizeWarning}</div>}
+            <div style={{ fontWeight:800,fontSize:14,color:C.text,marginBottom:12 }}>Choose Output</div>
+            {[["full",wantFull,setWantFull,"📝 Full Transcript","Everything the lecturer said"],["smart",wantSmart,setWantSmart,"📚 Smart Notes","Only the important points"],["summary",wantSummary,setWantSummary,"📄 Summary","One-page revision notes"]].map(function(item){return(
+              <label key={item[0]} style={{ display:"flex",alignItems:"center",gap:12,padding:"10px 0",cursor:phase==="transcribing"?"default":"pointer",opacity:phase==="transcribing"?0.6:1 }}>
+                <input type="checkbox" checked={item[1]} disabled={phase==="transcribing"} onChange={function(e){item[2](e.target.checked);}} style={{ width:20,height:20,accentColor:C.cyan }}/>
+                <div><div style={{ fontWeight:700,fontSize:14,color:C.text }}>{item[3]}</div><div style={{ fontSize:12,color:C.muted }}>{item[4]}</div></div>
+              </label>
+            );})}
+            {phase!=="reviewing"&&<button onClick={transcribe} disabled={phase==="transcribing"} style={{ width:"100%",marginTop:14,background:phase==="transcribing"?C.card2:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:phase==="transcribing"?C.muted:"#fff",border:"none",borderRadius:14,padding:"14px",fontWeight:800,fontSize:15,cursor:phase==="transcribing"?"default":"pointer" }}>{phase==="transcribing"?"✨ Transcribing...":"✨ Transcribe"}</button>}
           </div>
-          <div style={{ minHeight:120,fontSize:14,lineHeight:1.9,color:transcript?C.text:C.muted }}>{polishing?"✨ Polishing your notes with AI...":(transcript||"Tap Start Recording — your words appear here instantly...")}</div>
-          {transcript&&(<div style={{ marginTop:10,paddingTop:10,borderTop:"1px solid "+C.border,display:"flex",justifyContent:"space-between" }}><span style={{ fontSize:11,color:C.muted }}>{transcript.split(" ").filter(function(w){return w;}).length} words</span><span style={{ fontSize:11,color:C.muted }}>{transcript.length} chars</span></div>)}
-        </div>
+        )}
+
+        {phase==="reviewing"&&(
+          <div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+C.cyan+"40" }}>
+            <div style={{ display:"flex",gap:8,marginBottom:14,flexWrap:"wrap" }}>
+              {checkedTabs.map(function(k){return<button key={k} onClick={function(){setActiveTab(k);}} style={{ padding:"7px 14px",borderRadius:99,border:"none",background:activeTab===k?C.cyan:C.card2,color:activeTab===k?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{TAB_LABELS[k]}</button>;})}
+            </div>
+            <textarea value={activeTab?outputs[activeTab]:""} onChange={function(e){var v=e.target.value;setOutputs(function(o){var n={...o};n[activeTab]=v;return n;});}} style={{ width:"100%",minHeight:280,background:"transparent",border:"none",color:C.text,fontSize:14,lineHeight:1.9,outline:"none",resize:"none",fontFamily:"inherit",boxSizing:"border-box" }}/>
+            <div style={{ marginTop:10,paddingTop:10,borderTop:"1px solid "+C.border,display:"flex",justifyContent:"space-between" }}>
+              <span style={{ fontSize:11,color:C.muted }}>{(activeTab&&outputs[activeTab]?outputs[activeTab].split(" ").filter(function(w){return w;}).length:0)} words</span>
+              <button onClick={function(){navigator.clipboard&&activeTab&&navigator.clipboard.writeText(outputs[activeTab]);}} style={{ background:"none",border:"none",color:C.cyan,cursor:"pointer",fontSize:12,fontWeight:600 }}>Copy</button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -491,7 +600,7 @@ function ScanDocScreen({ onBack, onSave }) {
   var courses=["General","PHY 101","MTH 101","COS 102","ENG 201","CHM 102"];
   function handleFile(file){if(!file)return;var reader=new FileReader();reader.onload=function(e){setImage(e.target.result);setExtracted("");setStatus("Image ready! Tap Extract Text.");};reader.readAsDataURL(file);}
   async function extractText(){if(!image)return;setExtracting(true);setStatus("Reading text from image using AI...");try{var base64=image.split(",")[1];var mimeType=image.split(";")[0].split(":")[1];var text=await callGeminiVision(base64,mimeType,"Extract all text from this image. Format it as clean study notes with proper headings and bullet points. Return ONLY the extracted text.",1500);setExtracted(text);setStatus("Text extracted successfully!");}catch(e){setStatus("Error: "+e.message);setExtracted("Add your Gemini API key to extract text!");}setExtracting(false);}
-  function saveNote(){if(!extracted.trim()){alert("Extract text first!");return;}onSave({id:Date.now(),title:title||("Scanned Note - "+new Date().toLocaleDateString()),course,color:"#F59E0B",bg:"rgba(245,158,11,0.12)",date:"Today",tag:"Lecture",words:extracted.split(" ").length,preview:extracted.slice(0,100),content:extracted});}
+  function saveNote(){if(!extracted.trim()){alert("Extract text first!");return;}onSave({id:Date.now(),title:title||("Scanned Note - "+new Date().toLocaleDateString()),course,color:"#F59E0B",bg:"rgba(245,158,11,0.12)",tag:"Lecture",words:extracted.split(" ").length,preview:extracted.slice(0,100),content:extracted});}
   return(
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
       <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
@@ -561,7 +670,7 @@ function AIWriteScreen({ onBack, onSave }) {
       <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
         <button onClick={onBack} style={backBtn}>←</button>
         <span style={{ fontWeight:800,fontSize:16,color:C.text }}>AI Write</span>
-        {result&&<button onClick={function(){onSave({id:Date.now(),title:prompt.slice(0,40)||"AI Note",course,color:"#A78BFA",bg:"rgba(167,139,250,0.12)",date:"Today",tag:"Study",words:result.split(" ").length,preview:result.slice(0,100),content:result});}} style={{ background:"linear-gradient(135deg,#A78BFA,#06B6D4)",color:"#fff",border:"none",borderRadius:10,padding:"8px 16px",fontWeight:800,fontSize:13,cursor:"pointer" }}>Save</button>}
+        {result&&<button onClick={function(){onSave({id:Date.now(),title:prompt.slice(0,40)||"AI Note",course,color:"#A78BFA",bg:"rgba(167,139,250,0.12)",tag:"Study",words:result.split(" ").length,preview:result.slice(0,100),content:result});}} style={{ background:"linear-gradient(135deg,#A78BFA,#06B6D4)",color:"#fff",border:"none",borderRadius:10,padding:"8px 16px",fontWeight:800,fontSize:13,cursor:"pointer" }}>Save</button>}
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:20 }}>
         <div style={{ display:"flex",gap:8,marginBottom:14,flexWrap:"wrap" }}>{courses.map(function(c){return<button key={c} onClick={function(){setCourse(c);}} style={{ padding:"6px 14px",borderRadius:99,border:"2px solid",borderColor:course===c?C.purple:C.border,background:course===c?C.purple:C.card,color:course===c?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{c}</button>;})}</div>
@@ -591,7 +700,7 @@ function NoteDetail({ note, onBack, onDelete }) {
         {[["📝","note","Note"],["📋","summary","Summary"],["🧠","quiz","Quiz"]].map(function(item){return<button key={item[1]} onClick={function(){setView(item[1]);if(item[1]==="summary"&&!summary)generateSummary();if(item[1]==="quiz"&&quiz.length===0)generateQuiz();}} style={{ padding:"7px 16px",borderRadius:99,border:"none",background:view===item[1]?note.color:C.card2,color:view===item[1]?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer",marginTop:12 }}>{item[0]+" "+item[2]}</button>;})}
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:20 }}>
-        {view==="note"&&(<div><div style={{ display:"flex",alignItems:"center",gap:8,marginBottom:16 }}><span style={{ fontSize:11,fontWeight:700,color:note.color,background:note.bg,borderRadius:99,padding:"3px 12px" }}>{note.course}</span><span style={{ fontSize:11,color:C.muted }}>{note.date}</span></div><div style={{ background:C.card,borderRadius:18,padding:20,border:"1px solid "+C.border,marginBottom:16 }}><h2 style={{ color:C.text,fontSize:20,fontWeight:800,margin:"0 0 12px" }}>{note.title}</h2><div style={{ width:40,height:3,background:note.color,borderRadius:2,marginBottom:16 }}/><p style={{ margin:0,fontSize:14,color:"#CBD5E1",lineHeight:1.9,whiteSpace:"pre-line" }}>{note.content}</p></div><div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:10 }}><button onClick={function(){setView("summary");if(!summary)generateSummary();}} style={actionBtn(note.color)}>📋 AI Summary</button><button onClick={function(){setView("quiz");if(quiz.length===0)generateQuiz();}} style={actionBtn(C.purple)}>🧠 Quiz Me</button></div></div>)}
+        {view==="note"&&(<div><div style={{ display:"flex",alignItems:"center",gap:8,marginBottom:16 }}><span style={{ fontSize:11,fontWeight:700,color:note.color,background:note.bg,borderRadius:99,padding:"3px 12px" }}>{note.course}</span><span style={{ fontSize:11,color:C.muted }}>{formatRelativeDate(note.id)}</span></div><div style={{ background:C.card,borderRadius:18,padding:20,border:"1px solid "+C.border,marginBottom:16 }}><h2 style={{ color:C.text,fontSize:20,fontWeight:800,margin:"0 0 12px" }}>{note.title}</h2><div style={{ width:40,height:3,background:note.color,borderRadius:2,marginBottom:16 }}/><p style={{ margin:0,fontSize:14,color:"#CBD5E1",lineHeight:1.9,whiteSpace:"pre-line" }}>{note.content}</p></div><div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:10 }}><button onClick={function(){setView("summary");if(!summary)generateSummary();}} style={actionBtn(note.color)}>📋 AI Summary</button><button onClick={function(){setView("quiz");if(quiz.length===0)generateQuiz();}} style={actionBtn(C.purple)}>🧠 Quiz Me</button></div></div>)}
         {view==="summary"&&(loading?<div style={{ textAlign:"center",padding:"60px 20px" }}><div style={{ fontSize:48,animation:"spin 2s linear infinite" }}>✨</div><p style={{ color:C.muted,marginTop:16 }}>Generating...</p></div>:summary?(<div><div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+C.border,marginBottom:14 }}><div style={{ fontSize:11,fontWeight:700,color:C.green,letterSpacing:1,marginBottom:10 }}>OVERVIEW</div><p style={{ margin:0,fontSize:14,color:"#CBD5E1",lineHeight:1.8 }}>{summary.summary}</p></div><div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+C.border,marginBottom:14 }}><div style={{ fontSize:11,fontWeight:700,color:C.amber,letterSpacing:1,marginBottom:12 }}>KEY POINTS</div>{summary.keyPoints&&summary.keyPoints.map(function(p,i){return<div key={i} style={{ display:"flex",gap:10,marginBottom:10 }}><div style={{ width:6,height:6,borderRadius:3,background:C.amber,marginTop:7,flexShrink:0 }}/><p style={{ margin:0,fontSize:14,color:"#CBD5E1",lineHeight:1.7 }}>{p}</p></div>;})}</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{summary.tags&&summary.tags.map(function(t){return<span key={t} style={{ background:C.card2,color:C.cyan,borderRadius:99,padding:"4px 14px",fontSize:12,fontWeight:700 }}>{t}</span>;})}</div></div>):null)}
         {view==="quiz"&&(loading?<div style={{ textAlign:"center",padding:"60px 20px" }}><div style={{ fontSize:48,animation:"spin 2s linear infinite" }}>🧠</div><p style={{ color:C.muted,marginTop:16 }}>Generating quiz...</p></div>:quizDone?(<div style={{ textAlign:"center",padding:"40px 20px" }}><div style={{ fontSize:64,marginBottom:16 }}>{score===quiz.length?"🏆":"📖"}</div><div style={{ fontSize:40,fontWeight:800,color:C.text }}>{score}/{quiz.length}</div><p style={{ color:C.muted,marginTop:8 }}>{score===quiz.length?"Perfect! 🔥":"Keep studying! 💪"}</p><button onClick={function(){setQuizIdx(0);setSelected(null);setScore(0);setQuizDone(false);}} style={{ marginTop:20,background:"linear-gradient(135deg,"+note.color+",#A78BFA)",color:"#fff",border:"none",borderRadius:14,padding:"13px 32px",fontWeight:800,fontSize:15,cursor:"pointer" }}>Try Again</button></div>):quiz.length>0?(<div><div style={{ display:"flex",justifyContent:"space-between",marginBottom:8 }}><span style={{ fontSize:13,color:C.muted }}>Question {quizIdx+1}/{quiz.length}</span><span style={{ fontSize:13,fontWeight:700,color:C.text }}>Score: {score}</span></div><div style={{ height:4,background:C.border,borderRadius:2,marginBottom:20 }}><div style={{ height:4,background:note.color,borderRadius:2,width:(quizIdx/quiz.length*100)+"%",transition:"width 0.3s" }}/></div><div style={{ background:C.card,borderRadius:16,padding:20,marginBottom:16,border:"1px solid "+C.border }}><p style={{ margin:0,fontSize:16,fontWeight:600,color:C.text,lineHeight:1.6 }}>{quiz[quizIdx].question}</p></div>{quiz[quizIdx].options.map(function(opt,i){var bg=C.card,border=C.border,color=C.text;if(selected!==null){if(i===quiz[quizIdx].answer){bg="rgba(52,211,153,0.15)";border="#34D399";color="#34D399";}else if(i===selected){bg="rgba(248,113,113,0.15)";border="#F87171";color="#F87171";}}return<button key={i} onClick={function(){pick(i);}} disabled={selected!==null} style={{ width:"100%",textAlign:"left",background:bg,border:"2px solid "+border,borderRadius:12,padding:"13px 16px",marginBottom:10,fontSize:14,color:color,cursor:selected!==null?"default":"pointer",fontWeight:500,display:"flex",gap:10,fontFamily:"inherit" }}><span style={{opacity:0.5}}>{String.fromCharCode(65+i)}.</span>{opt}</button>;})}</div>):null)}
       </div>
@@ -601,11 +710,12 @@ function NoteDetail({ note, onBack, onDelete }) {
 
 // ── LIBRARY ───────────────────────────────────────────────────────────────────
 function LibraryScreen({ notes, onNote, onDelete }) {
-  var [search,setSearch]=useState("");var [sort,setSort]=useState("date");var [filter,setFilter]=useState("All");var [view,setView]=useState("list");var [selected,setSelected]=useState([]);
+  var [search,setSearch]=useState("");var [sort,setSort]=useState("date");var [filter,setFilter]=useState("All");var [courseFilter,setCourseFilter]=useState("All Courses");var [view,setView]=useState("list");var [selected,setSelected]=useState([]);
   var filters=["All","Lecture","Study","Business","Personal"];
   var sorts=[["date","📅 Date"],["title","🔤 Title"],["course","📚 Course"],["words","💬 Words"]];
-  var filtered=notes.filter(function(n){var ms=n.title.toLowerCase().includes(search.toLowerCase())||n.course.toLowerCase().includes(search.toLowerCase())||n.content.toLowerCase().includes(search.toLowerCase());var mf=filter==="All"||n.tag===filter;return ms&&mf;});
-  filtered=filtered.slice().sort(function(a,b){if(sort==="title")return a.title.localeCompare(b.title);if(sort==="course")return a.course.localeCompare(b.course);if(sort==="words")return(b.words||0)-(a.words||0);return 0;});
+  var courseOptions=["All Courses"].concat(Array.from(new Set(notes.map(function(n){return n.course;}))).sort());
+  var filtered=notes.filter(function(n){var ms=n.title.toLowerCase().includes(search.toLowerCase())||n.course.toLowerCase().includes(search.toLowerCase())||n.content.toLowerCase().includes(search.toLowerCase());var mf=filter==="All"||n.tag===filter;var mc=courseFilter==="All Courses"||n.course===courseFilter;return ms&&mf&&mc;});
+  filtered=filtered.slice().sort(function(a,b){if(sort==="title")return a.title.localeCompare(b.title);if(sort==="course")return a.course.localeCompare(b.course);if(sort==="words")return(b.words||0)-(a.words||0);return (b.id||0)-(a.id||0);});
   function toggleSelect(id){setSelected(function(s){return s.includes(id)?s.filter(function(x){return x!==id;}):[...s,id];});}
   function deleteSelected(){selected.forEach(function(id){onDelete(id);});setSelected([]);}
   return(
@@ -616,16 +726,21 @@ function LibraryScreen({ notes, onNote, onDelete }) {
           <button onClick={function(){setView(view==="list"?"grid":"list");}} style={{ background:"rgba(255,255,255,0.08)",border:"none",borderRadius:10,width:36,height:36,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center" }}>{view==="list"?"⊞":"☰"}</button>
         </div>
         <div style={{ position:"relative",marginBottom:14 }}><span style={{ position:"absolute",left:14,top:"50%",transform:"translateY(-50%)" }}>🔍</span><input value={search} onChange={function(e){setSearch(e.target.value);}} placeholder="Search notes, courses, content..." style={{ width:"100%",padding:"11px 14px 11px 42px",borderRadius:12,border:"1px solid rgba(255,255,255,0.1)",fontSize:13,background:"rgba(255,255,255,0.07)",color:C.text,outline:"none",boxSizing:"border-box" }}/></div>
-        <div style={{ display:"flex",gap:6,overflowX:"auto",paddingBottom:14 }}>{filters.map(function(f){return<button key={f} onClick={function(){setFilter(f);}} style={{ padding:"6px 14px",borderRadius:99,border:"none",background:filter===f?C.cyan:"rgba(255,255,255,0.07)",color:filter===f?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap",flexShrink:0 }}>{f}</button>;})}</div>
+        <div style={{ display:"flex",gap:6,overflowX:"auto",paddingBottom:10 }}>{filters.map(function(f){return<button key={f} onClick={function(){setFilter(f);}} style={{ padding:"6px 14px",borderRadius:99,border:"none",background:filter===f?C.cyan:"rgba(255,255,255,0.07)",color:filter===f?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap",flexShrink:0 }}>{f}</button>;})}</div>
+        {courseOptions.length>1&&<div style={{ display:"flex",gap:6,overflowX:"auto",paddingBottom:14 }}>{courseOptions.map(function(c){return<button key={c} onClick={function(){setCourseFilter(c);}} style={{ padding:"5px 12px",borderRadius:99,border:"1px solid "+(courseFilter===c?C.purple:"rgba(255,255,255,0.12)"),background:courseFilter===c?C.purple+"25":"transparent",color:courseFilter===c?C.purple:C.muted,fontSize:11,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap",flexShrink:0 }}>{c}</button>;})}</div>}
       </div>
       <div style={{ background:C.card,padding:"10px 16px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
         <div style={{ display:"flex",gap:6,overflowX:"auto" }}>{sorts.map(function(s){return<button key={s[0]} onClick={function(){setSort(s[0]);}} style={{ padding:"5px 12px",borderRadius:99,border:"none",background:sort===s[0]?C.purple+"30":"transparent",color:sort===s[0]?C.purple:C.muted,fontSize:11,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap" }}>{s[1]}</button>;})}</div>
         {selected.length>0&&<button onClick={deleteSelected} style={{ background:"rgba(248,113,113,0.15)",border:"1px solid "+C.red+"40",borderRadius:8,padding:"5px 12px",color:C.red,fontSize:11,fontWeight:700,cursor:"pointer",flexShrink:0 }}>🗑 Delete {selected.length}</button>}
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:16 }}>
-        {filtered.length===0?(<div style={{ textAlign:"center",padding:"60px 20px" }}><div style={{ fontSize:52,marginBottom:12 }}>🔍</div><div style={{ fontWeight:800,fontSize:18,color:C.text }}>No notes found</div></div>)
-        :view==="grid"?(<div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:10 }}>{filtered.map(function(note){var isSelected=selected.includes(note.id);return<div key={note.id} style={{ background:C.card,border:"2px solid "+(isSelected?C.cyan:note.color+"22"),borderRadius:16,padding:14,cursor:"pointer",position:"relative" }} onClick={function(){onNote(note);}}><div onClick={function(e){e.stopPropagation();toggleSelect(note.id);}} style={{ position:"absolute",top:10,right:10,width:20,height:20,borderRadius:"50%",border:"2px solid "+(isSelected?C.cyan:C.border),background:isSelected?C.cyan:"transparent",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11 }}>{isSelected?"✓":""}</div><div style={{ width:36,height:36,borderRadius:10,background:note.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,marginBottom:10 }}>{note.tag==="Lecture"?"📚":note.tag==="Study"?"💡":note.tag==="Business"?"💼":"📝"}</div><div style={{ fontWeight:700,fontSize:13,color:C.text,marginBottom:4 }}>{note.title}</div><div style={{ fontSize:10,color:note.color,fontWeight:700,background:note.bg,borderRadius:99,padding:"2px 8px",display:"inline-block",marginBottom:6 }}>{note.course}</div><div style={{ fontSize:11,color:C.muted }}>{note.date}</div></div>;})}</div>)
-        :(filtered.map(function(note){var isSelected=selected.includes(note.id);return<div key={note.id} style={{ background:C.card,border:"2px solid "+(isSelected?C.cyan:note.color+"22"),borderRadius:16,padding:16,marginBottom:10,cursor:"pointer",display:"flex",gap:12,alignItems:"flex-start" }} onClick={function(){onNote(note);}}><div onClick={function(e){e.stopPropagation();toggleSelect(note.id);}} style={{ width:22,height:22,borderRadius:"50%",border:"2px solid "+(isSelected?C.cyan:C.border),background:isSelected?C.cyan:"transparent",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,flexShrink:0,marginTop:2 }}>{isSelected?"✓":""}</div><div style={{ width:42,height:42,borderRadius:12,background:note.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0 }}>{note.tag==="Lecture"?"📚":note.tag==="Study"?"💡":note.tag==="Business"?"💼":"📝"}</div><div style={{ flex:1 }}><div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:4 }}><div style={{ fontWeight:800,fontSize:14,color:C.text }}>{note.title}</div><div style={{ fontSize:11,color:C.muted,flexShrink:0,marginLeft:8 }}>{note.date}</div></div><div style={{ display:"flex",gap:6,marginBottom:6 }}><span style={{ fontSize:10,color:note.color,fontWeight:700,background:note.bg,borderRadius:99,padding:"2px 8px" }}>{note.course}</span><span style={{ fontSize:10,color:C.muted,background:"rgba(255,255,255,0.04)",borderRadius:99,padding:"2px 8px" }}>{note.tag}</span></div><div style={{ fontSize:12,color:C.muted,lineHeight:1.5,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden" }}>{note.preview}</div><div style={{ display:"flex",gap:12,marginTop:8 }}><span style={{ fontSize:11,color:C.soft }}>💬 {note.words||note.content.split(" ").length} words</span><span style={{ fontSize:11,color:note.color,marginLeft:"auto" }}>Open →</span></div></div></div>;}))}
+        {filtered.length===0?(notes.length===0?(
+          <div style={{ textAlign:"center",padding:"60px 20px" }}><div style={{ fontSize:52,marginBottom:12 }}>📝</div><div style={{ fontWeight:800,fontSize:18,color:C.text,marginBottom:6 }}>No notes yet</div><div style={{ fontSize:13,color:C.muted }}>Record a lecture, scan a page, or write one — it'll show up here.</div></div>
+        ):(
+          <div style={{ textAlign:"center",padding:"60px 20px" }}><div style={{ fontSize:52,marginBottom:12 }}>🔍</div><div style={{ fontWeight:800,fontSize:18,color:C.text,marginBottom:6 }}>No matches</div><div style={{ fontSize:13,color:C.muted }}>Try a different search term or clear your filters.</div></div>
+        ))
+        :view==="grid"?(<div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:10 }}>{filtered.map(function(note){var isSelected=selected.includes(note.id);return<div key={note.id} style={{ background:C.card,border:"2px solid "+(isSelected?C.cyan:note.color+"22"),borderRadius:16,padding:14,cursor:"pointer",position:"relative" }} onClick={function(){onNote(note);}}><div onClick={function(e){e.stopPropagation();toggleSelect(note.id);}} style={{ position:"absolute",top:10,right:10,width:20,height:20,borderRadius:"50%",border:"2px solid "+(isSelected?C.cyan:C.border),background:isSelected?C.cyan:"transparent",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11 }}>{isSelected?"✓":""}</div><div style={{ width:36,height:36,borderRadius:10,background:note.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,marginBottom:10 }}>{note.tag==="Lecture"?"📚":note.tag==="Study"?"💡":note.tag==="Business"?"💼":"📝"}</div><div style={{ fontWeight:700,fontSize:13,color:C.text,marginBottom:4 }}>{note.title}</div><div style={{ fontSize:10,color:note.color,fontWeight:700,background:note.bg,borderRadius:99,padding:"2px 8px",display:"inline-block",marginBottom:6 }}>{note.course}</div><div style={{ fontSize:11,color:C.muted }}>{formatRelativeDate(note.id)}</div></div>;})}</div>)
+        :(filtered.map(function(note){var isSelected=selected.includes(note.id);return<div key={note.id} style={{ background:C.card,border:"2px solid "+(isSelected?C.cyan:note.color+"22"),borderRadius:16,padding:16,marginBottom:10,cursor:"pointer",display:"flex",gap:12,alignItems:"flex-start" }} onClick={function(){onNote(note);}}><div onClick={function(e){e.stopPropagation();toggleSelect(note.id);}} style={{ width:22,height:22,borderRadius:"50%",border:"2px solid "+(isSelected?C.cyan:C.border),background:isSelected?C.cyan:"transparent",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,flexShrink:0,marginTop:2 }}>{isSelected?"✓":""}</div><div style={{ width:42,height:42,borderRadius:12,background:note.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0 }}>{note.tag==="Lecture"?"📚":note.tag==="Study"?"💡":note.tag==="Business"?"💼":"📝"}</div><div style={{ flex:1 }}><div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:4 }}><div style={{ fontWeight:800,fontSize:14,color:C.text }}>{note.title}</div><div style={{ fontSize:11,color:C.muted,flexShrink:0,marginLeft:8 }}>{formatRelativeDate(note.id)}</div></div><div style={{ display:"flex",gap:6,marginBottom:6 }}><span style={{ fontSize:10,color:note.color,fontWeight:700,background:note.bg,borderRadius:99,padding:"2px 8px" }}>{note.course}</span><span style={{ fontSize:10,color:C.muted,background:"rgba(255,255,255,0.04)",borderRadius:99,padding:"2px 8px" }}>{note.tag}</span></div><div style={{ fontSize:12,color:C.muted,lineHeight:1.5,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden" }}>{note.preview}</div><div style={{ display:"flex",gap:12,marginTop:8 }}><span style={{ fontSize:11,color:C.soft }}>💬 {note.words||note.content.split(" ").length} words</span><span style={{ fontSize:11,color:note.color,marginLeft:"auto" }}>Open →</span></div></div></div>;}))}
       </div>
     </div>
   );
@@ -635,7 +750,7 @@ function LibraryScreen({ notes, onNote, onDelete }) {
 function DashboardScreen({ notes, user }) {
   var totalWords=notes.reduce(function(sum,n){return sum+(n.words||n.content.split(" ").length);},0);
   var totalNotes=notes.length;
-  var todayNotes=notes.filter(function(n){return n.date==="Today";}).length;
+  var todayNotes=notes.filter(function(n){return formatRelativeDate(n.id)==="Just now"||/m ago$/.test(formatRelativeDate(n.id))||formatRelativeDate(n.id)==="Today";}).length;
   var courseCounts={};notes.forEach(function(n){courseCounts[n.course]=(courseCounts[n.course]||0)+1;});
   var tagCounts={Lecture:0,Study:0,Business:0,Personal:0};notes.forEach(function(n){if(tagCounts[n.tag]!==undefined)tagCounts[n.tag]++;});
   var weekDays=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];var weekActivity=[3,1,4,2,5,0,2];var maxActivity=Math.max.apply(null,weekActivity);
@@ -681,7 +796,7 @@ function DashboardScreen({ notes, user }) {
 }
 
 // ── HOME ──────────────────────────────────────────────────────────────────────
-function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, user }) {
+function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, onChat, user }) {
   var [search,setSearch]=useState("");var [filter,setFilter]=useState("All");
   var filters=["All","Lecture","Study","Business","Personal"];
   var filtered=notes.filter(function(n){return(n.title.toLowerCase().includes(search.toLowerCase())||n.course.toLowerCase().includes(search.toLowerCase()))&&(filter==="All"||n.tag===filter);});
@@ -714,8 +829,8 @@ function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, user })
         </div>
         <div style={{ marginBottom:22 }}>
           <p style={{ fontWeight:800,fontSize:16,color:C.text,margin:"0 0 14px" }}>Quick Actions</p>
-          <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:10 }}>
-            {[["🎙️","Voice\nNote",C.cyan,onVoice],["✨","AI\nWrite",C.purple,onAIWrite],["📷","Scan\nDoc",C.amber,onScan],["🖊️","Draw",C.green,onDraw]].map(function(item){return<button key={item[1]} onClick={item[3]} style={{ background:C.card,border:"1px solid "+item[2]+"30",borderRadius:14,padding:"14px 8px",cursor:"pointer",textAlign:"center" }}><div style={{ width:38,height:38,borderRadius:10,background:item[2]+"20",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 8px",fontSize:20 }}>{item[0]}</div><span style={{ fontSize:11,fontWeight:700,color:C.soft,whiteSpace:"pre-line",lineHeight:1.3 }}>{item[1]}</span></button>;}) }
+          <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10 }}>
+            {[["🎙️","Voice\nNote",C.cyan,onVoice],["✨","AI\nWrite",C.purple,onAIWrite],["💬","AI\nChat",C.cyan,onChat],["📷","Scan\nDoc",C.amber,onScan],["🖊️","Draw",C.green,onDraw]].map(function(item){return<button key={item[1]} onClick={item[3]} style={{ background:C.card,border:"1px solid "+item[2]+"30",borderRadius:14,padding:"14px 8px",cursor:"pointer",textAlign:"center" }}><div style={{ width:38,height:38,borderRadius:10,background:item[2]+"20",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 8px",fontSize:20 }}>{item[0]}</div><span style={{ fontSize:11,fontWeight:700,color:C.soft,whiteSpace:"pre-line",lineHeight:1.3 }}>{item[1]}</span></button>;}) }
           </div>
         </div>
         <div style={{ display:"flex",gap:8,marginBottom:16,overflowX:"auto",paddingBottom:4 }}>
@@ -726,43 +841,102 @@ function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, user })
           <span style={{ fontSize:12,color:C.muted,fontWeight:600 }}>{filtered.length} notes</span>
         </div>
         {filtered.length===0?<div style={{ textAlign:"center",padding:"40px 20px" }}><div style={{ fontSize:48,marginBottom:12 }}>📝</div><p style={{ color:C.muted,fontSize:15 }}>No notes yet. Tap Voice Note to start!</p></div>
-        :filtered.slice(0,5).map(function(note){return<button key={note.id} onClick={function(){onNote(note);}} style={{ width:"100%",background:C.card,border:"1px solid "+note.color+"22",borderRadius:18,padding:16,marginBottom:12,cursor:"pointer",textAlign:"left" }}><div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10 }}><div style={{ display:"flex",alignItems:"center",gap:10 }}><div style={{ width:42,height:42,borderRadius:12,background:note.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,border:"1px solid "+note.color+"30",flexShrink:0 }}>{note.tag==="Lecture"?"📚":note.tag==="Study"?"💡":note.tag==="Business"?"💼":"📝"}</div><div><div style={{ fontWeight:800,fontSize:14,color:C.text,marginBottom:3 }}>{note.title}</div><span style={{ fontSize:11,fontWeight:700,color:note.color,background:note.bg,borderRadius:99,padding:"2px 8px" }}>{note.course}</span></div></div><div style={{ textAlign:"right" }}><div style={{ fontSize:11,color:C.muted,marginBottom:4 }}>{note.date}</div><span style={{ background:note.bg,borderRadius:99,padding:"2px 8px",fontSize:10,fontWeight:700,color:note.color }}>{note.tag}</span></div></div><p style={{ margin:"0 0 10px",fontSize:13,color:C.muted,lineHeight:1.6,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden" }}>{note.preview}</p><div style={{ display:"flex",alignItems:"center",paddingTop:10,borderTop:"1px solid "+C.border }}><span style={{ fontSize:11,color:C.muted }}>✨ AI features available</span><span style={{ fontSize:11,color:note.color,marginLeft:"auto",fontWeight:700 }}>Open →</span></div></button>;})}
+        :filtered.slice(0,5).map(function(note){return<button key={note.id} onClick={function(){onNote(note);}} style={{ width:"100%",background:C.card,border:"1px solid "+note.color+"22",borderRadius:18,padding:16,marginBottom:12,cursor:"pointer",textAlign:"left" }}><div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10 }}><div style={{ display:"flex",alignItems:"center",gap:10 }}><div style={{ width:42,height:42,borderRadius:12,background:note.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,border:"1px solid "+note.color+"30",flexShrink:0 }}>{note.tag==="Lecture"?"📚":note.tag==="Study"?"💡":note.tag==="Business"?"💼":"📝"}</div><div><div style={{ fontWeight:800,fontSize:14,color:C.text,marginBottom:3 }}>{note.title}</div><span style={{ fontSize:11,fontWeight:700,color:note.color,background:note.bg,borderRadius:99,padding:"2px 8px" }}>{note.course}</span></div></div><div style={{ textAlign:"right" }}><div style={{ fontSize:11,color:C.muted,marginBottom:4 }}>{formatRelativeDate(note.id)}</div><span style={{ background:note.bg,borderRadius:99,padding:"2px 8px",fontSize:10,fontWeight:700,color:note.color }}>{note.tag}</span></div></div><p style={{ margin:"0 0 10px",fontSize:13,color:C.muted,lineHeight:1.6,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden" }}>{note.preview}</p><div style={{ display:"flex",alignItems:"center",paddingTop:10,borderTop:"1px solid "+C.border }}><span style={{ fontSize:11,color:C.muted }}>✨ AI features available</span><span style={{ fontSize:11,color:note.color,marginLeft:"auto",fontWeight:700 }}>Open →</span></div></button>;})}
       </div>
     </div>
   );
 }
 
 // ── AI CHAT ───────────────────────────────────────────────────────────────────
-function AIScreen() {
-  var [messages,setMessages]=useState([{role:"ai",text:"Hi! 👋 I am your AI study assistant. Ask me to summarize notes, explain concepts, or create study plans!"}]);
-  var [input,setInput]=useState("");var [loading,setLoading]=useState(false);var endRef=useRef(null);
+function AIScreen({ notes, onBack }) {
+  var greeting={role:"ai",text:"Hi! 👋 I'm your AI study assistant. Ask me anything, or tap 📎 to attach one of your notes and we can go through it together."};
+  var [messages,setMessages]=useState([greeting]);
+  var [input,setInput]=useState("");var [loading,setLoading]=useState(false);var [showPicker,setShowPicker]=useState(false);var [pickerSearch,setPickerSearch]=useState("");
+  var endRef=useRef(null);
   useEffect(function(){endRef.current&&endRef.current.scrollIntoView({behavior:"smooth"});},[messages]);
-  async function send(){if(!input.trim())return;var q=input.trim();setInput("");setMessages(function(m){return[...m,{role:"user",text:q}];});setLoading(true);try{var res=await callGeminiText("You are a helpful AI study assistant for a Nigerian university student. Be concise and helpful: "+q,600);setMessages(function(m){return[...m,{role:"ai",text:res}];});}catch(e){setMessages(function(m){return[...m,{role:"ai",text:"Add your Gemini API key to enable real AI!"}];});}setLoading(false);}
+
+  function newChat(){ setMessages([greeting]); setInput(""); }
+
+  function attachNote(note){
+    setShowPicker(false);
+    var attachMsg = {
+      role:"user",
+      text:"📎 Attached note: \""+note.title+"\"",
+      apiText:"Here is my lecture note titled \""+note.title+"\" (course: "+note.course+"):\n\n"+note.content+"\n\nPlease help me understand it — I'll ask questions about it."
+    };
+    var updated = messages.concat([attachMsg]);
+    setMessages(updated);
+    askGemini(updated, true);
+  }
+
+  async function send(){
+    var q = input.trim();
+    if(!q) return;
+    setInput("");
+    var updated = messages.concat([{role:"user",text:q}]);
+    setMessages(updated);
+    askGemini(updated, false);
+  }
+
+  async function askGemini(history, isAutoOpener){
+    setLoading(true);
+    try{
+      var contents = history.map(function(m){ return { role: m.role==="ai"?"model":"user", parts:[{text: m.apiText||m.text}] }; });
+      if(isAutoOpener){
+        contents.push({ role:"user", parts:[{text:"Give a short, friendly opening — acknowledge the note and ask what they'd like help with (a summary, explaining a specific part, or quiz questions)."}] });
+      }
+      var reply = await callGeminiChat(contents, "You are a friendly, encouraging AI study assistant for a Nigerian university student. Be clear and concise. When a lecture note has been attached to the conversation, ground your answers in it.", 700);
+      setMessages(function(m){ return [...m,{role:"ai",text:reply}]; });
+    }catch(e){
+      setMessages(function(m){ return [...m,{role:"ai",text:"Couldn't reach Gemini — check your API key or connection and try again."}]; });
+    }
+    setLoading(false);
+  }
+
+  var filteredNotes = notes.filter(function(n){ return n.title.toLowerCase().includes(pickerSearch.toLowerCase())||n.course.toLowerCase().includes(pickerSearch.toLowerCase()); });
+
   return(
-    <div style={{ flex:1,display:"flex",flexDirection:"column",background:C.bg }}>
-      <div style={{ background:C.card,padding:"16px 20px",borderBottom:"1px solid "+C.border }}><div style={{ display:"flex",alignItems:"center",gap:10 }}><div style={{ width:40,height:40,borderRadius:12,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20 }}>🤖</div><div><div style={{ fontWeight:800,fontSize:16,color:C.text }}>AI Assistant</div><div style={{ fontSize:11,color:C.green,fontWeight:600 }}>Gemini AI</div></div></div></div>
+    <div style={{ flex:1,display:"flex",flexDirection:"column",background:C.bg,position:"relative" }}>
+      <div style={{ background:C.card,padding:"16px 20px",borderBottom:"1px solid "+C.border,display:"flex",justifyContent:"space-between",alignItems:"center" }}>
+        <div style={{ display:"flex",alignItems:"center",gap:10 }}><button onClick={onBack} style={backBtn}>←</button><div style={{ width:40,height:40,borderRadius:12,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20 }}>🤖</div><div><div style={{ fontWeight:800,fontSize:16,color:C.text }}>AI Assistant</div><div style={{ fontSize:11,color:C.green,fontWeight:600 }}>Gemini AI</div></div></div>
+        <button onClick={newChat} style={{ background:C.card2,border:"none",borderRadius:10,padding:"7px 12px",color:C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>🔄 New Chat</button>
+      </div>
       <div style={{ flex:1,overflowY:"auto",padding:"16px 16px 8px" }}>
         {messages.map(function(m,i){return<div key={i} style={{ display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start",marginBottom:12 }}>{m.role==="ai"&&<div style={{ width:32,height:32,borderRadius:10,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,marginRight:8,flexShrink:0,marginTop:2 }}>🤖</div>}<div style={{ maxWidth:"80%",background:m.role==="user"?"linear-gradient(135deg,#06B6D4,#A78BFA)":C.card2,borderRadius:m.role==="user"?"18px 18px 4px 18px":"18px 18px 18px 4px",padding:"12px 16px",border:m.role==="ai"?"1px solid "+C.border:"none" }}><p style={{ margin:0,fontSize:14,color:C.text,lineHeight:1.7,whiteSpace:"pre-wrap" }}>{m.text}</p></div></div>;})}
         {loading&&<div style={{ display:"flex",gap:4,alignItems:"center",marginLeft:40 }}>{[0,1,2].map(function(i){return<div key={i} style={{ width:8,height:8,borderRadius:"50%",background:C.cyan,animation:"dot "+(0.5+i*0.15)+"s ease-in-out infinite alternate" }}/>;})}</div>}
         <div ref={endRef}/>
       </div>
-      <div style={{ padding:"12px 16px 16px",background:C.card2,borderTop:"1px solid "+C.border,display:"flex",gap:10 }}>
-        <input value={input} onChange={function(e){setInput(e.target.value);}} onKeyDown={function(e){if(e.key==="Enter")send();}} placeholder="Ask anything..." style={{ flex:1,padding:"12px 16px",borderRadius:14,border:"1px solid "+C.border,fontSize:14,background:C.bg,color:C.text,outline:"none" }}/>
-        <button onClick={send} style={{ width:48,height:48,borderRadius:14,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",border:"none",cursor:"pointer",fontSize:20,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>↑</button>
+      <div style={{ padding:"12px 16px 16px",background:C.card2,borderTop:"1px solid "+C.border,display:"flex",gap:8 }}>
+        <button onClick={function(){setShowPicker(true);}} title="Attach a note" style={{ width:48,height:48,borderRadius:14,background:C.card,border:"1px solid "+C.border,cursor:"pointer",fontSize:18,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>📎</button>
+        <input value={input} onChange={function(e){setInput(e.target.value);}} onKeyDown={function(e){if(e.key==="Enter")send();}} placeholder="Ask anything..." style={{ flex:1,padding:"12px 16px",borderRadius:14,border:"1px solid "+C.border,fontSize:14,background:C.bg,color:C.text,outline:"none",minWidth:0 }}/>
+        <button onClick={function(){send();}} style={{ width:48,height:48,borderRadius:14,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",border:"none",cursor:"pointer",fontSize:20,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>↑</button>
       </div>
+      {showPicker&&(
+        <div style={{ position:"absolute",inset:0,background:"rgba(10,15,30,0.85)",display:"flex",flexDirection:"column",justifyContent:"flex-end",zIndex:20 }} onClick={function(){setShowPicker(false);}}>
+          <div style={{ background:C.card,borderRadius:"20px 20px 0 0",padding:20,maxHeight:"70vh",display:"flex",flexDirection:"column" }} onClick={function(e){e.stopPropagation();}}>
+            <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14 }}><span style={{ fontWeight:800,fontSize:16,color:C.text }}>Attach a note</span><button onClick={function(){setShowPicker(false);}} style={{ background:"none",border:"none",color:C.muted,fontSize:18,cursor:"pointer" }}>✕</button></div>
+            <input value={pickerSearch} onChange={function(e){setPickerSearch(e.target.value);}} placeholder="Search notes, courses..." style={{ width:"100%",padding:"11px 14px",borderRadius:12,border:"1px solid "+C.border,fontSize:13,background:C.bg,color:C.text,outline:"none",marginBottom:14,boxSizing:"border-box" }}/>
+            <div style={{ overflowY:"auto" }}>
+              {filteredNotes.length===0&&<div style={{ textAlign:"center",color:C.muted,fontSize:13,padding:"20px 0" }}>No notes match.</div>}
+              {filteredNotes.map(function(n){return<button key={n.id} onClick={function(){attachNote(n);}} style={{ width:"100%",textAlign:"left",background:C.card2,border:"1px solid "+C.border,borderRadius:12,padding:"12px 14px",marginBottom:8,cursor:"pointer" }}>
+                <div style={{ fontWeight:700,fontSize:14,color:C.text,marginBottom:3 }}>{n.title}</div>
+                <div style={{ display:"flex",gap:8,alignItems:"center" }}><span style={{ fontSize:10,color:n.color,fontWeight:700,background:n.bg,borderRadius:99,padding:"2px 8px" }}>{n.course}</span><span style={{ fontSize:11,color:C.muted }}>{formatRelativeDate(n.id)}</span></div>
+              </button>;})}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 // ── SETTINGS ──────────────────────────────────────────────────────────────────
-function SettingsScreen({ user, onLogout }) {
+function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings, setRecSettings }) {
   var [openSection,setOpenSection]=useState(null);
   var [lang,setLang]=useState("English");
   var [aiModel,setAiModel]=useState("Gemini");
   var [aiStyle,setAiStyle]=useState("Academic");
-  var [recQuality,setRecQuality]=useState("High");
   var [notifs,setNotifs]=useState({study:true,assignment:false,daily:true,recording:false});
-  var [recSettings,setRecSettings]=useState({noise:true,autoTranscribe:true,speakerID:false,autoSave:true});
   var [privacy,setPrivacy]=useState({fingerprint:false,face:false,pin:false,autoLock:true,hiddenFolder:false,encrypt:false});
 
   function Section({ id, icon, title, color, children }) {
@@ -815,8 +989,13 @@ function SettingsScreen({ user, onLogout }) {
 
         <Section id="rec" icon="🎤" title="Recording Settings" color="#06B6D4">
           <div style={{ marginTop:12 }}>
-            <div style={{ marginBottom:12 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>RECORDING QUALITY</div><div style={{ display:"flex",gap:8 }}>{["Low","Medium","High"].map(function(q){return<button key={q} onClick={function(){setRecQuality(q);}} style={{ flex:1,padding:"8px",borderRadius:10,border:"2px solid",borderColor:recQuality===q?C.cyan:C.border,background:recQuality===q?C.cyan:C.card,color:recQuality===q?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{q}</button>;})}</div></div>
-            {[["🔇","noise","Noise Reduction","Filter background noise"],["📝","autoTranscribe","Auto Transcription","Google free speech API"],["👥","speakerID","Speaker Identification","Identify different speakers"],["💾","autoSave","Auto Save Recording","Save recordings automatically"]].map(function(item){return<Row key={item[1]} icon={item[0]} label={item[2]} sub={item[3]} right={<Toggle value={recSettings[item[1]]} onChange={function(v){setRecSettings(function(p){return{...p,[item[1]]:v};});}} color={C.cyan}/>}/>;}) }
+            <div style={{ marginBottom:12 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>RECORDING QUALITY</div><div style={{ display:"flex",gap:8 }}>{["Low","Medium","High"].map(function(q){return<button key={q} onClick={function(){setRecQuality(q);}} style={{ flex:1,padding:"8px",borderRadius:10,border:"2px solid",borderColor:recQuality===q?C.cyan:C.border,background:recQuality===q?C.cyan:C.card,color:recQuality===q?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{q}</button>;})}</div><div style={{ fontSize:11,color:C.muted,marginTop:6 }}>Higher quality sounds better but makes a bigger audio file — matters if a lecture runs long.</div></div>
+            <Row icon="🔇" label="Noise Reduction" sub="Requests a noise-suppressed mic when you record" right={<Toggle value={recSettings.noise} onChange={function(v){setRecSettings(function(p){return{...p,noise:v};});}} color={C.cyan}/>}/>
+            <Row icon="✨" label="Auto-Transcribe" sub="Start transcribing automatically the moment you stop recording" right={<Toggle value={recSettings.autoTranscribe} onChange={function(v){setRecSettings(function(p){return{...p,autoTranscribe:v};});}} color={C.cyan}/>}/>
+            <Row icon="💾" label="Auto Save" sub="Save the note automatically once transcription finishes" right={<Toggle value={recSettings.autoSave} onChange={function(v){setRecSettings(function(p){return{...p,autoSave:v};});}} color={C.cyan}/>}/>
+            <div style={{ opacity:0.5 }}>
+              <Row icon="👥" label="Speaker Identification" sub="Needs a paid diarization service — not available yet" right={<span style={{ fontSize:9,fontWeight:700,color:C.amber,background:"rgba(245,158,11,0.15)",borderRadius:99,padding:"3px 8px" }}>COMING SOON</span>}/>
+            </div>
           </div>
         </Section>
 
@@ -873,6 +1052,13 @@ export default function App() {
   var [screen, setScreen] = useState("home");
   var [activeNote, setActiveNote] = useState(null);
   var [tab, setTab] = useState("home");
+  var [recQuality, setRecQuality] = useState(function(){ try{ return localStorage.getItem("jotting_recQuality")||"Medium"; }catch(e){ return "Medium"; } });
+  var [recSettings, setRecSettings] = useState(function(){
+    try{ var raw=localStorage.getItem("jotting_recSettings"); return raw?JSON.parse(raw):{noise:true,autoTranscribe:false,speakerID:false,autoSave:false}; }
+    catch(e){ return {noise:true,autoTranscribe:false,speakerID:false,autoSave:false}; }
+  });
+  useEffect(function(){ try{ localStorage.setItem("jotting_recQuality", recQuality); }catch(e){} }, [recQuality]);
+  useEffect(function(){ try{ localStorage.setItem("jotting_recSettings", JSON.stringify(recSettings)); }catch(e){} }, [recSettings]);
 
   // Listen for auth state
   useEffect(function() {
@@ -1001,16 +1187,16 @@ export default function App() {
       <div style={{ width:"100%",maxWidth:400,minHeight:"calc(100vh - 40px)",background:C.bg,borderRadius:36,overflow:"hidden",display:"flex",flexDirection:"column",boxShadow:"0 24px 80px rgba(6,182,212,0.12), 0 0 0 1px rgba(255,255,255,0.06)" }}>
         {cloudLoading&&<div style={{ background:"rgba(6,182,212,0.1)",padding:"10px",textAlign:"center",fontSize:12,color:C.cyan,fontWeight:600 }}>☁️ Syncing your notes...</div>}
         <div style={{ flex:1,display:"flex",flexDirection:"column",overflowY:"auto",minHeight:0 }}>
-          {screen==="home"&&<HomeScreen notes={notes} user={user} onNote={function(n){setActiveNote(n);go("detail");}} onVoice={function(){go("voice","new");}} onDraw={function(){go("draw");}} onAIWrite={function(){go("aiwrite");}} onScan={function(){go("scan");}}/>}
+          {screen==="home"&&<HomeScreen notes={notes} user={user} onNote={function(n){setActiveNote(n);go("detail");}} onVoice={function(){go("voice","new");}} onDraw={function(){go("draw");}} onAIWrite={function(){go("aiwrite");}} onScan={function(){go("scan");}} onChat={function(){go("ai");}}/>}
           {screen==="library"&&<LibraryScreen notes={notes} onNote={function(n){setActiveNote(n);go("detail");}} onDelete={deleteNote}/>}
           {screen==="dashboard"&&<DashboardScreen notes={notes} user={user}/>}
           {screen==="detail"&&activeNote&&<NoteDetail note={activeNote} onBack={function(){go(tab==="library"?"library":"home",tab);}} onDelete={deleteNote}/>}
-          {screen==="voice"&&<VoiceNoteScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
+          {screen==="voice"&&<VoiceNoteScreen onBack={function(){go("home","home");}} onSave={saveNote} recQuality={recQuality} recSettings={recSettings}/>}
           {screen==="draw"&&<DrawScreen onBack={function(){go("home","home");}}/>}
           {screen==="aiwrite"&&<AIWriteScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
           {screen==="scan"&&<ScanDocScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
-          {screen==="ai"&&<AIScreen/>}
-          {screen==="settings"&&<SettingsScreen user={user} onLogout={handleLogout}/>}
+          {screen==="ai"&&<AIScreen notes={notes} onBack={function(){go("home","home");}}/>}
+          {screen==="settings"&&<SettingsScreen user={user} onLogout={handleLogout} recQuality={recQuality} setRecQuality={setRecQuality} recSettings={recSettings} setRecSettings={setRecSettings}/>}
         </div>
         <div style={{ background:C.card2,borderTop:"1px solid "+C.border,padding:"10px 10px 16px",display:"flex",justifyContent:"space-around",alignItems:"center",flexShrink:0 }}>
           {NAV.map(function(item){return(
