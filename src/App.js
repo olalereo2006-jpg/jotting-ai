@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { initializeApp } from "firebase/app";
 import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, sendPasswordResetEmail, GoogleAuthProvider, signInWithPopup } from "firebase/auth";
-import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, query, where } from "firebase/firestore";
+import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, setDoc, query, where } from "firebase/firestore";
 
 // ── Firebase Config ───────────────────────────────────────────────────────────
 const firebaseConfig = {
@@ -26,7 +26,7 @@ const C = {
   red: "#F87171", text: "#F1F5F9", muted: "#64748B", soft: "#94A3B8",
 };
 
-const GEMINI_KEY = "AQ.Ab8RN6I2nJUkGrrtyn9AuImOjXwxBcJClNzrf4cgMDjAIvjdKw";
+const GEMINI_KEY = "YOUR_GEMINI_KEY_HERE";
 const GEMINI_MODEL = "gemini-flash-latest";
 
 // Gemini's servers occasionally return 503 (temporarily overloaded) — this retries
@@ -147,6 +147,35 @@ function persistNotesLocal(userId, notesList) {
   try { localStorage.setItem("jotting_notes_"+userId, JSON.stringify(notesList)); } catch(e){}
 }
 
+// ── Chat session persistence (SAM-X AI chat history) ───────────────────────────
+// Each session keeps its own stable id (client-generated), so saving is just an
+// upsert to that same Firestore doc — no separate firestoreId bookkeeping needed.
+async function saveChatToCloud(userId, session) {
+  try { await setDoc(doc(db, "chats", session.id), { ...session, userId }); }
+  catch(e) { console.error("Chat save error:", e); }
+}
+async function loadChatsFromCloud(userId) {
+  try {
+    var q = query(collection(db, "chats"), where("userId","==",userId));
+    var snap = await getDocs(q);
+    var list = snap.docs.map(function(d){ return d.data(); });
+    list.sort(function(a,b){ return (b.updatedAt||0) - (a.updatedAt||0); });
+    return list;
+  } catch(e) { console.error("Chat load error:", e); return []; }
+}
+async function deleteChatFromCloud(sessionId) {
+  try { await deleteDoc(doc(db, "chats", sessionId)); } catch(e) { console.error("Chat delete error:", e); }
+}
+function loadChatsLocal(userId) {
+  try {
+    var raw = localStorage.getItem("jotting_chats_"+userId);
+    return raw ? JSON.parse(raw) : [];
+  } catch(e) { return []; }
+}
+function persistChatsLocal(userId, sessions) {
+  try { localStorage.setItem("jotting_chats_"+userId, JSON.stringify(sessions)); } catch(e){}
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function Wave({ active, color, size }) {
   var c=color||"#06B6D4"; var s=size||1;
@@ -177,7 +206,7 @@ function OnboardingScreen({ onDone }) {
   var pages = [
     { icon:"🎵", title:"Welcome to Jotting AI", desc:"The smartest note-taking app for Nigerian university students", color:"#06B6D4", bg:"linear-gradient(135deg,#0A0F1E,#1E1B4B)" },
     { icon:"🎙️", title:"Record Your Lectures", desc:"Record your lecturer's voice and our AI converts it to perfect notes automatically", color:"#A78BFA", bg:"linear-gradient(135deg,#0A0F1E,#1E0B4B)" },
-    { icon:"🤖", title:"AI-Powered Learning", desc:"Get instant summaries, quizzes, and flashcards from your notes using Gemini AI", color:"#34D399", bg:"linear-gradient(135deg,#0A0F1E,#0B1E1B)" },
+    { icon:"🤖", title:"AI-Powered Learning", desc:"Get instant summaries, quizzes, and flashcards from your notes using SAM-X AI", color:"#34D399", bg:"linear-gradient(135deg,#0A0F1E,#0B1E1B)" },
     { icon:"📚", title:"Study Smarter", desc:"Library, Dashboard, Push Notifications — everything you need to ace your exams", color:"#F59E0B", bg:"linear-gradient(135deg,#0A0F1E,#1E1A0A)" },
   ];
   var p = pages[page];
@@ -848,14 +877,38 @@ function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, onChat,
 }
 
 // ── AI CHAT ───────────────────────────────────────────────────────────────────
-function AIScreen({ notes, onBack }) {
-  var greeting={role:"ai",text:"Hi! 👋 I'm your AI study assistant. Ask me anything, or tap 📎 to attach one of your notes and we can go through it together."};
+function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession }) {
+  var greeting={role:"ai",text:"Hi! 👋 I'm SAM-X, your AI study assistant. Ask me anything, or tap 📎 to attach one of your notes and we can go through it together."};
+  var [activeId,setActiveId]=useState(null); // null = fresh chat, not yet saved
   var [messages,setMessages]=useState([greeting]);
-  var [input,setInput]=useState("");var [loading,setLoading]=useState(false);var [showPicker,setShowPicker]=useState(false);var [pickerSearch,setPickerSearch]=useState("");
+  var [input,setInput]=useState("");var [loading,setLoading]=useState(false);
+  var [showPicker,setShowPicker]=useState(false);var [pickerSearch,setPickerSearch]=useState("");
+  var [showHistory,setShowHistory]=useState(false);
   var endRef=useRef(null);
   useEffect(function(){endRef.current&&endRef.current.scrollIntoView({behavior:"smooth"});},[messages]);
 
-  function newChat(){ setMessages([greeting]); setInput(""); }
+  function newChat(){ setActiveId(null); setMessages([greeting]); setInput(""); setShowHistory(false); }
+
+  function openSession(session){
+    setActiveId(session.id);
+    setMessages(session.messages);
+    setShowHistory(false);
+  }
+
+  function removeSession(e, id){
+    e.stopPropagation();
+    if(!window.confirm("Delete this conversation?")) return;
+    onDeleteSession(id);
+    if(activeId===id) newChat();
+  }
+
+  function persist(history){
+    var id = activeId || ("chat_"+Date.now());
+    var firstUserMsg = history.find(function(m){return m.role==="user";});
+    var title = firstUserMsg ? (firstUserMsg.text.length>40?firstUserMsg.text.slice(0,40)+"…":firstUserMsg.text) : "New chat";
+    onSaveSession({ id:id, title:title, messages:history, updatedAt:Date.now() });
+    if(!activeId) setActiveId(id);
+  }
 
   function attachNote(note){
     setShowPicker(false);
@@ -871,7 +924,7 @@ function AIScreen({ notes, onBack }) {
 
   async function send(){
     var q = input.trim();
-    if(!q) return;
+    if(!q || loading) return;
     setInput("");
     var updated = messages.concat([{role:"user",text:q}]);
     setMessages(updated);
@@ -885,10 +938,12 @@ function AIScreen({ notes, onBack }) {
       if(isAutoOpener){
         contents.push({ role:"user", parts:[{text:"Give a short, friendly opening — acknowledge the note and ask what they'd like help with (a summary, explaining a specific part, or quiz questions)."}] });
       }
-      var reply = await callGeminiChat(contents, "You are a friendly, encouraging AI study assistant for a Nigerian university student. Be clear and concise. When a lecture note has been attached to the conversation, ground your answers in it.", 700);
-      setMessages(function(m){ return [...m,{role:"ai",text:reply}]; });
+      var reply = await callGeminiChat(contents, "You are SAM-X, a friendly, encouraging AI study assistant for a Nigerian university student. Be clear and concise. When a lecture note has been attached to the conversation, ground your answers in it.", 700);
+      var next = history.concat([{role:"ai",text:reply}]);
+      setMessages(next);
+      persist(next);
     }catch(e){
-      setMessages(function(m){ return [...m,{role:"ai",text:"Couldn't reach Gemini — check your API key or connection and try again."}]; });
+      setMessages(history.concat([{role:"ai",text:"Couldn't reach SAM-X — check your API key or connection and try again."}]));
     }
     setLoading(false);
   }
@@ -898,8 +953,11 @@ function AIScreen({ notes, onBack }) {
   return(
     <div style={{ flex:1,display:"flex",flexDirection:"column",background:C.bg,position:"relative" }}>
       <div style={{ background:C.card,padding:"16px 20px",borderBottom:"1px solid "+C.border,display:"flex",justifyContent:"space-between",alignItems:"center" }}>
-        <div style={{ display:"flex",alignItems:"center",gap:10 }}><button onClick={onBack} style={backBtn}>←</button><div style={{ width:40,height:40,borderRadius:12,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20 }}>🤖</div><div><div style={{ fontWeight:800,fontSize:16,color:C.text }}>AI Assistant</div><div style={{ fontSize:11,color:C.green,fontWeight:600 }}>Gemini AI</div></div></div>
-        <button onClick={newChat} style={{ background:C.card2,border:"none",borderRadius:10,padding:"7px 12px",color:C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>🔄 New Chat</button>
+        <div style={{ display:"flex",alignItems:"center",gap:10 }}><button onClick={onBack} style={backBtn}>←</button><div style={{ width:40,height:40,borderRadius:12,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20 }}>🤖</div><div><div style={{ fontWeight:800,fontSize:16,color:C.text }}>SAM-X AI</div><div style={{ fontSize:11,color:C.green,fontWeight:600 }}>AI Study Assistant</div></div></div>
+        <div style={{ display:"flex",gap:8 }}>
+          <button onClick={function(){setShowHistory(true);}} title="Chat history" style={{ background:C.card2,border:"none",borderRadius:10,width:36,height:36,color:C.muted,fontSize:16,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center" }}>🕐</button>
+          <button onClick={newChat} title="New chat" style={{ background:C.card2,border:"none",borderRadius:10,width:36,height:36,color:C.muted,fontSize:16,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center" }}>✏️</button>
+        </div>
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:"16px 16px 8px" }}>
         {messages.map(function(m,i){return<div key={i} style={{ display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start",marginBottom:12 }}>{m.role==="ai"&&<div style={{ width:32,height:32,borderRadius:10,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,marginRight:8,flexShrink:0,marginTop:2 }}>🤖</div>}<div style={{ maxWidth:"80%",background:m.role==="user"?"linear-gradient(135deg,#06B6D4,#A78BFA)":C.card2,borderRadius:m.role==="user"?"18px 18px 4px 18px":"18px 18px 18px 4px",padding:"12px 16px",border:m.role==="ai"?"1px solid "+C.border:"none" }}><p style={{ margin:0,fontSize:14,color:C.text,lineHeight:1.7,whiteSpace:"pre-wrap" }}>{m.text}</p></div></div>;})}
@@ -908,9 +966,10 @@ function AIScreen({ notes, onBack }) {
       </div>
       <div style={{ padding:"12px 16px 16px",background:C.card2,borderTop:"1px solid "+C.border,display:"flex",gap:8 }}>
         <button onClick={function(){setShowPicker(true);}} title="Attach a note" style={{ width:48,height:48,borderRadius:14,background:C.card,border:"1px solid "+C.border,cursor:"pointer",fontSize:18,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>📎</button>
-        <input value={input} onChange={function(e){setInput(e.target.value);}} onKeyDown={function(e){if(e.key==="Enter")send();}} placeholder="Ask anything..." style={{ flex:1,padding:"12px 16px",borderRadius:14,border:"1px solid "+C.border,fontSize:14,background:C.bg,color:C.text,outline:"none",minWidth:0 }}/>
-        <button onClick={function(){send();}} style={{ width:48,height:48,borderRadius:14,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",border:"none",cursor:"pointer",fontSize:20,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>↑</button>
+        <input value={input} disabled={loading} onChange={function(e){setInput(e.target.value);}} onKeyDown={function(e){if(e.key==="Enter")send();}} placeholder="Ask anything..." style={{ flex:1,padding:"12px 16px",borderRadius:14,border:"1px solid "+C.border,fontSize:14,background:C.bg,color:C.text,outline:"none",minWidth:0 }}/>
+        <button onClick={send} disabled={loading} style={{ width:48,height:48,borderRadius:14,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",border:"none",cursor:loading?"default":"pointer",opacity:loading?0.6:1,fontSize:20,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>↑</button>
       </div>
+
       {showPicker&&(
         <div style={{ position:"absolute",inset:0,background:"rgba(10,15,30,0.85)",display:"flex",flexDirection:"column",justifyContent:"flex-end",zIndex:20 }} onClick={function(){setShowPicker(false);}}>
           <div style={{ background:C.card,borderRadius:"20px 20px 0 0",padding:20,maxHeight:"70vh",display:"flex",flexDirection:"column" }} onClick={function(e){e.stopPropagation();}}>
@@ -926,6 +985,28 @@ function AIScreen({ notes, onBack }) {
           </div>
         </div>
       )}
+
+      {showHistory&&(
+        <div style={{ position:"absolute",inset:0,background:"rgba(10,15,30,0.85)",display:"flex",flexDirection:"column",justifyContent:"flex-end",zIndex:20 }} onClick={function(){setShowHistory(false);}}>
+          <div style={{ background:C.card,borderRadius:"20px 20px 0 0",padding:20,maxHeight:"70vh",display:"flex",flexDirection:"column" }} onClick={function(e){e.stopPropagation();}}>
+            <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14 }}><span style={{ fontWeight:800,fontSize:16,color:C.text }}>Chat History</span><button onClick={function(){setShowHistory(false);}} style={{ background:"none",border:"none",color:C.muted,fontSize:18,cursor:"pointer" }}>✕</button></div>
+            <button onClick={newChat} style={{ display:"flex",alignItems:"center",gap:8,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",border:"none",borderRadius:12,padding:"12px 16px",color:"#fff",fontWeight:700,fontSize:14,cursor:"pointer",marginBottom:14 }}>✏️ New Chat</button>
+            <div style={{ overflowY:"auto" }}>
+              {chatSessions.length===0&&<div style={{ textAlign:"center",color:C.muted,fontSize:13,padding:"20px 0" }}>No past conversations yet.</div>}
+              {chatSessions.map(function(s){var lastMsg=s.messages&&s.messages.length?s.messages[s.messages.length-1]:null;return(
+                <button key={s.id} onClick={function(){openSession(s);}} style={{ width:"100%",textAlign:"left",background:activeId===s.id?C.cyan+"15":C.card2,border:"1px solid "+(activeId===s.id?C.cyan+"50":C.border),borderRadius:12,padding:"12px 14px",marginBottom:8,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10 }}>
+                  <div style={{ minWidth:0,flex:1 }}>
+                    <div style={{ fontWeight:700,fontSize:14,color:C.text,marginBottom:3,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis" }}>{s.title||"New chat"}</div>
+                    {lastMsg&&<div style={{ fontSize:12,color:C.muted,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis" }}>{lastMsg.text}</div>}
+                    <div style={{ fontSize:10,color:C.muted,marginTop:4 }}>{formatRelativeDate(s.updatedAt)}</div>
+                  </div>
+                  <span onClick={function(e){removeSession(e,s.id);}} style={{ color:C.red,fontSize:16,padding:4,flexShrink:0 }}>🗑️</span>
+                </button>
+              );})}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -934,7 +1015,6 @@ function AIScreen({ notes, onBack }) {
 function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings, setRecSettings }) {
   var [openSection,setOpenSection]=useState(null);
   var [lang,setLang]=useState("English");
-  var [aiModel,setAiModel]=useState("Gemini");
   var [aiStyle,setAiStyle]=useState("Academic");
   var [notifs,setNotifs]=useState({study:true,assignment:false,daily:true,recording:false});
   var [privacy,setPrivacy]=useState({fingerprint:false,face:false,pin:false,autoLock:true,hiddenFolder:false,encrypt:false});
@@ -961,7 +1041,7 @@ function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings
             <div style={{ flex:1 }}>
               <div style={{ fontWeight:800,fontSize:18,color:C.text }}>{(user&&user.displayName)||"Student"}</div>
               <div style={{ fontSize:13,color:C.muted }}>{user&&user.email}</div>
-              <div style={{ fontSize:11,color:C.green,marginTop:2 }}>✅ Verified Account</div>
+                <div style={{ fontSize:11,color:C.green,marginTop:2 }}>✅ Verified Account</div>
             </div>
           </div>
         </div>
@@ -970,7 +1050,7 @@ function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings
           <div style={{ marginTop:12 }}>
             <div style={{ background:C.card2,borderRadius:12,padding:"12px 16px",marginBottom:10,display:"flex",justifyContent:"space-between",alignItems:"center" }}><div><div style={{ fontWeight:700,fontSize:14,color:C.text }}>Current Plan</div><div style={{ fontSize:12,color:C.muted }}>Free - 5 recordings per month</div></div><span style={{ background:"rgba(6,182,212,0.15)",color:C.cyan,borderRadius:99,padding:"4px 14px",fontSize:12,fontWeight:700 }}>Free</span></div>
             <div style={{ background:"linear-gradient(135deg,#4F46E5,#7C3AED,#06B6D4)",borderRadius:16,padding:20,marginBottom:10 }}>
-              <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12 }}><div><div style={{ fontWeight:800,fontSize:18,color:"#fff" }}>Upgrade to Pro</div><div style={{ fontSize:12,color:"rgba(255,255,255,0.75)",marginTop:4,lineHeight:1.8 }}>Unlimited recordings and notes{"\n"}Real AI with Gemini{"\n"}Priority support</div></div><span style={{ fontSize:32 }}>🚀</span></div>
+              <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12 }}><div><div style={{ fontWeight:800,fontSize:18,color:"#fff" }}>Upgrade to Pro</div><div style={{ fontSize:12,color:"rgba(255,255,255,0.75)",marginTop:4,lineHeight:1.8 }}>Unlimited recordings and notes{"\n"}Real AI with SAM-X{"\n"}Priority support</div></div><span style={{ fontSize:32 }}>🚀</span></div>
               <div style={{ display:"flex",alignItems:"baseline",gap:4,marginBottom:14 }}><span style={{ fontSize:32,fontWeight:800,color:"#fff" }}>₦550</span><span style={{ fontSize:13,color:"rgba(255,255,255,0.6)" }}>/month</span></div>
               <button style={{ width:"100%",background:"#fff",color:"#4F46E5",border:"none",borderRadius:12,padding:"13px",fontWeight:800,fontSize:15,cursor:"pointer" }}>Get Pro Now →</button>
             </div>
@@ -1001,7 +1081,7 @@ function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings
 
         <Section id="ai" icon="🤖" title="AI Settings" color="#A78BFA">
           <div style={{ marginTop:12 }}>
-            <div style={{ marginBottom:14 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>AI MODEL</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{["Gemini","Claude","GPT-4"].map(function(m){return<button key={m} onClick={function(){setAiModel(m);}} style={{ padding:"8px 16px",borderRadius:10,border:"2px solid",borderColor:aiModel===m?C.purple:C.border,background:aiModel===m?C.purple:C.card,color:aiModel===m?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{m}</button>;})}</div></div>
+            <div style={{ marginBottom:14 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>AI ENGINE</div><div style={{ background:C.card2,borderRadius:12,padding:"12px 14px",display:"flex",alignItems:"center",gap:10 }}><span style={{ fontSize:20 }}>🤖</span><div><div style={{ fontWeight:700,fontSize:14,color:C.text }}>SAM-X AI</div><div style={{ fontSize:11,color:C.muted }}>Powers your Summary, Quiz, AI Write, Scan Doc, and Chat</div></div></div></div>
             <div style={{ marginBottom:14 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>WRITING STYLE</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{["Academic","Simple","Detailed"].map(function(s){return<button key={s} onClick={function(){setAiStyle(s);}} style={{ padding:"8px 16px",borderRadius:10,border:"2px solid",borderColor:aiStyle===s?C.purple:C.border,background:aiStyle===s?C.purple:C.card,color:aiStyle===s?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{s}</button>;})}</div></div>
             <Row icon="🌐" label="AI Response Language" sub="English"/>
             <Row icon="📏" label="AI Summary Length" sub="Medium"/>
@@ -1048,6 +1128,7 @@ export default function App() {
   var [authLoading, setAuthLoading] = useState(true);
   var [showOnboarding, setShowOnboarding] = useState(false);
   var [notes, setNotes] = useState([]);
+  var [chatSessions, setChatSessions] = useState([]);
   var [cloudLoading, setCloudLoading] = useState(false);
   var [screen, setScreen] = useState("home");
   var [activeNote, setActiveNote] = useState(null);
@@ -1083,11 +1164,24 @@ export default function App() {
           });
           setCloudLoading(false);
         });
+        var cachedChats = loadChatsLocal(firebaseUser.uid);
+        if (cachedChats.length > 0) setChatSessions(cachedChats);
+        loadChatsFromCloud(firebaseUser.uid).then(function(cloudChats){
+          setChatSessions(function(prev){
+            var byId = {};
+            prev.concat(cloudChats).forEach(function(s){ byId[s.id] = s; });
+            var merged = Object.values(byId);
+            merged.sort(function(a,b){ return (b.updatedAt||0) - (a.updatedAt||0); });
+            persistChatsLocal(firebaseUser.uid, merged);
+            return merged;
+          });
+        });
         var isNew = !localStorage.getItem("jotting_seen_"+firebaseUser.uid);
         if (isNew) { setShowOnboarding(true); localStorage.setItem("jotting_seen_"+firebaseUser.uid,"1"); }
       } else {
         setUser(null);
         setNotes([]);
+        setChatSessions([]);
         setAuthLoading(false);
       }
     });
@@ -1128,6 +1222,26 @@ export default function App() {
       return updated;
     });
     if (screen==="detail") go(tab==="library"?"library":"home",tab);
+  }
+
+  function saveChatSession(session) {
+    setChatSessions(function(prev){
+      var exists = prev.some(function(s){ return s.id===session.id; });
+      var updated = exists ? prev.map(function(s){ return s.id===session.id ? session : s; }) : [session, ...prev];
+      updated.sort(function(a,b){ return (b.updatedAt||0) - (a.updatedAt||0); });
+      if (user) persistChatsLocal(user.uid, updated);
+      return updated;
+    });
+    if (user) saveChatToCloud(user.uid, session).catch(function(e){ console.error("Background chat save failed:", e); });
+  }
+
+  async function deleteChatSession(id) {
+    await deleteChatFromCloud(id);
+    setChatSessions(function(s){
+      var updated = s.filter(function(x){ return x.id!==id; });
+      if (user) persistChatsLocal(user.uid, updated);
+      return updated;
+    });
   }
 
   async function handleLogout() {
@@ -1195,7 +1309,7 @@ export default function App() {
           {screen==="draw"&&<DrawScreen onBack={function(){go("home","home");}}/>}
           {screen==="aiwrite"&&<AIWriteScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
           {screen==="scan"&&<ScanDocScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
-          {screen==="ai"&&<AIScreen notes={notes} onBack={function(){go("home","home");}}/>}
+          {screen==="ai"&&<AIScreen notes={notes} onBack={function(){go("home","home");}} chatSessions={chatSessions} onSaveSession={saveChatSession} onDeleteSession={deleteChatSession}/>}
           {screen==="settings"&&<SettingsScreen user={user} onLogout={handleLogout} recQuality={recQuality} setRecQuality={setRecQuality} recSettings={recSettings} setRecSettings={setRecSettings}/>}
         </div>
         <div style={{ background:C.card2,borderTop:"1px solid "+C.border,padding:"10px 10px 16px",display:"flex",justifyContent:"space-around",alignItems:"center",flexShrink:0 }}>
