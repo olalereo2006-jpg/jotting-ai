@@ -1,7 +1,13 @@
 import { useState, useEffect, useRef } from "react";
 import { initializeApp } from "firebase/app";
 import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, sendPasswordResetEmail, GoogleAuthProvider, signInWithPopup } from "firebase/auth";
-import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, query, where } from "firebase/firestore";
+import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, setDoc, query, where } from "firebase/firestore";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import "katex/dist/katex.min.css";
+import mammoth from "mammoth";
 
 // ── Firebase Config ───────────────────────────────────────────────────────────
 const firebaseConfig = {
@@ -26,7 +32,7 @@ const C = {
   red: "#F87171", text: "#F1F5F9", muted: "#64748B", soft: "#94A3B8",
 };
 
-const GEMINI_KEY = "AQ.Ab8RN6I2nJUkGrrtyn9AuImOjXwxBcJClNzrf4cgMDjAIvjdKw";
+const GEMINI_KEY = "YOUR_GEMINI_KEY_HERE";
 const GEMINI_MODEL = "gemini-flash-latest";
 
 // Gemini's servers occasionally return 503 (temporarily overloaded) — this retries
@@ -54,17 +60,40 @@ async function callGeminiText(promptText, maxTokens) {
 // Full multi-turn chat: `contents` is the whole conversation so far (each turn
 // {role:"user"|"model", parts:[{text}]}), so Gemini actually remembers context
 // across messages instead of treating every question in isolation.
-async function callGeminiChat(contents, systemInstruction, maxTokens) {
-  var body = { contents: contents, generationConfig: { maxOutputTokens: maxTokens||800 } };
+// Real word-by-word streaming (Gemini's SSE endpoint), with abort support for the
+// Stop button. onChunk receives the full text-so-far each time new tokens arrive.
+async function callGeminiChatStream(contents, systemInstruction, onChunk, signal, maxTokens) {
+  var body = { contents: contents, generationConfig: { maxOutputTokens: maxTokens||1200 } };
   if (systemInstruction) body.systemInstruction = { parts:[{ text: systemInstruction }] };
-  var res = await fetchWithRetry(
-    "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":generateContent?key="+GEMINI_KEY,
-    { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body) }
+  var res = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":streamGenerateContent?alt=sse&key="+GEMINI_KEY,
+    { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), signal:signal }
   );
-  var data = await res.json();
-  var text = data&&data.candidates&&data.candidates[0]&&data.candidates[0].content&&data.candidates[0].content.parts&&data.candidates[0].content.parts[0]&&data.candidates[0].content.parts[0].text;
-  if (!text) throw new Error((data&&data.error&&data.error.message)||"No response from Gemini");
-  return text;
+  if (!res.ok || !res.body) throw new Error("Couldn't start streaming response from SAM-X");
+  var reader = res.body.getReader();
+  var decoder = new TextDecoder();
+  var buffer = "";
+  var full = "";
+  while (true) {
+    var chunk = await reader.read();
+    if (chunk.done) break;
+    buffer += decoder.decode(chunk.value, { stream:true });
+    var lines = buffer.split("\n");
+    buffer = lines.pop();
+    for (var i=0; i<lines.length; i++) {
+      var line = lines[i].trim();
+      if (!line.startsWith("data:")) continue;
+      var jsonStr = line.slice(5).trim();
+      if (!jsonStr || jsonStr==="[DONE]") continue;
+      try {
+        var obj = JSON.parse(jsonStr);
+        var textPart = obj&&obj.candidates&&obj.candidates[0]&&obj.candidates[0].content&&obj.candidates[0].content.parts&&obj.candidates[0].content.parts[0]&&obj.candidates[0].content.parts[0].text;
+        if (textPart) { full += textPart; onChunk(full); }
+      } catch(e) { /* ignore partial/incomplete JSON chunk, next read will complete it */ }
+    }
+  }
+  if (!full) throw new Error("No response from SAM-X");
+  return full;
 }
 
 async function callGeminiVision(base64, mediaType, promptText, maxTokens) {
@@ -147,6 +176,35 @@ function persistNotesLocal(userId, notesList) {
   try { localStorage.setItem("jotting_notes_"+userId, JSON.stringify(notesList)); } catch(e){}
 }
 
+// ── Chat session persistence (SAM-X AI chat history) ───────────────────────────
+// Each session keeps its own stable id (client-generated), so saving is just an
+// upsert to that same Firestore doc — no separate firestoreId bookkeeping needed.
+async function saveChatToCloud(userId, session) {
+  try { await setDoc(doc(db, "chats", session.id), { ...session, userId }); }
+  catch(e) { console.error("Chat save error:", e); }
+}
+async function loadChatsFromCloud(userId) {
+  try {
+    var q = query(collection(db, "chats"), where("userId","==",userId));
+    var snap = await getDocs(q);
+    var list = snap.docs.map(function(d){ return d.data(); });
+    list.sort(function(a,b){ return (b.updatedAt||0) - (a.updatedAt||0); });
+    return list;
+  } catch(e) { console.error("Chat load error:", e); return []; }
+}
+async function deleteChatFromCloud(sessionId) {
+  try { await deleteDoc(doc(db, "chats", sessionId)); } catch(e) { console.error("Chat delete error:", e); }
+}
+function loadChatsLocal(userId) {
+  try {
+    var raw = localStorage.getItem("jotting_chats_"+userId);
+    return raw ? JSON.parse(raw) : [];
+  } catch(e) { return []; }
+}
+function persistChatsLocal(userId, sessions) {
+  try { localStorage.setItem("jotting_chats_"+userId, JSON.stringify(sessions)); } catch(e){}
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function Wave({ active, color, size }) {
   var c=color||"#06B6D4"; var s=size||1;
@@ -177,7 +235,7 @@ function OnboardingScreen({ onDone }) {
   var pages = [
     { icon:"🎵", title:"Welcome to Jotting AI", desc:"The smartest note-taking app for Nigerian university students", color:"#06B6D4", bg:"linear-gradient(135deg,#0A0F1E,#1E1B4B)" },
     { icon:"🎙️", title:"Record Your Lectures", desc:"Record your lecturer's voice and our AI converts it to perfect notes automatically", color:"#A78BFA", bg:"linear-gradient(135deg,#0A0F1E,#1E0B4B)" },
-    { icon:"🤖", title:"AI-Powered Learning", desc:"Get instant summaries, quizzes, and flashcards from your notes using Gemini AI", color:"#34D399", bg:"linear-gradient(135deg,#0A0F1E,#0B1E1B)" },
+    { icon:"🤖", title:"AI-Powered Learning", desc:"Get instant summaries, quizzes, and flashcards from your notes using SAM-X AI", color:"#34D399", bg:"linear-gradient(135deg,#0A0F1E,#0B1E1B)" },
     { icon:"📚", title:"Study Smarter", desc:"Library, Dashboard, Push Notifications — everything you need to ace your exams", color:"#F59E0B", bg:"linear-gradient(135deg,#0A0F1E,#1E1A0A)" },
   ];
   var p = pages[page];
@@ -848,80 +906,387 @@ function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, onChat,
 }
 
 // ── AI CHAT ───────────────────────────────────────────────────────────────────
-function AIScreen({ notes, onBack }) {
-  var greeting={role:"ai",text:"Hi! 👋 I'm your AI study assistant. Ask me anything, or tap 📎 to attach one of your notes and we can go through it together."};
-  var [messages,setMessages]=useState([greeting]);
-  var [input,setInput]=useState("");var [loading,setLoading]=useState(false);var [showPicker,setShowPicker]=useState(false);var [pickerSearch,setPickerSearch]=useState("");
-  var endRef=useRef(null);
-  useEffect(function(){endRef.current&&endRef.current.scrollIntoView({behavior:"smooth"});},[messages]);
+function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession }) {
+  var greeting = {role:"ai", text:"Hi! 👋 I'm SAM-X, your AI study assistant. Ask me anything, attach a note to discuss it, or upload a file (image, PDF, TXT, or DOCX) and I'll read it with you."};
+  var [activeId, setActiveId] = useState(null);
+  var [messages, setMessages] = useState([greeting]);
+  var [input, setInput] = useState("");
+  var [streaming, setStreaming] = useState(false);
+  var [streamingText, setStreamingText] = useState("");
+  var [editingIndex, setEditingIndex] = useState(null);
+  var [editText, setEditText] = useState("");
+  var [errorRetry, setErrorRetry] = useState(null);
+  var [copiedIndex, setCopiedIndex] = useState(null);
+  var [showPicker, setShowPicker] = useState(false);
+  var [pickerSearch, setPickerSearch] = useState("");
+  var [pickerMode, setPickerMode] = useState("discuss");
+  var [showAttachMenu, setShowAttachMenu] = useState(false);
+  var [showHistory, setShowHistory] = useState(false);
+  var [historySearch, setHistorySearch] = useState("");
+  var [historyTab, setHistoryTab] = useState("chats");
+  var [renamingId, setRenamingId] = useState(null);
+  var [renameText, setRenameText] = useState("");
 
-  function newChat(){ setMessages([greeting]); setInput(""); }
+  var endRef = useRef(null);
+  var abortRef = useRef(null);
+  var fileInputRef = useRef(null);
 
-  function attachNote(note){
+  useEffect(function(){ endRef.current && endRef.current.scrollIntoView({behavior:"smooth"}); }, [messages, streamingText]);
+
+  var courseList = Array.from(new Set(notes.map(function(n){return n.course;})));
+
+  var iconBtnStyle = { background:C.card2, border:"none", borderRadius:10, width:36, height:36, color:C.muted, fontSize:16, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" };
+  var suggestionChip = { background:C.card2, border:"1px solid "+C.border, borderRadius:99, padding:"9px 14px", color:C.text, fontSize:13, fontWeight:600, cursor:"pointer" };
+  var msgActionBtn = { background:"none", border:"none", color:C.muted, fontSize:11, fontWeight:600, cursor:"pointer", padding:"2px 0" };
+  var attachMenuItem = { display:"block", width:"100%", textAlign:"left", background:"none", border:"none", padding:"10px 14px", color:C.text, fontSize:14, fontWeight:600, cursor:"pointer", borderRadius:8 };
+
+  function newChat(){ setActiveId(null); setMessages([greeting]); setInput(""); setShowHistory(false); setEditingIndex(null); setErrorRetry(null); }
+
+  function openSession(session){ setActiveId(session.id); setMessages(session.messages); setShowHistory(false); setEditingIndex(null); setErrorRetry(null); }
+
+  function persist(history){
+    var sanitized = history.map(function(m){
+      if(m.attachment){ var copy={...m}; delete copy.attachment; return copy; }
+      return m;
+    });
+    var id = activeId || ("chat_"+Date.now());
+    var existing = chatSessions.find(function(s){return s.id===id;});
+    var firstUserMsg = sanitized.find(function(m){return m.role==="user";});
+    var title = (existing&&existing.title) || (firstUserMsg ? (firstUserMsg.text.length>40?firstUserMsg.text.slice(0,40)+"…":firstUserMsg.text) : "New chat");
+    onSaveSession({ id:id, title:title, messages:sanitized, updatedAt:Date.now(), pinned:existing?!!existing.pinned:false, archived:existing?!!existing.archived:false });
+    if(!activeId) setActiveId(id);
+  }
+
+  function togglePin(e, session){ e.stopPropagation(); onSaveSession({...session, pinned:!session.pinned}); }
+  function toggleArchive(e, session){ e.stopPropagation(); onSaveSession({...session, archived:!session.archived}); if(activeId===session.id) newChat(); }
+  function startRename(e, session){ e.stopPropagation(); setRenamingId(session.id); setRenameText(session.title||""); }
+  function saveRename(session){ onSaveSession({...session, title:renameText.trim()||"New chat"}); setRenamingId(null); }
+  function removeSession(e, id){ e.stopPropagation(); if(!window.confirm("Delete this conversation?")) return; onDeleteSession(id); if(activeId===id) newChat(); }
+
+  async function askGemini(history, isAutoOpener){
+    setStreaming(true); setStreamingText(""); setErrorRetry(null);
+    abortRef.current = new AbortController();
+    var contents = history.map(function(m){
+      var parts=[];
+      if(m.attachment) parts.push({inline_data:{mime_type:m.attachment.mimeType, data:m.attachment.base64}});
+      parts.push({text: m.apiText||m.text});
+      return { role: m.role==="ai"?"model":"user", parts: parts };
+    });
+    if(isAutoOpener){
+      contents.push({role:"user", parts:[{text:"Give a short, friendly opening — acknowledge what was shared and ask what they'd like help with."}]});
+    }
+    var sys = "You are SAM-X, a friendly, encouraging AI study assistant built into Jotting AI for a Nigerian university student"+(courseList.length?(" studying "+courseList.join(", ")):"")+". Give natural, structured answers — use headings and bullet points where helpful, explain concepts step-by-step, and ask a clarifying follow-up question when the request is ambiguous. Use Markdown formatting (headings, lists, tables, fenced code blocks, and $...$ or $$...$$ for math) where it helps clarity. Remember and use the whole conversation so far.";
+    var currentStreamed = "";
+    try{
+      var reply = await callGeminiChatStream(contents, sys, function(partial){ currentStreamed=partial; setStreamingText(partial); }, abortRef.current.signal, 1500);
+      var next = history.concat([{role:"ai", text:reply}]);
+      setMessages(next);
+      setStreamingText("");
+      persist(next);
+    }catch(e){
+      if(e && e.name==="AbortError"){
+        var next2 = currentStreamed ? history.concat([{role:"ai", text:currentStreamed}]) : history;
+        setMessages(next2);
+        setStreamingText("");
+        if(currentStreamed) persist(next2);
+      } else {
+        setErrorRetry({ history: history });
+      }
+    }
+    setStreaming(false);
+    abortRef.current = null;
+  }
+
+  function stopGenerating(){ abortRef.current && abortRef.current.abort(); }
+  function retry(){ if(errorRetry){ var h = errorRetry.history; setErrorRetry(null); askGemini(h, false); } }
+
+  async function send(){
+    var q = input.trim();
+    if(!q || streaming) return;
+    setInput("");
+    var updated = messages.concat([{role:"user", text:q}]);
+    setMessages(updated);
+    askGemini(updated, false);
+  }
+
+  function startEdit(i){ setEditingIndex(i); setEditText(messages[i].text); }
+  function saveEdit(){
+    if(!editText.trim()) return;
+    var truncated = messages.slice(0, editingIndex);
+    var updated = truncated.concat([{role:"user", text:editText.trim()}]);
+    setMessages(updated);
+    setEditingIndex(null);
+    askGemini(updated, false);
+  }
+
+  function regenerate(){
+    if(streaming || messages.length===0 || messages[messages.length-1].role!=="ai") return;
+    var truncated = messages.slice(0,-1);
+    setMessages(truncated);
+    askGemini(truncated, false);
+  }
+
+  function copyMessage(i, text){ navigator.clipboard && navigator.clipboard.writeText(text); setCopiedIndex(i); setTimeout(function(){setCopiedIndex(null);}, 1500); }
+
+  function blobToBase64(blob){
+    return new Promise(function(resolve,reject){
+      var reader = new FileReader();
+      reader.onloadend = function(){ resolve(reader.result.split(",")[1]); };
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  async function handleFileAttach(e){
+    var file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if(!file) return;
+    setShowAttachMenu(false);
+    try{
+      var msg;
+      if(file.type.startsWith("image/") || file.type==="application/pdf"){
+        var base64 = await blobToBase64(file);
+        msg = { role:"user", text:"📎 Attached: "+file.name, attachment:{mimeType:file.type, base64:base64}, apiText:"I've attached a file named \""+file.name+"\". Please read it and help me with it." };
+      } else if(file.name.toLowerCase().endsWith(".docx")){
+        var arrayBuffer = await file.arrayBuffer();
+        var result = await mammoth.extractRawText({arrayBuffer:arrayBuffer});
+        msg = { role:"user", text:"📎 Attached: "+file.name, apiText:"Here is the content of a Word document named \""+file.name+"\":\n\n"+result.value+"\n\nPlease help me with it." };
+      } else if(file.type==="text/plain" || file.name.toLowerCase().endsWith(".txt")){
+        var text = await file.text();
+        msg = { role:"user", text:"📎 Attached: "+file.name, apiText:"Here is the content of a file named \""+file.name+"\":\n\n"+text+"\n\nPlease help me with it." };
+      } else {
+        alert("That file type isn't supported yet. Try an image, PDF, TXT, or DOCX file.");
+        return;
+      }
+      var updated = messages.concat([msg]);
+      setMessages(updated);
+      askGemini(updated, true);
+    }catch(err){
+      alert("Couldn't read that file — try a different one.");
+    }
+  }
+
+  function openPicker(mode){ setPickerMode(mode); setShowPicker(true); setShowAttachMenu(false); }
+
+  function attachNote(note, mode){
     setShowPicker(false);
+    var prompts = {
+      discuss: "Please help me understand it — I'll ask questions about it.",
+      flashcards: "Please turn this into a set of flashcards (question on one line, answer on the next) covering the key concepts.",
+      studyplan: "Please suggest a study plan for reviewing this material, broken into manageable sessions.",
+      quiz: "Please quiz me on this — ask me one question at a time and check my answers as I respond."
+    };
     var attachMsg = {
       role:"user",
-      text:"📎 Attached note: \""+note.title+"\"",
-      apiText:"Here is my lecture note titled \""+note.title+"\" (course: "+note.course+"):\n\n"+note.content+"\n\nPlease help me understand it — I'll ask questions about it."
+      text:"📎 Attached note: \""+note.title+"\" ("+(mode==="flashcards"?"flashcards":mode==="studyplan"?"study plan":mode==="quiz"?"quiz me":"discuss")+")",
+      apiText:"Here is my lecture note titled \""+note.title+"\" (course: "+note.course+"):\n\n"+note.content+"\n\n"+(prompts[mode]||prompts.discuss)
     };
     var updated = messages.concat([attachMsg]);
     setMessages(updated);
     askGemini(updated, true);
   }
 
-  async function send(){
-    var q = input.trim();
-    if(!q) return;
-    setInput("");
-    var updated = messages.concat([{role:"user",text:q}]);
-    setMessages(updated);
-    askGemini(updated, false);
-  }
-
-  async function askGemini(history, isAutoOpener){
-    setLoading(true);
-    try{
-      var contents = history.map(function(m){ return { role: m.role==="ai"?"model":"user", parts:[{text: m.apiText||m.text}] }; });
-      if(isAutoOpener){
-        contents.push({ role:"user", parts:[{text:"Give a short, friendly opening — acknowledge the note and ask what they'd like help with (a summary, explaining a specific part, or quiz questions)."}] });
-      }
-      var reply = await callGeminiChat(contents, "You are a friendly, encouraging AI study assistant for a Nigerian university student. Be clear and concise. When a lecture note has been attached to the conversation, ground your answers in it.", 700);
-      setMessages(function(m){ return [...m,{role:"ai",text:reply}]; });
-    }catch(e){
-      setMessages(function(m){ return [...m,{role:"ai",text:"Couldn't reach Gemini — check your API key or connection and try again."}]; });
-    }
-    setLoading(false);
-  }
-
   var filteredNotes = notes.filter(function(n){ return n.title.toLowerCase().includes(pickerSearch.toLowerCase())||n.course.toLowerCase().includes(pickerSearch.toLowerCase()); });
 
+  function groupSessions(list){
+    var now = new Date();
+    var startToday = new Date(now.getFullYear(),now.getMonth(),now.getDate()).getTime();
+    var groups = { pinned:[], today:[], yesterday:[], last7:[], last30:[], older:[] };
+    list.forEach(function(s){
+      if(s.pinned){ groups.pinned.push(s); return; }
+      var d = new Date(s.updatedAt||0);
+      var startOfThat = new Date(d.getFullYear(),d.getMonth(),d.getDate()).getTime();
+      var diffDays = Math.round((startToday-startOfThat)/86400000);
+      if(diffDays<=0) groups.today.push(s);
+      else if(diffDays===1) groups.yesterday.push(s);
+      else if(diffDays<=7) groups.last7.push(s);
+      else if(diffDays<=30) groups.last30.push(s);
+      else groups.older.push(s);
+    });
+    return groups;
+  }
+
+  var visibleSessions = chatSessions.filter(function(s){
+    var matchesSearch = !historySearch || (s.title||"").toLowerCase().includes(historySearch.toLowerCase());
+    var matchesTab = historyTab==="archived" ? s.archived : !s.archived;
+    return matchesSearch && matchesTab;
+  });
+  var grouped = groupSessions(visibleSessions);
+  var GROUP_LABELS = [["pinned","📌 Pinned"],["today","Today"],["yesterday","Yesterday"],["last7","Previous 7 Days"],["last30","Previous 30 Days"],["older","Older"]];
+
   return(
-    <div style={{ flex:1,display:"flex",flexDirection:"column",background:C.bg,position:"relative" }}>
-      <div style={{ background:C.card,padding:"16px 20px",borderBottom:"1px solid "+C.border,display:"flex",justifyContent:"space-between",alignItems:"center" }}>
-        <div style={{ display:"flex",alignItems:"center",gap:10 }}><button onClick={onBack} style={backBtn}>←</button><div style={{ width:40,height:40,borderRadius:12,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20 }}>🤖</div><div><div style={{ fontWeight:800,fontSize:16,color:C.text }}>AI Assistant</div><div style={{ fontSize:11,color:C.green,fontWeight:600 }}>Gemini AI</div></div></div>
-        <button onClick={newChat} style={{ background:C.card2,border:"none",borderRadius:10,padding:"7px 12px",color:C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>🔄 New Chat</button>
+    <div style={{ flex:1, display:"flex", flexDirection:"column", background:C.bg, position:"relative" }}>
+      <style>{".samx-md p{margin:4px 0}.samx-md ul,.samx-md ol{padding-left:20px;margin:6px 0}.samx-md h1,.samx-md h2,.samx-md h3{margin:10px 0 6px;font-size:15px}.samx-md code{background:rgba(6,182,212,0.15);color:#06B6D4;padding:2px 6px;border-radius:5px;font-size:13px;font-family:monospace}.samx-md pre{background:#0A0F1E;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:12px;overflow-x:auto;margin:8px 0}.samx-md pre code{background:transparent;color:#E2E8F0;padding:0}.samx-md table{border-collapse:collapse;width:100%;font-size:13px;margin:8px 0}.samx-md th,.samx-md td{border:1px solid rgba(255,255,255,0.08);padding:6px 10px;text-align:left}.samx-md th{background:rgba(255,255,255,0.05)}.samx-md blockquote{border-left:3px solid #06B6D4;padding-left:10px;margin:8px 0;color:#94A3B8}"}</style>
+
+      <div style={{ background:C.card, padding:"16px 20px", borderBottom:"1px solid "+C.border, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          <button onClick={onBack} style={backBtn}>←</button>
+          <div style={{ width:40,height:40,borderRadius:12,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20 }}>🤖</div>
+          <div><div style={{ fontWeight:800,fontSize:16,color:C.text }}>SAM-X AI</div><div style={{ fontSize:11,color:C.green,fontWeight:600 }}>AI Study Assistant</div></div>
+        </div>
+        <div style={{ display:"flex", gap:8 }}>
+          <button onClick={function(){setShowHistory(true);}} title="Chat history" style={iconBtnStyle}>🕐</button>
+          <button onClick={newChat} title="New chat" style={iconBtnStyle}>✏️</button>
+        </div>
       </div>
-      <div style={{ flex:1,overflowY:"auto",padding:"16px 16px 8px" }}>
-        {messages.map(function(m,i){return<div key={i} style={{ display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start",marginBottom:12 }}>{m.role==="ai"&&<div style={{ width:32,height:32,borderRadius:10,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,marginRight:8,flexShrink:0,marginTop:2 }}>🤖</div>}<div style={{ maxWidth:"80%",background:m.role==="user"?"linear-gradient(135deg,#06B6D4,#A78BFA)":C.card2,borderRadius:m.role==="user"?"18px 18px 4px 18px":"18px 18px 18px 4px",padding:"12px 16px",border:m.role==="ai"?"1px solid "+C.border:"none" }}><p style={{ margin:0,fontSize:14,color:C.text,lineHeight:1.7,whiteSpace:"pre-wrap" }}>{m.text}</p></div></div>;})}
-        {loading&&<div style={{ display:"flex",gap:4,alignItems:"center",marginLeft:40 }}>{[0,1,2].map(function(i){return<div key={i} style={{ width:8,height:8,borderRadius:"50%",background:C.cyan,animation:"dot "+(0.5+i*0.15)+"s ease-in-out infinite alternate" }}/>;})}</div>}
+
+      <div style={{ flex:1, overflowY:"auto", padding:"16px 16px 8px" }}>
+        {messages.length===1 && !streaming && (
+          <div style={{ display:"flex", flexWrap:"wrap", gap:8, marginBottom:16 }}>
+            <button onClick={function(){openPicker("discuss");}} style={suggestionChip}>📚 Explain a note</button>
+            <button onClick={function(){openPicker("quiz");}} style={suggestionChip}>❓ Quiz me</button>
+            <button onClick={function(){openPicker("flashcards");}} style={suggestionChip}>🗂️ Make flashcards</button>
+            <button onClick={function(){openPicker("studyplan");}} style={suggestionChip}>🗓️ Study plan</button>
+          </div>
+        )}
+        {messages.map(function(m,i){
+          var isEditing = editingIndex===i;
+          return (
+            <div key={i} style={{ display:"flex", flexDirection:"column", alignItems:m.role==="user"?"flex-end":"flex-start", marginBottom:16, animation:"fadeIn 0.25s ease" }}>
+              <div style={{ display:"flex", justifyContent:m.role==="user"?"flex-end":"flex-start", width:"100%" }}>
+                {m.role==="ai" && <div style={{ width:32,height:32,borderRadius:10,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,marginRight:8,flexShrink:0,marginTop:2 }}>🤖</div>}
+                <div style={{ maxWidth:"82%" }}>
+                  {isEditing ? (
+                    <div style={{ background:C.card2, borderRadius:14, padding:10, border:"1px solid "+C.cyan }}>
+                      <textarea value={editText} onChange={function(e){setEditText(e.target.value);}} style={{ width:"100%", minHeight:60, background:"transparent", border:"none", color:C.text, fontSize:14, outline:"none", resize:"none", fontFamily:"inherit" }}/>
+                      <div style={{ display:"flex", gap:8, justifyContent:"flex-end", marginTop:6 }}>
+                        <button onClick={function(){setEditingIndex(null);}} style={{ background:"none", border:"1px solid "+C.border, borderRadius:8, padding:"6px 12px", color:C.muted, fontSize:12, cursor:"pointer" }}>Cancel</button>
+                        <button onClick={saveEdit} style={{ background:C.cyan, border:"none", borderRadius:8, padding:"6px 12px", color:"#0A0F1E", fontWeight:700, fontSize:12, cursor:"pointer" }}>Save & Resend</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{ background:m.role==="user"?"linear-gradient(135deg,#06B6D4,#A78BFA)":C.card2, borderRadius:m.role==="user"?"18px 18px 4px 18px":"18px 18px 18px 4px", padding:"12px 16px", border:m.role==="ai"?"1px solid "+C.border:"none" }}>
+                      {m.role==="ai"
+                        ? <div className="samx-md" style={{ fontSize:14, color:C.text, lineHeight:1.7 }}><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>{m.text}</ReactMarkdown></div>
+                        : <p style={{ margin:0, fontSize:14, color:"#fff", lineHeight:1.7, whiteSpace:"pre-wrap" }}>{m.text}</p>}
+                    </div>
+                  )}
+                </div>
+              </div>
+              {!isEditing && (
+                <div style={{ display:"flex", gap:12, marginTop:4, marginLeft:m.role==="ai"?40:0 }}>
+                  {m.role==="ai" && <button onClick={function(){copyMessage(i, m.text);}} style={msgActionBtn}>{copiedIndex===i?"✓ Copied":"📋 Copy"}</button>}
+                  {m.role==="user" && <button onClick={function(){startEdit(i);}} style={msgActionBtn}>✏️ Edit</button>}
+                  {m.role==="ai" && i===messages.length-1 && !streaming && <button onClick={regenerate} style={msgActionBtn}>🔄 Regenerate</button>}
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {streaming && (
+          <div style={{ display:"flex", marginBottom:16 }}>
+            <div style={{ width:32,height:32,borderRadius:10,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,marginRight:8,flexShrink:0,marginTop:2 }}>🤖</div>
+            <div style={{ maxWidth:"82%", background:C.card2, borderRadius:"18px 18px 18px 4px", padding:"12px 16px", border:"1px solid "+C.border }}>
+              {streamingText
+                ? <div className="samx-md" style={{ fontSize:14, color:C.text, lineHeight:1.7 }}><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>{streamingText}</ReactMarkdown></div>
+                : <div style={{ display:"flex", gap:4 }}>{[0,1,2].map(function(i){return <div key={i} style={{ width:8,height:8,borderRadius:"50%",background:C.cyan,animation:"dot "+(0.5+i*0.15)+"s ease-in-out infinite alternate" }}/>;})}</div>}
+            </div>
+          </div>
+        )}
+        {errorRetry && (
+          <div style={{ background:"rgba(248,113,113,0.1)", border:"1px solid rgba(248,113,113,0.3)", borderRadius:12, padding:14, marginBottom:16, display:"flex", justifyContent:"space-between", alignItems:"center", gap:10 }}>
+            <span style={{ fontSize:13, color:C.red }}>⚠️ Couldn't reach SAM-X. Check your connection.</span>
+            <button onClick={retry} style={{ background:C.red, border:"none", borderRadius:8, padding:"6px 14px", color:"#fff", fontWeight:700, fontSize:12, cursor:"pointer", flexShrink:0 }}>Retry</button>
+          </div>
+        )}
         <div ref={endRef}/>
       </div>
-      <div style={{ padding:"12px 16px 16px",background:C.card2,borderTop:"1px solid "+C.border,display:"flex",gap:8 }}>
-        <button onClick={function(){setShowPicker(true);}} title="Attach a note" style={{ width:48,height:48,borderRadius:14,background:C.card,border:"1px solid "+C.border,cursor:"pointer",fontSize:18,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>📎</button>
-        <input value={input} onChange={function(e){setInput(e.target.value);}} onKeyDown={function(e){if(e.key==="Enter")send();}} placeholder="Ask anything..." style={{ flex:1,padding:"12px 16px",borderRadius:14,border:"1px solid "+C.border,fontSize:14,background:C.bg,color:C.text,outline:"none",minWidth:0 }}/>
-        <button onClick={function(){send();}} style={{ width:48,height:48,borderRadius:14,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",border:"none",cursor:"pointer",fontSize:20,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>↑</button>
+
+      <div style={{ padding:"12px 16px 16px", background:C.card2, borderTop:"1px solid "+C.border, position:"relative" }}>
+        {streaming ? (
+          <button onClick={stopGenerating} style={{ width:"100%", background:"rgba(248,113,113,0.15)", color:C.red, border:"2px solid "+C.red+"40", borderRadius:14, padding:"13px", fontWeight:800, fontSize:14, cursor:"pointer" }}>⏹ Stop Generating</button>
+        ) : (
+          <div style={{ display:"flex", gap:8 }}>
+            <button onClick={function(){setShowAttachMenu(function(s){return !s;});}} title="Attach" style={{ width:48,height:48,borderRadius:14,background:C.card,border:"1px solid "+C.border,cursor:"pointer",fontSize:20,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,color:C.text }}>+</button>
+            <input value={input} onChange={function(e){setInput(e.target.value);}} onKeyDown={function(e){if(e.key==="Enter")send();}} placeholder="Ask anything..." style={{ flex:1,padding:"12px 16px",borderRadius:14,border:"1px solid "+C.border,fontSize:14,background:C.bg,color:C.text,outline:"none",minWidth:0 }}/>
+            <button onClick={send} style={{ width:48,height:48,borderRadius:14,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",border:"none",cursor:"pointer",fontSize:20,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>↑</button>
+          </div>
+        )}
+        {showAttachMenu && (
+          <div style={{ position:"absolute", bottom:76, left:16, background:C.card, border:"1px solid "+C.border, borderRadius:14, padding:8, boxShadow:"0 8px 24px rgba(0,0,0,0.4)", zIndex:25 }}>
+            <button onClick={function(){setShowAttachMenu(false); openPicker("discuss");}} style={attachMenuItem}>📝 Attach a note</button>
+            <button onClick={function(){fileInputRef.current&&fileInputRef.current.click();}} style={attachMenuItem}>📎 Attach a file</button>
+          </div>
+        )}
+        <input ref={fileInputRef} type="file" accept="image/*,.pdf,.txt,.docx" onChange={handleFileAttach} style={{display:"none"}}/>
       </div>
-      {showPicker&&(
-        <div style={{ position:"absolute",inset:0,background:"rgba(10,15,30,0.85)",display:"flex",flexDirection:"column",justifyContent:"flex-end",zIndex:20 }} onClick={function(){setShowPicker(false);}}>
-          <div style={{ background:C.card,borderRadius:"20px 20px 0 0",padding:20,maxHeight:"70vh",display:"flex",flexDirection:"column" }} onClick={function(e){e.stopPropagation();}}>
-            <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14 }}><span style={{ fontWeight:800,fontSize:16,color:C.text }}>Attach a note</span><button onClick={function(){setShowPicker(false);}} style={{ background:"none",border:"none",color:C.muted,fontSize:18,cursor:"pointer" }}>✕</button></div>
-            <input value={pickerSearch} onChange={function(e){setPickerSearch(e.target.value);}} placeholder="Search notes, courses..." style={{ width:"100%",padding:"11px 14px",borderRadius:12,border:"1px solid "+C.border,fontSize:13,background:C.bg,color:C.text,outline:"none",marginBottom:14,boxSizing:"border-box" }}/>
+
+      {showPicker && (
+        <div style={{ position:"absolute", inset:0, background:"rgba(10,15,30,0.85)", display:"flex", flexDirection:"column", justifyContent:"flex-end", zIndex:20 }} onClick={function(){setShowPicker(false);}}>
+          <div style={{ background:C.card, borderRadius:"20px 20px 0 0", padding:20, maxHeight:"70vh", display:"flex", flexDirection:"column" }} onClick={function(e){e.stopPropagation();}}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
+              <span style={{ fontWeight:800, fontSize:16, color:C.text }}>{pickerMode==="flashcards"?"Make flashcards from...":pickerMode==="studyplan"?"Study plan from...":pickerMode==="quiz"?"Quiz me on...":"Attach a note"}</span>
+              <button onClick={function(){setShowPicker(false);}} style={{ background:"none", border:"none", color:C.muted, fontSize:18, cursor:"pointer" }}>✕</button>
+            </div>
+            <input value={pickerSearch} onChange={function(e){setPickerSearch(e.target.value);}} placeholder="Search notes, courses..." style={{ width:"100%", padding:"11px 14px", borderRadius:12, border:"1px solid "+C.border, fontSize:13, background:C.bg, color:C.text, outline:"none", marginBottom:14, boxSizing:"border-box" }}/>
             <div style={{ overflowY:"auto" }}>
-              {filteredNotes.length===0&&<div style={{ textAlign:"center",color:C.muted,fontSize:13,padding:"20px 0" }}>No notes match.</div>}
-              {filteredNotes.map(function(n){return<button key={n.id} onClick={function(){attachNote(n);}} style={{ width:"100%",textAlign:"left",background:C.card2,border:"1px solid "+C.border,borderRadius:12,padding:"12px 14px",marginBottom:8,cursor:"pointer" }}>
-                <div style={{ fontWeight:700,fontSize:14,color:C.text,marginBottom:3 }}>{n.title}</div>
-                <div style={{ display:"flex",gap:8,alignItems:"center" }}><span style={{ fontSize:10,color:n.color,fontWeight:700,background:n.bg,borderRadius:99,padding:"2px 8px" }}>{n.course}</span><span style={{ fontSize:11,color:C.muted }}>{formatRelativeDate(n.id)}</span></div>
-              </button>;})}
+              {filteredNotes.length===0 && <div style={{ textAlign:"center", color:C.muted, fontSize:13, padding:"20px 0" }}>No notes match.</div>}
+              {filteredNotes.map(function(n){return(
+                <button key={n.id} onClick={function(){attachNote(n, pickerMode);}} style={{ width:"100%", textAlign:"left", background:C.card2, border:"1px solid "+C.border, borderRadius:12, padding:"12px 14px", marginBottom:8, cursor:"pointer" }}>
+                  <div style={{ fontWeight:700, fontSize:14, color:C.text, marginBottom:3 }}>{n.title}</div>
+                  <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                    <span style={{ fontSize:10, color:n.color, fontWeight:700, background:n.bg, borderRadius:99, padding:"2px 8px" }}>{n.course}</span>
+                    <span style={{ fontSize:11, color:C.muted }}>{formatRelativeDate(n.id)}</span>
+                  </div>
+                </button>
+              );})}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showHistory && (
+        <div style={{ position:"absolute", inset:0, background:"rgba(10,15,30,0.85)", display:"flex", flexDirection:"column", justifyContent:"flex-end", zIndex:20 }} onClick={function(){setShowHistory(false);}}>
+          <div style={{ background:C.card, borderRadius:"20px 20px 0 0", padding:20, maxHeight:"80vh", display:"flex", flexDirection:"column" }} onClick={function(e){e.stopPropagation();}}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
+              <span style={{ fontWeight:800, fontSize:16, color:C.text }}>Chat History</span>
+              <button onClick={function(){setShowHistory(false);}} style={{ background:"none", border:"none", color:C.muted, fontSize:18, cursor:"pointer" }}>✕</button>
+            </div>
+            <button onClick={newChat} style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:8, background:"linear-gradient(135deg,#06B6D4,#A78BFA)", border:"none", borderRadius:12, padding:"12px 16px", color:"#fff", fontWeight:700, fontSize:14, cursor:"pointer", marginBottom:12 }}>✏️ New Chat</button>
+            <input value={historySearch} onChange={function(e){setHistorySearch(e.target.value);}} placeholder="Search conversations..." style={{ width:"100%", padding:"10px 14px", borderRadius:12, border:"1px solid "+C.border, fontSize:13, background:C.bg, color:C.text, outline:"none", marginBottom:10, boxSizing:"border-box" }}/>
+            <div style={{ display:"flex", gap:8, marginBottom:14 }}>
+              <button onClick={function(){setHistoryTab("chats");}} style={{ flex:1, padding:"8px", borderRadius:10, border:"none", background:historyTab==="chats"?C.cyan:C.card2, color:historyTab==="chats"?"#0A0F1E":C.muted, fontWeight:700, fontSize:12, cursor:"pointer" }}>Chats</button>
+              <button onClick={function(){setHistoryTab("archived");}} style={{ flex:1, padding:"8px", borderRadius:10, border:"none", background:historyTab==="archived"?C.cyan:C.card2, color:historyTab==="archived"?"#0A0F1E":C.muted, fontWeight:700, fontSize:12, cursor:"pointer" }}>Archived</button>
+            </div>
+            <div style={{ overflowY:"auto" }}>
+              {visibleSessions.length===0 && <div style={{ textAlign:"center", color:C.muted, fontSize:13, padding:"20px 0" }}>{historyTab==="archived"?"No archived chats.":"No conversations yet."}</div>}
+              {GROUP_LABELS.map(function(g){
+                var list = grouped[g[0]];
+                if(!list || list.length===0) return null;
+                return (
+                  <div key={g[0]} style={{ marginBottom:14 }}>
+                    <div style={{ fontSize:11, fontWeight:700, color:C.muted, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>{g[1]}</div>
+                    {list.map(function(s){
+                      var lastMsg = s.messages && s.messages.length ? s.messages[s.messages.length-1] : null;
+                      var isRenaming = renamingId===s.id;
+                      return (
+                        <div key={s.id} onClick={function(){if(!isRenaming) openSession(s);}} style={{ background:activeId===s.id?C.cyan+"15":C.card2, border:"1px solid "+(activeId===s.id?C.cyan+"50":C.border), borderRadius:12, padding:"12px 14px", marginBottom:8, cursor:isRenaming?"default":"pointer" }}>
+                          {isRenaming ? (
+                            <div style={{ display:"flex", gap:8 }}>
+                              <input autoFocus value={renameText} onChange={function(e){setRenameText(e.target.value);}} onKeyDown={function(e){if(e.key==="Enter")saveRename(s);}} onClick={function(e){e.stopPropagation();}} style={{ flex:1, background:C.bg, border:"1px solid "+C.cyan, borderRadius:8, padding:"6px 10px", color:C.text, fontSize:13, outline:"none" }}/>
+                              <button onClick={function(e){e.stopPropagation();saveRename(s);}} style={{ background:C.cyan, border:"none", borderRadius:8, padding:"6px 12px", color:"#0A0F1E", fontWeight:700, fontSize:12, cursor:"pointer" }}>Save</button>
+                            </div>
+                          ) : (
+                            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:10 }}>
+                              <div style={{ minWidth:0, flex:1 }}>
+                                <div style={{ fontWeight:700, fontSize:14, color:C.text, marginBottom:3, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{s.title||"New chat"}</div>
+                                {lastMsg && <div style={{ fontSize:12, color:C.muted, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{lastMsg.text}</div>}
+                                <div style={{ fontSize:10, color:C.muted, marginTop:4 }}>{formatRelativeDate(s.updatedAt)}</div>
+                              </div>
+                              <div style={{ display:"flex", gap:6, flexShrink:0 }}>
+                                <span onClick={function(e){togglePin(e,s);}} style={{ fontSize:15, cursor:"pointer", opacity:s.pinned?1:0.4 }}>📌</span>
+                                <span onClick={function(e){startRename(e,s);}} style={{ fontSize:15, cursor:"pointer", opacity:0.6 }}>✏️</span>
+                                <span onClick={function(e){toggleArchive(e,s);}} style={{ fontSize:15, cursor:"pointer", opacity:0.6 }}>{s.archived?"📤":"🗄️"}</span>
+                                <span onClick={function(e){removeSession(e,s.id);}} style={{ fontSize:15, cursor:"pointer", color:C.red }}>🗑️</span>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>
@@ -934,7 +1299,6 @@ function AIScreen({ notes, onBack }) {
 function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings, setRecSettings }) {
   var [openSection,setOpenSection]=useState(null);
   var [lang,setLang]=useState("English");
-  var [aiModel,setAiModel]=useState("Gemini");
   var [aiStyle,setAiStyle]=useState("Academic");
   var [notifs,setNotifs]=useState({study:true,assignment:false,daily:true,recording:false});
   var [privacy,setPrivacy]=useState({fingerprint:false,face:false,pin:false,autoLock:true,hiddenFolder:false,encrypt:false});
@@ -970,7 +1334,7 @@ function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings
           <div style={{ marginTop:12 }}>
             <div style={{ background:C.card2,borderRadius:12,padding:"12px 16px",marginBottom:10,display:"flex",justifyContent:"space-between",alignItems:"center" }}><div><div style={{ fontWeight:700,fontSize:14,color:C.text }}>Current Plan</div><div style={{ fontSize:12,color:C.muted }}>Free - 5 recordings per month</div></div><span style={{ background:"rgba(6,182,212,0.15)",color:C.cyan,borderRadius:99,padding:"4px 14px",fontSize:12,fontWeight:700 }}>Free</span></div>
             <div style={{ background:"linear-gradient(135deg,#4F46E5,#7C3AED,#06B6D4)",borderRadius:16,padding:20,marginBottom:10 }}>
-              <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12 }}><div><div style={{ fontWeight:800,fontSize:18,color:"#fff" }}>Upgrade to Pro</div><div style={{ fontSize:12,color:"rgba(255,255,255,0.75)",marginTop:4,lineHeight:1.8 }}>Unlimited recordings and notes{"\n"}Real AI with Gemini{"\n"}Priority support</div></div><span style={{ fontSize:32 }}>🚀</span></div>
+              <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12 }}><div><div style={{ fontWeight:800,fontSize:18,color:"#fff" }}>Upgrade to Pro</div><div style={{ fontSize:12,color:"rgba(255,255,255,0.75)",marginTop:4,lineHeight:1.8 }}>Unlimited recordings and notes{"\n"}Real AI with SAM-X{"\n"}Priority support</div></div><span style={{ fontSize:32 }}>🚀</span></div>
               <div style={{ display:"flex",alignItems:"baseline",gap:4,marginBottom:14 }}><span style={{ fontSize:32,fontWeight:800,color:"#fff" }}>₦550</span><span style={{ fontSize:13,color:"rgba(255,255,255,0.6)" }}>/month</span></div>
               <button style={{ width:"100%",background:"#fff",color:"#4F46E5",border:"none",borderRadius:12,padding:"13px",fontWeight:800,fontSize:15,cursor:"pointer" }}>Get Pro Now →</button>
             </div>
@@ -1001,7 +1365,7 @@ function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings
 
         <Section id="ai" icon="🤖" title="AI Settings" color="#A78BFA">
           <div style={{ marginTop:12 }}>
-            <div style={{ marginBottom:14 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>AI MODEL</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{["Gemini","Claude","GPT-4"].map(function(m){return<button key={m} onClick={function(){setAiModel(m);}} style={{ padding:"8px 16px",borderRadius:10,border:"2px solid",borderColor:aiModel===m?C.purple:C.border,background:aiModel===m?C.purple:C.card,color:aiModel===m?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{m}</button>;})}</div></div>
+            <div style={{ marginBottom:14 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>AI ENGINE</div><div style={{ background:C.card2,borderRadius:12,padding:"12px 14px",display:"flex",alignItems:"center",gap:10 }}><span style={{ fontSize:20 }}>🤖</span><div><div style={{ fontWeight:700,fontSize:14,color:C.text }}>SAM-X AI</div><div style={{ fontSize:11,color:C.muted }}>Powers your Summary, Quiz, AI Write, Scan Doc, and Chat</div></div></div></div>
             <div style={{ marginBottom:14 }}><div style={{ fontSize:12,color:C.muted,marginBottom:8,fontWeight:600 }}>WRITING STYLE</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{["Academic","Simple","Detailed"].map(function(s){return<button key={s} onClick={function(){setAiStyle(s);}} style={{ padding:"8px 16px",borderRadius:10,border:"2px solid",borderColor:aiStyle===s?C.purple:C.border,background:aiStyle===s?C.purple:C.card,color:aiStyle===s?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{s}</button>;})}</div></div>
             <Row icon="🌐" label="AI Response Language" sub="English"/>
             <Row icon="📏" label="AI Summary Length" sub="Medium"/>
@@ -1048,6 +1412,7 @@ export default function App() {
   var [authLoading, setAuthLoading] = useState(true);
   var [showOnboarding, setShowOnboarding] = useState(false);
   var [notes, setNotes] = useState([]);
+  var [chatSessions, setChatSessions] = useState([]);
   var [cloudLoading, setCloudLoading] = useState(false);
   var [screen, setScreen] = useState("home");
   var [activeNote, setActiveNote] = useState(null);
@@ -1083,11 +1448,24 @@ export default function App() {
           });
           setCloudLoading(false);
         });
+        var cachedChats = loadChatsLocal(firebaseUser.uid);
+        if (cachedChats.length > 0) setChatSessions(cachedChats);
+        loadChatsFromCloud(firebaseUser.uid).then(function(cloudChats){
+          setChatSessions(function(prev){
+            var byId = {};
+            prev.concat(cloudChats).forEach(function(s){ byId[s.id] = s; });
+            var merged = Object.values(byId);
+            merged.sort(function(a,b){ return (b.updatedAt||0) - (a.updatedAt||0); });
+            persistChatsLocal(firebaseUser.uid, merged);
+            return merged;
+          });
+        });
         var isNew = !localStorage.getItem("jotting_seen_"+firebaseUser.uid);
         if (isNew) { setShowOnboarding(true); localStorage.setItem("jotting_seen_"+firebaseUser.uid,"1"); }
       } else {
         setUser(null);
         setNotes([]);
+        setChatSessions([]);
         setAuthLoading(false);
       }
     });
@@ -1128,6 +1506,26 @@ export default function App() {
       return updated;
     });
     if (screen==="detail") go(tab==="library"?"library":"home",tab);
+  }
+
+  function saveChatSession(session) {
+    setChatSessions(function(prev){
+      var exists = prev.some(function(s){ return s.id===session.id; });
+      var updated = exists ? prev.map(function(s){ return s.id===session.id ? session : s; }) : [session, ...prev];
+      updated.sort(function(a,b){ return (b.updatedAt||0) - (a.updatedAt||0); });
+      if (user) persistChatsLocal(user.uid, updated);
+      return updated;
+    });
+    if (user) saveChatToCloud(user.uid, session).catch(function(e){ console.error("Background chat save failed:", e); });
+  }
+
+  async function deleteChatSession(id) {
+    await deleteChatFromCloud(id);
+    setChatSessions(function(s){
+      var updated = s.filter(function(x){ return x.id!==id; });
+      if (user) persistChatsLocal(user.uid, updated);
+      return updated;
+    });
   }
 
   async function handleLogout() {
@@ -1195,7 +1593,7 @@ export default function App() {
           {screen==="draw"&&<DrawScreen onBack={function(){go("home","home");}}/>}
           {screen==="aiwrite"&&<AIWriteScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
           {screen==="scan"&&<ScanDocScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
-          {screen==="ai"&&<AIScreen notes={notes} onBack={function(){go("home","home");}}/>}
+          {screen==="ai"&&<AIScreen notes={notes} onBack={function(){go("home","home");}} chatSessions={chatSessions} onSaveSession={saveChatSession} onDeleteSession={deleteChatSession}/>}
           {screen==="settings"&&<SettingsScreen user={user} onLogout={handleLogout} recQuality={recQuality} setRecQuality={setRecQuality} recSettings={recSettings} setRecSettings={setRecSettings}/>}
         </div>
         <div style={{ background:C.card2,borderTop:"1px solid "+C.border,padding:"10px 10px 16px",display:"flex",justifyContent:"space-around",alignItems:"center",flexShrink:0 }}>
