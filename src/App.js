@@ -32,7 +32,7 @@ const C = {
   red: "#F87171", text: "#F1F5F9", muted: "#64748B", soft: "#94A3B8",
 };
 
-const GEMINI_KEY = "YOUR_GEMINI_KEY_HERE";
+const GEMINI_KEY = process.env.REACT_APP_GEMINI_KEY;
 const GEMINI_MODEL = "gemini-flash-latest";
 
 // Gemini's servers occasionally return 503 (temporarily overloaded) — this retries
