@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { initializeApp } from "firebase/app";
 import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, sendPasswordResetEmail, GoogleAuthProvider, signInWithPopup } from "firebase/auth";
-import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, setDoc, query, where } from "firebase/firestore";
+import { getFirestore, collection, addDoc, getDocs, getDoc, deleteDoc, doc, setDoc, query, where } from "firebase/firestore";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -32,8 +32,31 @@ const C = {
   red: "#F87171", text: "#F1F5F9", muted: "#64748B", soft: "#94A3B8",
 };
 
-const GEMINI_KEY = process.env.REACT_APP_GEMINI_KEY;
-const GEMINI_MODEL = "gemini-flash-latest";
+// ── Subscription plans & AI credit costs ───────────────────────────────────────
+// Adding a new plan later is just adding a new key here — nothing else needs to change.
+// IMPORTANT: netlify/functions/generate.js keeps its own matching copy of the credit
+// allocations (server-side enforcement can't trust anything sent from the browser),
+// so if you change numbers here, update that file too.
+const PLANS = {
+  free:    { id:"free",    name:"Free",    priceMonthly:0,   priceYearly:0,     monthlyCredits:60,   color:C.muted,  tagline:"Get started",          features:["Unlimited notes & Library","60 AI credits / month","Voice recording & transcription","AI Chat, Scan Doc & quizzes"] },
+  pro:     { id:"pro",     name:"Pro",     priceMonthly:550, priceYearly:5500,  monthlyCredits:400,  color:C.cyan,   tagline:"For regular studying",   features:["Everything in Free","400 AI credits / month","Faster, priority AI responses","More cloud storage","Priority support"] },
+  premium: { id:"premium", name:"Premium", priceMonthly:1500,priceYearly:15000, monthlyCredits:1500, color:C.purple, tagline:"For serious exam prep",  features:["Everything in Pro","1,500 AI credits / month","AI Study Planner","Exam Mode","Advanced AI Tutor","Advanced analytics & maximum storage"] },
+};
+const CREDIT_COSTS = { chat:1, summary:5, quiz:8, flashcards:8, pdf_analysis:20, transcribe:15 };
+const LOW_CREDIT_WARNING_THRESHOLD = 10;
+
+async function getIdToken(){
+  try{ return auth.currentUser ? await auth.currentUser.getIdToken() : null; }catch(e){ return null; }
+}
+
+// Thrown when the secure proxy reports the user is out of AI credits, so screens can
+// show the Upgrade page instead of a generic error message.
+function OutOfCreditsError(remaining){
+  var err = new Error("OUT_OF_CREDITS");
+  err.code = "OUT_OF_CREDITS";
+  err.remaining = remaining;
+  return err;
+}
 
 // Gemini's servers occasionally return 503 (temporarily overloaded) — this retries
 // a couple of times with a short growing delay before giving up for real.
@@ -46,79 +69,65 @@ async function fetchWithRetry(url, options, retries) {
   }
 }
 
-async function callGeminiText(promptText, maxTokens) {
-  var res = await fetchWithRetry(
-    "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":generateContent?key="+GEMINI_KEY,
-    { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ contents:[{role:"user",parts:[{text:promptText}]}], generationConfig:{maxOutputTokens:maxTokens||800} }) }
-  );
+// Every AI feature in the app calls this same secure endpoint instead of Gemini
+// directly — the real API key lives only on the server (netlify/functions/generate.js),
+// which also checks and deducts the student's AI credits before answering.
+async function callProxy(action, payload, onCreditsUpdate) {
+  var idToken = await getIdToken();
+  var res = await fetchWithRetry("/api/generate", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ idToken:idToken, action:action, ...payload })
+  });
   var data = await res.json();
+  if (res.status===402 || (data&&data.error==="OUT_OF_CREDITS")) throw OutOfCreditsError(data&&data.remaining);
+  if (!res.ok) throw new Error((data&&data.error)||"Something went wrong reaching SAM-X");
+  if (onCreditsUpdate && data && typeof data.creditsRemaining==="number") onCreditsUpdate(data.creditsRemaining);
   var text = data&&data.candidates&&data.candidates[0]&&data.candidates[0].content&&data.candidates[0].content.parts&&data.candidates[0].content.parts[0]&&data.candidates[0].content.parts[0].text;
-  if (!text) throw new Error((data&&data.error&&data.error.message)||"No response from Gemini");
+  if (!text) throw new Error("No response from SAM-X");
   return text;
+}
+
+async function callGeminiText(promptText, maxTokens, action) {
+  return await callProxy(action||"chat", { contents:[{role:"user",parts:[{text:promptText}]}], maxTokens:maxTokens||800 }, updateGlobalCredits);
 }
 
 // Full multi-turn chat: `contents` is the whole conversation so far (each turn
-// {role:"user"|"model", parts:[{text}]}), so Gemini actually remembers context
+// {role:"user"|"model", parts:[{text}]}), so SAM-X actually remembers context
 // across messages instead of treating every question in isolation.
-// Real word-by-word streaming (Gemini's SSE endpoint), with abort support for the
-// Stop button. onChunk receives the full text-so-far each time new tokens arrive.
-async function callGeminiChatStream(contents, systemInstruction, onChunk, signal, maxTokens) {
-  var body = { contents: contents, generationConfig: { maxOutputTokens: maxTokens||1200 } };
-  if (systemInstruction) body.systemInstruction = { parts:[{ text: systemInstruction }] };
-  var res = await fetch(
-    "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":streamGenerateContent?alt=sse&key="+GEMINI_KEY,
-    { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), signal:signal }
-  );
-  if (!res.ok || !res.body) throw new Error("Couldn't start streaming response from SAM-X");
-  var reader = res.body.getReader();
-  var decoder = new TextDecoder();
-  var buffer = "";
-  var full = "";
-  while (true) {
-    var chunk = await reader.read();
-    if (chunk.done) break;
-    buffer += decoder.decode(chunk.value, { stream:true });
-    var lines = buffer.split("\n");
-    buffer = lines.pop();
-    for (var i=0; i<lines.length; i++) {
-      var line = lines[i].trim();
-      if (!line.startsWith("data:")) continue;
-      var jsonStr = line.slice(5).trim();
-      if (!jsonStr || jsonStr==="[DONE]") continue;
-      try {
-        var obj = JSON.parse(jsonStr);
-        var textPart = obj&&obj.candidates&&obj.candidates[0]&&obj.candidates[0].content&&obj.candidates[0].content.parts&&obj.candidates[0].content.parts[0]&&obj.candidates[0].content.parts[0].text;
-        if (textPart) { full += textPart; onChunk(full); }
-      } catch(e) { /* ignore partial/incomplete JSON chunk, next read will complete it */ }
-    }
+// The real Gemini key can't be relayed as a raw token-stream through a standard
+// serverless function, so the proxy returns the complete answer in one shot and
+// this reveals it word-by-word client-side — same smooth feel, secure underneath.
+async function callGeminiChatStream(contents, systemInstruction, onChunk, signal, maxTokens, action) {
+  var text = await callProxy(action||"chat", { contents:contents, systemInstruction:systemInstruction, maxTokens:maxTokens||1200 }, updateGlobalCredits);
+  var words = text.split(" ");
+  var acc = "";
+  for (var i=0;i<words.length;i++){
+    if (signal && signal.aborted) { var abortErr=new Error("Aborted"); abortErr.name="AbortError"; throw abortErr; }
+    acc += (i===0?"":" ") + words[i];
+    onChunk(acc);
+    await new Promise(function(r){ setTimeout(r, 16); });
   }
-  if (!full) throw new Error("No response from SAM-X");
-  return full;
+  return acc;
 }
 
-async function callGeminiVision(base64, mediaType, promptText, maxTokens) {
-  var res = await fetchWithRetry(
-    "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":generateContent?key="+GEMINI_KEY,
-    { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ contents:[{role:"user",parts:[{inline_data:{mime_type:mediaType,data:base64}},{text:promptText}]}], generationConfig:{maxOutputTokens:maxTokens||1200} }) }
-  );
-  var data = await res.json();
-  var text = data&&data.candidates&&data.candidates[0]&&data.candidates[0].content&&data.candidates[0].content.parts&&data.candidates[0].content.parts[0]&&data.candidates[0].content.parts[0].text;
-  if (!text) throw new Error((data&&data.error&&data.error.message)||"No response from Gemini");
-  return text;
+async function callGeminiVision(base64, mediaType, promptText, maxTokens, action) {
+  return await callProxy(action||"pdf_analysis", { contents:[{role:"user",parts:[{inline_data:{mime_type:mediaType,data:base64}},{text:promptText}]}], maxTokens:maxTokens||1200 }, updateGlobalCredits);
 }
 
-// Gemini can listen to real recorded audio directly and produce text from it —
+// SAM-X can listen to real recorded audio directly and produce text from it —
 // this powers the record-then-transcribe flow (full transcript / smart notes / summary).
-async function callGeminiAudio(base64, mediaType, promptText, maxTokens) {
-  var res = await fetchWithRetry(
-    "https://generativelanguage.googleapis.com/v1beta/models/"+GEMINI_MODEL+":generateContent?key="+GEMINI_KEY,
-    { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ contents:[{role:"user",parts:[{inline_data:{mime_type:mediaType,data:base64}},{text:promptText}]}], generationConfig:{maxOutputTokens:maxTokens||2000} }) }
-  );
-  var data = await res.json();
-  var text = data&&data.candidates&&data.candidates[0]&&data.candidates[0].content&&data.candidates[0].content.parts&&data.candidates[0].content.parts[0]&&data.candidates[0].content.parts[0].text;
-  if (!text) throw new Error((data&&data.error&&data.error.message)||"No response from Gemini");
-  return text;
+async function callGeminiAudio(base64, mediaType, promptText, maxTokens, action) {
+  return await callProxy(action||"transcribe", { contents:[{role:"user",parts:[{inline_data:{mime_type:mediaType,data:base64}},{text:promptText}]}], maxTokens:maxTokens||2000 }, updateGlobalCredits);
 }
+
+// A tiny global hook so any of the helpers above can push a fresh credit balance up
+// to the App component after a successful call, without threading props through
+// every single screen. Set once, in the App component, right after login.
+var updateGlobalCredits = function(){};
+// Same pattern: lets any screen jump straight to the upgrade page the moment a
+// student runs out of credits, instead of every screen needing its own navigation logic.
+var triggerUpgradeScreen = function(){};
 
 // ── Firestore helpers ─────────────────────────────────────────────────────────
 async function saveNoteToCloud(userId, note) {
@@ -204,6 +213,21 @@ function loadChatsLocal(userId) {
 function persistChatsLocal(userId, sessions) {
   try { localStorage.setItem("jotting_chats_"+userId, JSON.stringify(sessions)); } catch(e){}
 }
+
+// ── Subscription account (plan + AI credits) ───────────────────────────────────
+// Read-only by design: the client is never allowed to create or modify its own
+// plan/credits document. The server (netlify/functions/generate.js, using the
+// Firebase Admin SDK) is the only thing that creates this doc and changes credits —
+// otherwise a technical user could just write themselves unlimited credits directly.
+async function loadOrInitAccount(userId) {
+  try {
+    var ref = doc(db, "accounts", userId);
+    var snap = await getDoc(ref);
+    if (snap.exists()) return snap.data();
+    return { plan:"free", credits:PLANS.free.monthlyCredits, creditsMonthKey:currentMonthKey() };
+  } catch(e) { console.error("Account load error:", e); return { plan:"free", credits:PLANS.free.monthlyCredits, creditsMonthKey:currentMonthKey() }; }
+}
+function currentMonthKey(){ var d=new Date(); return d.getFullYear()+"-"+d.getMonth(); }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function Wave({ active, color, size }) {
@@ -552,10 +576,12 @@ function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings }) {
       var base64 = await blobToBase64(audioBlobRef.current);
       var mediaType = mimeTypeRef.current.split(";")[0];
       var jobs=[];
-      if(wantFull) jobs.push(["full", callGeminiAudio(base64, mediaType, "Transcribe this lecture recording verbatim, word for word, as accurately as you can. Add natural paragraph breaks where the speaker's train of thought shifts. Return only the transcript, no preamble.", 3000)]);
-      if(wantSmart) jobs.push(["smart", callGeminiAudio(base64, mediaType, "Listen to this lecture recording and turn it into clean, well-organized study notes — headers and bullet points, only the important points, skip filler and repetition. Return only the notes, no preamble.", 2000)]);
-      if(wantSummary) jobs.push(["summary", callGeminiAudio(base64, mediaType, "Listen to this lecture recording and write a concise one-page revision summary covering only the core ideas and key takeaways a student needs to remember. Return only the summary, no preamble.", 900)]);
+      if(wantFull) jobs.push(["full", callGeminiAudio(base64, mediaType, "Transcribe this lecture recording verbatim, word for word, as accurately as you can. Add natural paragraph breaks where the speaker's train of thought shifts. Return only the transcript, no preamble.", 3000, "transcribe")]);
+      if(wantSmart) jobs.push(["smart", callGeminiAudio(base64, mediaType, "Listen to this lecture recording and turn it into clean, well-organized study notes — headers and bullet points, only the important points, skip filler and repetition. Return only the notes, no preamble.", 2000, "transcribe")]);
+      if(wantSummary) jobs.push(["summary", callGeminiAudio(base64, mediaType, "Listen to this lecture recording and write a concise one-page revision summary covering only the core ideas and key takeaways a student needs to remember. Return only the summary, no preamble.", 900, "transcribe")]);
       var results = await Promise.allSettled(jobs.map(function(j){return j[1];}));
+      var outOfCredits = results.some(function(r){ return r.status==="rejected" && r.reason && r.reason.code==="OUT_OF_CREDITS"; });
+      if (outOfCredits) { triggerUpgradeScreen(); setPhase("stopped"); return; }
       var next = {full:"",smart:"",summary:""};
       var firstKey=null;
       results.forEach(function(r,i){
@@ -657,7 +683,7 @@ function ScanDocScreen({ onBack, onSave }) {
   var fileRef=useRef(null);
   var courses=["General","PHY 101","MTH 101","COS 102","ENG 201","CHM 102"];
   function handleFile(file){if(!file)return;var reader=new FileReader();reader.onload=function(e){setImage(e.target.result);setExtracted("");setStatus("Image ready! Tap Extract Text.");};reader.readAsDataURL(file);}
-  async function extractText(){if(!image)return;setExtracting(true);setStatus("Reading text from image using AI...");try{var base64=image.split(",")[1];var mimeType=image.split(";")[0].split(":")[1];var text=await callGeminiVision(base64,mimeType,"Extract all text from this image. Format it as clean study notes with proper headings and bullet points. Return ONLY the extracted text.",1500);setExtracted(text);setStatus("Text extracted successfully!");}catch(e){setStatus("Error: "+e.message);setExtracted("Add your Gemini API key to extract text!");}setExtracting(false);}
+  async function extractText(){if(!image)return;setExtracting(true);setStatus("Reading text from image using AI...");try{var base64=image.split(",")[1];var mimeType=image.split(";")[0].split(":")[1];var text=await callGeminiVision(base64,mimeType,"Extract all text from this image. Format it as clean study notes with proper headings and bullet points. Return ONLY the extracted text.",1500,"pdf_analysis");setExtracted(text);setStatus("Text extracted successfully!");}catch(e){if(e.code==="OUT_OF_CREDITS"){triggerUpgradeScreen();setStatus("");}else{setStatus("Error: "+e.message);}}setExtracting(false);}
   function saveNote(){if(!extracted.trim()){alert("Extract text first!");return;}onSave({id:Date.now(),title:title||("Scanned Note - "+new Date().toLocaleDateString()),course,color:"#F59E0B",bg:"rgba(245,158,11,0.12)",tag:"Lecture",words:extracted.split(" ").length,preview:extracted.slice(0,100),content:extracted});}
   return(
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
@@ -722,7 +748,7 @@ function AIWriteScreen({ onBack, onSave }) {
   var [prompt,setPrompt]=useState("");var [result,setResult]=useState("");var [loading,setLoading]=useState(false);var [course,setCourse]=useState("General");
   var courses=["General","PHY 101","MTH 101","COS 102","ENG 201","CHM 102"];
   var suggestions=["Summarize Newton laws of motion","Write notes on Data Structures","Explain Organic Chemistry basics","Create outline for Kinematics"];
-  async function generate(text){var q=text||prompt;if(!q.trim())return;setLoading(true);setResult("");try{var res=await callGeminiText("Write clear structured student notes with bullet points and headers for: "+q,800);setResult(res);}catch(e){setResult("Notes on: "+q+"\n\nAdd Gemini API key for real AI notes!");}setLoading(false);}
+  async function generate(text){var q=text||prompt;if(!q.trim())return;setLoading(true);setResult("");try{var res=await callGeminiText("Write clear structured student notes with bullet points and headers for: "+q,800,"chat");setResult(res);}catch(e){if(e.code==="OUT_OF_CREDITS"){triggerUpgradeScreen();}else{setResult("Couldn't reach SAM-X — check your connection and try again.");}}setLoading(false);}
   return(
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
       <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
@@ -744,8 +770,8 @@ function AIWriteScreen({ onBack, onSave }) {
 // ── NOTE DETAIL ───────────────────────────────────────────────────────────────
 function NoteDetail({ note, onBack, onDelete }) {
   var [view,setView]=useState("note");var [summary,setSummary]=useState(null);var [quiz,setQuiz]=useState([]);var [quizIdx,setQuizIdx]=useState(0);var [selected,setSelected]=useState(null);var [score,setScore]=useState(0);var [quizDone,setQuizDone]=useState(false);var [loading,setLoading]=useState(false);
-  async function generateSummary(){setLoading(true);setView("summary");try{var raw=await callGeminiText("Summarize these notes. Return ONLY JSON: {\"summary\":\"...\",\"keyPoints\":[\"...\"],\"tags\":[\"...\"]} NOTES: "+note.content,800);setSummary(JSON.parse(raw.split("```json").join("").split("```").join("").trim()));}catch(e){setSummary({summary:"This covers "+note.title+".",keyPoints:["Review definitions","Practice problems"],tags:[note.course,note.tag]});}setLoading(false);}
-  async function generateQuiz(){setLoading(true);setView("quiz");try{var raw=await callGeminiText("Create 5 MCQ from these notes. Return ONLY JSON array: [{\"question\":\"...\",\"options\":[\"A\",\"B\",\"C\",\"D\"],\"answer\":0}] NOTES: "+note.content,800);var q=JSON.parse(raw.split("```json").join("").split("```").join("").trim());setQuiz(q);setQuizIdx(0);setSelected(null);setScore(0);setQuizDone(false);}catch(e){setQuiz([{question:"What is the main topic?",options:[note.course,"History","Math","Art"],answer:0}]);}setLoading(false);}
+  async function generateSummary(){setLoading(true);setView("summary");try{var raw=await callGeminiText("Summarize these notes. Return ONLY JSON: {\"summary\":\"...\",\"keyPoints\":[\"...\"],\"tags\":[\"...\"]} NOTES: "+note.content,800,"summary");setSummary(JSON.parse(raw.split("```json").join("").split("```").join("").trim()));}catch(e){if(e.code==="OUT_OF_CREDITS"){triggerUpgradeScreen();}else{setSummary({summary:"This covers "+note.title+".",keyPoints:["Review definitions","Practice problems"],tags:[note.course,note.tag]});}}setLoading(false);}
+  async function generateQuiz(){setLoading(true);setView("quiz");try{var raw=await callGeminiText("Create 5 MCQ from these notes. Return ONLY JSON array: [{\"question\":\"...\",\"options\":[\"A\",\"B\",\"C\",\"D\"],\"answer\":0}] NOTES: "+note.content,800,"quiz");var q=JSON.parse(raw.split("```json").join("").split("```").join("").trim());setQuiz(q);setQuizIdx(0);setSelected(null);setScore(0);setQuizDone(false);}catch(e){if(e.code==="OUT_OF_CREDITS"){triggerUpgradeScreen();}else{setQuiz([{question:"What is the main topic?",options:[note.course,"History","Math","Art"],answer:0}]);}}setLoading(false);}
   function pick(i){if(selected!==null)return;setSelected(i);if(i===quiz[quizIdx].answer)setScore(function(s){return s+1;});setTimeout(function(){if(quizIdx+1<quiz.length){setQuizIdx(function(q){return q+1;});setSelected(null);}else setQuizDone(true);},900);}
   return(
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
@@ -805,7 +831,7 @@ function LibraryScreen({ notes, onNote, onDelete }) {
 }
 
 // ── DASHBOARD ─────────────────────────────────────────────────────────────────
-function DashboardScreen({ notes, user }) {
+function DashboardScreen({ notes, user, credits, plan }) {
   var totalWords=notes.reduce(function(sum,n){return sum+(n.words||n.content.split(" ").length);},0);
   var totalNotes=notes.length;
   var todayNotes=notes.filter(function(n){return formatRelativeDate(n.id)==="Just now"||/m ago$/.test(formatRelativeDate(n.id))||formatRelativeDate(n.id)==="Today";}).length;
@@ -834,7 +860,7 @@ function DashboardScreen({ notes, user }) {
           <div style={{ fontSize:64 }}>🔥</div>
         </div>
         <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:16 }}>
-          {[["📝",totalNotes,"Total Notes",C.cyan],["💬",totalWords,"Total Words",C.purple],["📅",todayNotes,"Notes Today",C.green],["⭐","4.8","Avg Rating",C.amber]].map(function(item){return<div key={item[2]} style={{ background:C.card,borderRadius:16,padding:"16px",border:"1px solid "+C.border }}><div style={{ fontSize:24,marginBottom:8 }}>{item[0]}</div><div style={{ fontSize:28,fontWeight:800,color:item[3] }}>{item[1]}</div><div style={{ fontSize:12,color:C.muted,fontWeight:600,marginTop:2 }}>{item[2]}</div></div>;}) }
+          {[["📝",totalNotes,"Total Notes",C.cyan],["💬",totalWords,"Total Words",C.purple],["📅",todayNotes,"Notes Today",C.green],["⚡",credits,"AI Credits Left",credits<=LOW_CREDIT_WARNING_THRESHOLD?C.red:C.amber]].map(function(item){return<div key={item[2]} style={{ background:C.card,borderRadius:16,padding:"16px",border:"1px solid "+C.border }}><div style={{ fontSize:24,marginBottom:8 }}>{item[0]}</div><div style={{ fontSize:28,fontWeight:800,color:item[3] }}>{item[1]}</div><div style={{ fontSize:12,color:C.muted,fontWeight:600,marginTop:2 }}>{item[2]}</div></div>;}) }
         </div>
         <div style={{ background:C.card,borderRadius:18,padding:"20px",marginBottom:16,border:"1px solid "+C.border }}>
           <div style={{ fontWeight:800,fontSize:15,color:C.text,marginBottom:16 }}>Weekly Activity 📈</div>
@@ -930,6 +956,7 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession 
   var endRef = useRef(null);
   var abortRef = useRef(null);
   var fileInputRef = useRef(null);
+  var inputRef = useRef(null);
 
   useEffect(function(){ endRef.current && endRef.current.scrollIntoView({behavior:"smooth"}); }, [messages, streamingText]);
 
@@ -963,7 +990,7 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession 
   function saveRename(session){ onSaveSession({...session, title:renameText.trim()||"New chat"}); setRenamingId(null); }
   function removeSession(e, id){ e.stopPropagation(); if(!window.confirm("Delete this conversation?")) return; onDeleteSession(id); if(activeId===id) newChat(); }
 
-  async function askGemini(history, isAutoOpener){
+  async function askGemini(history, isAutoOpener, action){
     setStreaming(true); setStreamingText(""); setErrorRetry(null);
     abortRef.current = new AbortController();
     var contents = history.map(function(m){
@@ -978,7 +1005,7 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession 
     var sys = "You are SAM-X, a friendly, encouraging AI study assistant built into Jotting AI for a Nigerian university student"+(courseList.length?(" studying "+courseList.join(", ")):"")+". Give natural, structured answers — use headings and bullet points where helpful, explain concepts step-by-step, and ask a clarifying follow-up question when the request is ambiguous. Use Markdown formatting (headings, lists, tables, fenced code blocks, and $...$ or $$...$$ for math) where it helps clarity. Remember and use the whole conversation so far.";
     var currentStreamed = "";
     try{
-      var reply = await callGeminiChatStream(contents, sys, function(partial){ currentStreamed=partial; setStreamingText(partial); }, abortRef.current.signal, 1500);
+      var reply = await callGeminiChatStream(contents, sys, function(partial){ currentStreamed=partial; setStreamingText(partial); }, abortRef.current.signal, 1500, action||"chat");
       var next = history.concat([{role:"ai", text:reply}]);
       setMessages(next);
       setStreamingText("");
@@ -989,6 +1016,9 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession 
         setMessages(next2);
         setStreamingText("");
         if(currentStreamed) persist(next2);
+      } else if(e && e.code==="OUT_OF_CREDITS"){
+        setStreamingText("");
+        triggerUpgradeScreen();
       } else {
         setErrorRetry({ history: history });
       }
@@ -1004,9 +1034,17 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession 
     var q = input.trim();
     if(!q || streaming) return;
     setInput("");
+    if(inputRef.current) inputRef.current.style.height = "auto";
     var updated = messages.concat([{role:"user", text:q}]);
     setMessages(updated);
     askGemini(updated, false);
+  }
+
+  function autoResizeInput(e){
+    setInput(e.target.value);
+    var el = e.target;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 120) + "px";
   }
 
   function startEdit(i){ setEditingIndex(i); setEditText(messages[i].text); }
@@ -1060,7 +1098,7 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession 
       }
       var updated = messages.concat([msg]);
       setMessages(updated);
-      askGemini(updated, true);
+      askGemini(updated, true, msg.attachment ? "pdf_analysis" : "chat");
     }catch(err){
       alert("Couldn't read that file — try a different one.");
     }
@@ -1076,6 +1114,7 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession 
       studyplan: "Please suggest a study plan for reviewing this material, broken into manageable sessions.",
       quiz: "Please quiz me on this — ask me one question at a time and check my answers as I respond."
     };
+    var actionByMode = { discuss:"chat", flashcards:"flashcards", studyplan:"summary", quiz:"quiz" };
     var attachMsg = {
       role:"user",
       text:"📎 Attached note: \""+note.title+"\" ("+(mode==="flashcards"?"flashcards":mode==="studyplan"?"study plan":mode==="quiz"?"quiz me":"discuss")+")",
@@ -1083,7 +1122,7 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession 
     };
     var updated = messages.concat([attachMsg]);
     setMessages(updated);
-    askGemini(updated, true);
+    askGemini(updated, true, actionByMode[mode]||"chat");
   }
 
   var filteredNotes = notes.filter(function(n){ return n.title.toLowerCase().includes(pickerSearch.toLowerCase())||n.course.toLowerCase().includes(pickerSearch.toLowerCase()); });
@@ -1196,9 +1235,9 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession 
         {streaming ? (
           <button onClick={stopGenerating} style={{ width:"100%", background:"rgba(248,113,113,0.15)", color:C.red, border:"2px solid "+C.red+"40", borderRadius:14, padding:"13px", fontWeight:800, fontSize:14, cursor:"pointer" }}>⏹ Stop Generating</button>
         ) : (
-          <div style={{ display:"flex", gap:8 }}>
+          <div style={{ display:"flex", gap:8, alignItems:"flex-end" }}>
             <button onClick={function(){setShowAttachMenu(function(s){return !s;});}} title="Attach" style={{ width:48,height:48,borderRadius:14,background:C.card,border:"1px solid "+C.border,cursor:"pointer",fontSize:20,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,color:C.text }}>+</button>
-            <input value={input} onChange={function(e){setInput(e.target.value);}} onKeyDown={function(e){if(e.key==="Enter")send();}} placeholder="Ask anything..." style={{ flex:1,padding:"12px 16px",borderRadius:14,border:"1px solid "+C.border,fontSize:14,background:C.bg,color:C.text,outline:"none",minWidth:0 }}/>
+            <textarea ref={inputRef} value={input} onChange={autoResizeInput} onKeyDown={function(e){if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }}} placeholder="Ask anything..." rows={1} style={{ flex:1,padding:"12px 16px",borderRadius:18,border:"1px solid "+C.border,fontSize:14,background:C.bg,color:C.text,outline:"none",minWidth:0,resize:"none",overflowY:"auto",maxHeight:120,lineHeight:1.5,fontFamily:"inherit" }}/>
             <button onClick={send} style={{ width:48,height:48,borderRadius:14,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",border:"none",cursor:"pointer",fontSize:20,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>↑</button>
           </div>
         )}
@@ -1295,8 +1334,99 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession 
   );
 }
 
+// ── PRICING / UPGRADE ─────────────────────────────────────────────────────────
+function PricingScreen({ onBack, plan, credits }) {
+  var [cycle, setCycle] = useState("monthly");
+  var planOrder = ["free","pro","premium"];
+
+  function priceFor(p){ return cycle==="monthly" ? p.priceMonthly : p.priceYearly; }
+  function periodLabel(){ return cycle==="monthly" ? "/month" : "/year"; }
+
+  return (
+    <div style={{ flex:1, background:C.bg, display:"flex", flexDirection:"column" }}>
+      <style>{"@keyframes floatUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}"}</style>
+      <div style={{ background:C.card, padding:"16px 20px", display:"flex", alignItems:"center", gap:12, borderBottom:"1px solid "+C.border }}>
+        <button onClick={onBack} style={backBtn}>←</button>
+        <span style={{ fontWeight:800, fontSize:16, color:C.text }}>Plans & Pricing</span>
+      </div>
+      <div style={{ flex:1, overflowY:"auto", padding:20 }}>
+        {credits <= LOW_CREDIT_WARNING_THRESHOLD && (
+          <div style={{ background:"rgba(245,158,11,0.1)", border:"1px solid rgba(245,158,11,0.3)", borderRadius:14, padding:16, marginBottom:20, textAlign:"center" }}>
+            <div style={{ fontSize:28, marginBottom:6 }}>⚡</div>
+            <div style={{ fontWeight:800, fontSize:15, color:C.amber, marginBottom:4 }}>{credits<=0 ? "You're out of AI credits" : "Running low on AI credits"}</div>
+            <div style={{ fontSize:12, color:C.muted }}>You have {credits} credit{credits===1?"":"s"} left on the {(PLANS[plan]||PLANS.free).name} plan. Upgrade below for a lot more room.</div>
+          </div>
+        )}
+        <div style={{ textAlign:"center", marginBottom:20 }}>
+          <div style={{ fontWeight:800, fontSize:22, color:C.text, marginBottom:6 }}>Choose your plan</div>
+          <div style={{ fontSize:13, color:C.muted }}>Cancel anytime. Prices in Naira.</div>
+        </div>
+        <div style={{ display:"flex", justifyContent:"center", marginBottom:24 }}>
+          <div style={{ display:"flex", background:C.card2, borderRadius:99, padding:4, gap:4 }}>
+            <button onClick={function(){setCycle("monthly");}} style={{ padding:"8px 18px", borderRadius:99, border:"none", background:cycle==="monthly"?C.cyan:"transparent", color:cycle==="monthly"?"#0A0F1E":C.muted, fontWeight:700, fontSize:13, cursor:"pointer" }}>Monthly</button>
+            <button onClick={function(){setCycle("yearly");}} style={{ padding:"8px 18px", borderRadius:99, border:"none", background:cycle==="yearly"?C.cyan:"transparent", color:cycle==="yearly"?"#0A0F1E":C.muted, fontWeight:700, fontSize:13, cursor:"pointer", display:"flex", alignItems:"center", gap:6 }}>Yearly <span style={{ fontSize:10, background:C.green, color:"#0A0F1E", borderRadius:99, padding:"2px 6px", fontWeight:800 }}>save 17%</span></button>
+          </div>
+        </div>
+
+        {planOrder.map(function(key, idx){
+          var p = PLANS[key];
+          var isCurrent = plan===key;
+          return (
+            <div key={key} style={{ animation:"floatUp 0.35s ease "+(idx*0.08)+"s both", background:C.card, border:"2px solid "+(isCurrent?p.color:C.border), borderRadius:20, padding:20, marginBottom:16, position:"relative", overflow:"hidden" }}>
+              {key==="pro" && <div style={{ position:"absolute", top:0, right:0, background:p.color, color:"#0A0F1E", fontSize:10, fontWeight:800, padding:"4px 14px", borderBottomLeftRadius:10 }}>MOST POPULAR</div>}
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:10 }}>
+                <div>
+                  <div style={{ fontWeight:800, fontSize:18, color:p.color }}>{p.name}</div>
+                  <div style={{ fontSize:12, color:C.muted }}>{p.tagline}</div>
+                </div>
+                {isCurrent && <span style={{ fontSize:10, fontWeight:800, color:C.green, background:"rgba(52,211,153,0.15)", borderRadius:99, padding:"4px 10px" }}>CURRENT PLAN</span>}
+              </div>
+              <div style={{ display:"flex", alignItems:"baseline", gap:6, marginBottom:16 }}>
+                <span style={{ fontSize:30, fontWeight:800, color:C.text }}>{priceFor(p)===0?"Free":"₦"+priceFor(p).toLocaleString()}</span>
+                {priceFor(p)>0 && <span style={{ fontSize:13, color:C.muted }}>{periodLabel()}</span>}
+              </div>
+              <div style={{ marginBottom:18 }}>
+                {p.features.map(function(f,i){return <div key={i} style={{ display:"flex", gap:8, alignItems:"flex-start", marginBottom:8 }}><span style={{ color:p.color, fontSize:14 }}>✓</span><span style={{ fontSize:13, color:C.soft, lineHeight:1.5 }}>{f}</span></div>;})}
+              </div>
+              <button disabled={isCurrent} onClick={function(){alert("Real payment isn't wired up yet — this is where Paystack checkout will go next.");}} style={{ width:"100%", padding:"13px", borderRadius:14, border:"none", background:isCurrent?C.card2:("linear-gradient(135deg,"+p.color+",#A78BFA)"), color:isCurrent?C.muted:"#0A0F1E", fontWeight:800, fontSize:14, cursor:isCurrent?"default":"pointer" }}>{isCurrent?"Your Current Plan":(key==="free"?"Downgrade to Free":"Upgrade to "+p.name)}</button>
+            </div>
+          );
+        })}
+
+        <div style={{ marginTop:8, marginBottom:20 }}>
+          <div style={{ fontWeight:800, fontSize:15, color:C.text, marginBottom:12, textAlign:"center" }}>Compare features</div>
+          <div style={{ background:C.card, borderRadius:16, border:"1px solid "+C.border, overflow:"hidden" }}>
+            <div style={{ display:"grid", gridTemplateColumns:"1.4fr 1fr 1fr 1fr", padding:"10px 12px", background:C.card2, fontSize:11, fontWeight:800, color:C.muted }}>
+              <span>Feature</span><span style={{textAlign:"center"}}>Free</span><span style={{textAlign:"center"}}>Pro</span><span style={{textAlign:"center"}}>Premium</span>
+            </div>
+            {[
+              ["AI credits / month","60","400","1,500"],
+              ["Voice recording & transcribe","✓","✓","✓"],
+              ["AI Chat, Scan Doc, Quizzes","✓","✓","✓"],
+              ["Priority AI responses","—","✓","✓"],
+              ["Cloud storage","Standard","More","Maximum"],
+              ["AI Study Planner","—","—","✓"],
+              ["Exam Mode","—","—","✓"],
+              ["Advanced AI Tutor","—","—","✓"],
+              ["Priority support","—","✓","✓"],
+            ].map(function(row,i){return(
+              <div key={i} style={{ display:"grid", gridTemplateColumns:"1.4fr 1fr 1fr 1fr", padding:"10px 12px", fontSize:12, color:C.soft, borderTop:"1px solid "+C.border }}>
+                <span style={{ color:C.text, fontWeight:600 }}>{row[0]}</span>
+                <span style={{textAlign:"center"}}>{row[1]}</span>
+                <span style={{textAlign:"center"}}>{row[2]}</span>
+                <span style={{textAlign:"center"}}>{row[3]}</span>
+              </div>
+            );})}
+          </div>
+        </div>
+        <div style={{ textAlign:"center", fontSize:11, color:C.muted, marginBottom:20 }}>Payments aren't live yet — upgrading here is a preview. Real checkout is coming soon.</div>
+      </div>
+    </div>
+  );
+}
+
 // ── SETTINGS ──────────────────────────────────────────────────────────────────
-function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings, setRecSettings }) {
+function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings, setRecSettings, plan, credits, onViewPlans }) {
   var [openSection,setOpenSection]=useState(null);
   var [lang,setLang]=useState("English");
   var [aiStyle,setAiStyle]=useState("Academic");
@@ -1332,14 +1462,22 @@ function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings
 
         <Section id="sub" icon="⭐" title="Subscription" color="#F59E0B">
           <div style={{ marginTop:12 }}>
-            <div style={{ background:C.card2,borderRadius:12,padding:"12px 16px",marginBottom:10,display:"flex",justifyContent:"space-between",alignItems:"center" }}><div><div style={{ fontWeight:700,fontSize:14,color:C.text }}>Current Plan</div><div style={{ fontSize:12,color:C.muted }}>Free - 5 recordings per month</div></div><span style={{ background:"rgba(6,182,212,0.15)",color:C.cyan,borderRadius:99,padding:"4px 14px",fontSize:12,fontWeight:700 }}>Free</span></div>
-            <div style={{ background:"linear-gradient(135deg,#4F46E5,#7C3AED,#06B6D4)",borderRadius:16,padding:20,marginBottom:10 }}>
-              <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12 }}><div><div style={{ fontWeight:800,fontSize:18,color:"#fff" }}>Upgrade to Pro</div><div style={{ fontSize:12,color:"rgba(255,255,255,0.75)",marginTop:4,lineHeight:1.8 }}>Unlimited recordings and notes{"\n"}Real AI with SAM-X{"\n"}Priority support</div></div><span style={{ fontSize:32 }}>🚀</span></div>
-              <div style={{ display:"flex",alignItems:"baseline",gap:4,marginBottom:14 }}><span style={{ fontSize:32,fontWeight:800,color:"#fff" }}>₦550</span><span style={{ fontSize:13,color:"rgba(255,255,255,0.6)" }}>/month</span></div>
-              <button style={{ width:"100%",background:"#fff",color:"#4F46E5",border:"none",borderRadius:12,padding:"13px",fontWeight:800,fontSize:15,cursor:"pointer" }}>Get Pro Now →</button>
+            <div style={{ background:C.card2,borderRadius:12,padding:"12px 16px",marginBottom:10,display:"flex",justifyContent:"space-between",alignItems:"center" }}>
+              <div>
+                <div style={{ fontWeight:700,fontSize:14,color:C.text }}>Current Plan</div>
+                <div style={{ fontSize:12,color:C.muted }}>{credits} AI credit{credits===1?"":"s"} remaining this month</div>
+              </div>
+              <span style={{ background:(PLANS[plan]||PLANS.free).color+"25",color:(PLANS[plan]||PLANS.free).color,borderRadius:99,padding:"4px 14px",fontSize:12,fontWeight:700 }}>{(PLANS[plan]||PLANS.free).name}</span>
             </div>
-            <Row icon="🔄" label="Restore Purchase" sub="Restore previous subscription"/>
-            <Row icon="📜" label="Payment History" sub="View past transactions"/>
+            {credits<=LOW_CREDIT_WARNING_THRESHOLD && <div style={{ background:"rgba(245,158,11,0.1)",border:"1px solid rgba(245,158,11,0.3)",borderRadius:12,padding:"10px 14px",marginBottom:10,fontSize:12,color:C.amber,fontWeight:600 }}>⚡ {credits<=0?"You're out of credits — upgrade to keep using AI features.":"Running low on credits."}</div>}
+            {plan!=="premium" && (
+              <div style={{ background:"linear-gradient(135deg,#4F46E5,#7C3AED,#06B6D4)",borderRadius:16,padding:20,marginBottom:10 }}>
+                <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12 }}><div><div style={{ fontWeight:800,fontSize:18,color:"#fff" }}>{plan==="free"?"Upgrade to Pro":"Upgrade to Premium"}</div><div style={{ fontSize:12,color:"rgba(255,255,255,0.75)",marginTop:4,lineHeight:1.8 }}>More AI credits{"\n"}Faster SAM-X responses{"\n"}Priority support</div></div><span style={{ fontSize:32 }}>🚀</span></div>
+                <div style={{ display:"flex",alignItems:"baseline",gap:4,marginBottom:14 }}><span style={{ fontSize:32,fontWeight:800,color:"#fff" }}>₦{(plan==="free"?PLANS.pro.priceMonthly:PLANS.premium.priceMonthly).toLocaleString()}</span><span style={{ fontSize:13,color:"rgba(255,255,255,0.6)" }}>/month</span></div>
+                <button onClick={onViewPlans} style={{ width:"100%",background:"#fff",color:"#4F46E5",border:"none",borderRadius:12,padding:"13px",fontWeight:800,fontSize:15,cursor:"pointer" }}>See Plans →</button>
+              </div>
+            )}
+            <Row icon="📊" label="View All Plans" sub="Compare Free, Pro, and Premium" onPress={onViewPlans}/>
           </div>
         </Section>
 
@@ -1422,8 +1560,19 @@ export default function App() {
     try{ var raw=localStorage.getItem("jotting_recSettings"); return raw?JSON.parse(raw):{noise:true,autoTranscribe:false,speakerID:false,autoSave:false}; }
     catch(e){ return {noise:true,autoTranscribe:false,speakerID:false,autoSave:false}; }
   });
+  var [plan, setPlan] = useState("free");
+  var [credits, setCredits] = useState(PLANS.free.monthlyCredits);
   useEffect(function(){ try{ localStorage.setItem("jotting_recQuality", recQuality); }catch(e){} }, [recQuality]);
   useEffect(function(){ try{ localStorage.setItem("jotting_recSettings", JSON.stringify(recSettings)); }catch(e){} }, [recSettings]);
+
+  // Let any AI helper function (defined outside this component) update the credit
+  // balance shown here, and let any screen jump to the upgrade page, without props
+  // needing to be threaded down through every single screen.
+  useEffect(function(){
+    updateGlobalCredits = function(remaining){ setCredits(remaining); };
+    triggerUpgradeScreen = function(){ setScreen("pricing"); };
+    return function(){ updateGlobalCredits = function(){}; triggerUpgradeScreen = function(){}; };
+  }, []);
 
   // Listen for auth state
   useEffect(function() {
@@ -1460,12 +1609,25 @@ export default function App() {
             return merged;
           });
         });
+        loadOrInitAccount(firebaseUser.uid).then(function(account){
+          var monthKey = currentMonthKey();
+          // This is a display-only estimate — the real refill happens securely on the
+          // server (in the Netlify function) the next time an AI request is made this
+          // month. The client is never allowed to write its own credit balance directly.
+          var displayCredits = account.creditsMonthKey !== monthKey
+            ? (PLANS[account.plan]||PLANS.free).monthlyCredits
+            : (typeof account.credits==="number" ? account.credits : PLANS.free.monthlyCredits);
+          setPlan(account.plan||"free");
+          setCredits(displayCredits);
+        });
         var isNew = !localStorage.getItem("jotting_seen_"+firebaseUser.uid);
         if (isNew) { setShowOnboarding(true); localStorage.setItem("jotting_seen_"+firebaseUser.uid,"1"); }
       } else {
         setUser(null);
         setNotes([]);
         setChatSessions([]);
+        setPlan("free");
+        setCredits(PLANS.free.monthlyCredits);
         setAuthLoading(false);
       }
     });
@@ -1587,14 +1749,15 @@ export default function App() {
         <div style={{ flex:1,display:"flex",flexDirection:"column",overflowY:"auto",minHeight:0 }}>
           {screen==="home"&&<HomeScreen notes={notes} user={user} onNote={function(n){setActiveNote(n);go("detail");}} onVoice={function(){go("voice","new");}} onDraw={function(){go("draw");}} onAIWrite={function(){go("aiwrite");}} onScan={function(){go("scan");}} onChat={function(){go("ai");}}/>}
           {screen==="library"&&<LibraryScreen notes={notes} onNote={function(n){setActiveNote(n);go("detail");}} onDelete={deleteNote}/>}
-          {screen==="dashboard"&&<DashboardScreen notes={notes} user={user}/>}
+          {screen==="dashboard"&&<DashboardScreen notes={notes} user={user} credits={credits} plan={plan}/>}
           {screen==="detail"&&activeNote&&<NoteDetail note={activeNote} onBack={function(){go(tab==="library"?"library":"home",tab);}} onDelete={deleteNote}/>}
           {screen==="voice"&&<VoiceNoteScreen onBack={function(){go("home","home");}} onSave={saveNote} recQuality={recQuality} recSettings={recSettings}/>}
           {screen==="draw"&&<DrawScreen onBack={function(){go("home","home");}}/>}
           {screen==="aiwrite"&&<AIWriteScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
           {screen==="scan"&&<ScanDocScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
           {screen==="ai"&&<AIScreen notes={notes} onBack={function(){go("home","home");}} chatSessions={chatSessions} onSaveSession={saveChatSession} onDeleteSession={deleteChatSession}/>}
-          {screen==="settings"&&<SettingsScreen user={user} onLogout={handleLogout} recQuality={recQuality} setRecQuality={setRecQuality} recSettings={recSettings} setRecSettings={setRecSettings}/>}
+          {screen==="settings"&&<SettingsScreen user={user} onLogout={handleLogout} recQuality={recQuality} setRecQuality={setRecQuality} recSettings={recSettings} setRecSettings={setRecSettings} plan={plan} credits={credits} onViewPlans={function(){setScreen("pricing");}}/>}
+          {screen==="pricing"&&<PricingScreen onBack={function(){go("settings","settings");}} plan={plan} credits={credits}/>}
         </div>
         <div style={{ background:C.card2,borderTop:"1px solid "+C.border,padding:"10px 10px 16px",display:"flex",justifyContent:"space-around",alignItems:"center",flexShrink:0 }}>
           {NAV.map(function(item){return(
