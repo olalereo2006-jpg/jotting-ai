@@ -1,22 +1,16 @@
-// netlify/functions/generate.js
+// api/generate.js
 //
-// This is the ONLY place the real Gemini API key ever lives. The browser never
-// sees it. Every AI feature in the app (chat, summaries, quizzes, scan doc,
-// voice transcription) sends its request here instead of calling Gemini directly.
+// This is Vercel's version of the exact same secure AI proxy as
+// netlify/functions/generate.js — same logic, just written in the request/response
+// shape Vercel expects instead of Netlify's event-based shape. Both need to exist
+// because each hosting platform only recognizes its own convention.
 //
-// What this function does, in order:
-//   1. Verifies the caller is really logged in (checks their Firebase ID token)
-//   2. Looks up how many AI credits they have left, resetting monthly if needed
-//   3. Refuses the request (402 Payment Required style) if they're out of credits
-//   4. Deducts the credit cost BEFORE calling Gemini, inside a Firestore transaction
-//      (so two requests firing at once can't both slip through on the same credit)
-//   5. Calls Gemini with the private key and returns the answer, plus the new balance
-//
-// Setup needed (see the message alongside this file for full instructions):
+// Setup needed (same as the Netlify one, but set separately in Vercel's dashboard):
 //   - npm install firebase-admin
-//   - Environment variables in Netlify: FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL,
-//     FIREBASE_PRIVATE_KEY, GEMINI_SERVER_KEY
-//   - netlify.toml redirect so /api/generate reaches this function
+//   - Environment variables in Vercel (Project Settings -> Environment Variables):
+//     FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY, GEMINI_SERVER_KEY
+//   - No redirect file needed — Vercel automatically turns anything in /api into a
+//     function reachable at /api/<filename>, so /api/generate.js -> /api/generate
 
 const admin = require("firebase-admin");
 
@@ -31,12 +25,10 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
-const GEMINI_MODEL = "gemini-flash-latest";
 const GEMINI_KEY = process.env.GEMINI_SERVER_KEY;
 
-// Keep these numbers in sync with PLANS / CREDIT_COSTS near the top of src/App.js —
-// this is the copy that actually gets enforced, since nothing from the browser can
-// be trusted for billing-relevant numbers.
+// Keep these numbers in sync with PLANS near the top of src/App.js, and with
+// netlify/functions/generate.js — this is the copy that actually gets enforced here.
 const CREDIT_COSTS = { chat: 1, summary: 5, quiz: 8, flashcards: 8, pdf_analysis: 20, transcribe: 15 };
 const PLAN_MONTHLY_CREDITS = { free: 60, pro: 400, premium: 1500 };
 
@@ -45,37 +37,27 @@ function monthKey() {
   return d.getFullYear() + "-" + d.getMonth();
 }
 
-exports.handler = async function (event) {
-  if (event.httpMethod !== "POST") {
-    return { statusCode: 405, body: JSON.stringify({ error: "Method not allowed" }) };
+module.exports = async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
   }
 
-  var body;
-  try {
-    body = JSON.parse(event.body || "{}");
-  } catch (e) {
-    return { statusCode: 400, body: JSON.stringify({ error: "Malformed request" }) };
-  }
-
+  var body = req.body || {};
   var idToken = body.idToken;
   var action = body.action || "chat";
   var contents = body.contents;
   var systemInstruction = body.systemInstruction;
   var maxTokens = body.maxTokens || 800;
 
-  if (!idToken) {
-    return { statusCode: 401, body: JSON.stringify({ error: "Please log in and try again." }) };
-  }
-  if (!contents) {
-    return { statusCode: 400, body: JSON.stringify({ error: "Missing request content" }) };
-  }
+  if (!idToken) return res.status(401).json({ error: "Please log in and try again." });
+  if (!contents) return res.status(400).json({ error: "Missing request content" });
 
   var uid;
   try {
     var decoded = await admin.auth().verifyIdToken(idToken);
     uid = decoded.uid;
   } catch (e) {
-    return { statusCode: 401, body: JSON.stringify({ error: "Your session expired — please log in again." }) };
+    return res.status(401).json({ error: "Your session expired — please log in again." });
   }
 
   var cost = CREDIT_COSTS[action] != null ? CREDIT_COSTS[action] : 1;
@@ -91,14 +73,11 @@ exports.handler = async function (event) {
       var thisMonth = monthKey();
 
       var credits = typeof data.credits === "number" ? data.credits : monthlyAllowance;
-      // Reset credits automatically at the start of a new month.
       if (data.creditsMonthKey !== thisMonth) {
         credits = monthlyAllowance;
       }
 
       if (credits < cost) {
-        // Still write the reset (if one happened) so the balance is accurate next time,
-        // even though this particular request is being declined.
         t.set(accountRef, { plan: plan, credits: credits, creditsMonthKey: thisMonth }, { merge: true });
         return { ok: false, remaining: credits };
       }
@@ -109,14 +88,13 @@ exports.handler = async function (event) {
     });
   } catch (e) {
     console.error("Credit transaction failed:", e);
-    return { statusCode: 500, body: JSON.stringify({ error: "Server error — please try again." }) };
+    return res.status(500).json({ error: "Server error — please try again." });
   }
 
   if (!deduction.ok) {
-    return { statusCode: 402, body: JSON.stringify({ error: "OUT_OF_CREDITS", remaining: deduction.remaining }) };
+    return res.status(402).json({ error: "OUT_OF_CREDITS", remaining: deduction.remaining });
   }
 
-  // Best-effort usage log for future admin analytics — never blocks the response.
   db.collection("usageLogs").add({ uid: uid, action: action, cost: cost, ts: Date.now() }).catch(function () {});
 
   try {
@@ -132,13 +110,13 @@ exports.handler = async function (event) {
     var data = await geminiRes.json();
 
     if (!geminiRes.ok) {
-      return { statusCode: geminiRes.status, body: JSON.stringify({ error: (data && data.error && data.error.message) || "AI request failed" }) };
+      return res.status(geminiRes.status).json({ error: (data && data.error && data.error.message) || "AI request failed" });
     }
 
     data.creditsRemaining = deduction.remaining;
-    return { statusCode: 200, body: JSON.stringify(data) };
+    return res.status(200).json(data);
   } catch (e) {
     console.error("Gemini call failed:", e);
-    return { statusCode: 500, body: JSON.stringify({ error: "Couldn't reach the AI — please try again." }) };
+    return res.status(500).json({ error: "Couldn't reach the AI — please try again." });
   }
 };

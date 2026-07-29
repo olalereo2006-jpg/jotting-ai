@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+ import { useState, useEffect, useRef } from "react";
 import { initializeApp } from "firebase/app";
 import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, sendPasswordResetEmail, GoogleAuthProvider, signInWithPopup } from "firebase/auth";
 import { getFirestore, collection, addDoc, getDocs, getDoc, deleteDoc, doc, setDoc, query, where } from "firebase/firestore";
@@ -42,7 +42,6 @@ const PLANS = {
   pro:     { id:"pro",     name:"Pro",     priceMonthly:550, priceYearly:5500,  monthlyCredits:400,  color:C.cyan,   tagline:"For regular studying",   features:["Everything in Free","400 AI credits / month","Faster, priority AI responses","More cloud storage","Priority support"] },
   premium: { id:"premium", name:"Premium", priceMonthly:1500,priceYearly:15000, monthlyCredits:1500, color:C.purple, tagline:"For serious exam prep",  features:["Everything in Pro","1,500 AI credits / month","AI Study Planner","Exam Mode","Advanced AI Tutor","Advanced analytics & maximum storage"] },
 };
-const CREDIT_COSTS = { chat:1, summary:5, quiz:8, flashcards:8, pdf_analysis:20, transcribe:15 };
 const LOW_CREDIT_WARNING_THRESHOLD = 10;
 
 async function getIdToken(){
@@ -229,7 +228,63 @@ async function loadOrInitAccount(userId) {
 }
 function currentMonthKey(){ var d=new Date(); return d.getFullYear()+"-"+d.getMonth(); }
 
+// ── Profile (school/department/level) + daily study streak ────────────────────
+// Unlike credits, a streak is just a motivational number — no real harm if a
+// student could nudge it, so this collection can be read/written directly by its
+// own owner (unlike the locked-down `accounts` collection).
+function dayKey(d){ d=d||new Date(); return d.getFullYear()+"-"+d.getMonth()+"-"+d.getDate(); }
+
+async function loadOrInitProfile(userId) {
+  try {
+    var ref = doc(db, "profiles", userId);
+    var snap = await getDoc(ref);
+    var today = dayKey();
+    if (!snap.exists()) {
+      var fresh = { school:"", department:"", level:"", streak:1, lastActiveDay:today };
+      await setDoc(ref, fresh);
+      return fresh;
+    }
+    var data = snap.data();
+    if (data.lastActiveDay !== today) {
+      var yesterday = dayKey(new Date(Date.now()-86400000));
+      var newStreak = data.lastActiveDay===yesterday ? (data.streak||0)+1 : 1;
+      var updated = { ...data, streak:newStreak, lastActiveDay:today };
+      await setDoc(ref, updated, { merge:true });
+      return updated;
+    }
+    return data;
+  } catch(e) { console.error("Profile load error:", e); return { school:"", department:"", level:"", streak:1, lastActiveDay:dayKey() }; }
+}
+async function saveProfileFields(userId, fields) {
+  try { await setDoc(doc(db, "profiles", userId), fields, { merge:true }); } catch(e) { console.error("Profile save error:", e); }
+}
+
+// ── Notification Center ─────────────────────────────────────────────────────────
+// Lightweight in-app notification feed — separate from browser push notifications
+// (those are handled elsewhere for reminders). This is the bell icon's history list.
+function loadNotifsLocal(userId) {
+  try { var raw = localStorage.getItem("jotting_notifcenter_"+userId); return raw ? JSON.parse(raw) : []; } catch(e) { return []; }
+}
+function persistNotifsLocal(userId, list) {
+  try { localStorage.setItem("jotting_notifcenter_"+userId, JSON.stringify(list)); } catch(e){}
+}
+function makeNotif(type, title, message){
+  return { id:"n_"+Date.now()+"_"+Math.floor(Math.random()*1000), type:type, title:title, message:message, ts:Date.now(), read:false };
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Browser push notifications (for study reminders) ───────────────────────────
+function requestNotificationPermission(){
+  if ("Notification" in window && Notification.permission==="default") {
+    Notification.requestPermission().catch(function(){});
+  }
+}
+function sendNotification(title, body){
+  if ("Notification" in window && Notification.permission==="granted") {
+    try{ new Notification(title, { body:body, icon:"/favicon.ico" }); }catch(e){}
+  }
+}
+
 function Wave({ active, color, size }) {
   var c=color||"#06B6D4"; var s=size||1;
   return (
@@ -248,6 +303,10 @@ function Toggle({ value, onChange, color }) {
       <div style={{ position:"absolute",top:3,left:value?23:3,width:20,height:20,borderRadius:"50%",background:"#fff",transition:"left 0.25s" }}/>
     </div>
   );
+}
+
+function Row({ icon, label, sub, right, danger, onPress }) {
+  return<div onClick={onPress} style={{ display:"flex",alignItems:"center",justifyContent:"space-between",padding:"13px 0",borderBottom:"1px solid "+C.border,cursor:onPress?"pointer":"default" }}><div style={{ display:"flex",alignItems:"center",gap:10 }}>{icon&&<span style={{ fontSize:18 }}>{icon}</span>}<div><div style={{ fontSize:14,fontWeight:600,color:danger?C.red:C.text }}>{label}</div>{sub&&<div style={{ fontSize:11,color:C.muted,marginTop:1 }}>{sub}</div>}</div></div>{right!==undefined?right:<span style={{ color:C.muted,fontSize:16 }}>›</span>}</div>;
 }
 
 var backBtn = { background:"rgba(255,255,255,0.08)",border:"none",borderRadius:10,width:36,height:36,cursor:"pointer",color:"#fff",fontSize:18,display:"flex",alignItems:"center",justifyContent:"center" };
@@ -679,57 +738,185 @@ function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings }) {
 
 // ── SCAN DOC ──────────────────────────────────────────────────────────────────
 function ScanDocScreen({ onBack, onSave }) {
-  var [image,setImage]=useState(null);var [extracting,setExtracting]=useState(false);var [extracted,setExtracted]=useState("");var [title,setTitle]=useState("");var [course,setCourse]=useState("General");var [status,setStatus]=useState("Take a photo or upload an image");
-  var fileRef=useRef(null);
+  var [image,setImage]=useState(null); // final (possibly cropped) image data URL, or null while a PDF is loaded
+  var [pdfFile,setPdfFile]=useState(null); // {dataUrl, name} when a PDF was chosen instead of an image
+  var [cropping,setCropping]=useState(false);
+  var [rawImage,setRawImage]=useState(null); // uncropped source, kept so "Re-crop" can start over
+  var [box,setBox]=useState({x:20,y:20,w:200,h:200}); // crop rectangle, in on-screen px relative to the preview
+  var [extracting,setExtracting]=useState(false);var [extracted,setExtracted]=useState("");var [title,setTitle]=useState("");var [course,setCourse]=useState("General");var [status,setStatus]=useState("Take a photo or upload an image or PDF");
+  var fileRef=useRef(null); var imgRef=useRef(null); var dragRef=useRef(null);
   var courses=["General","PHY 101","MTH 101","COS 102","ENG 201","CHM 102"];
-  function handleFile(file){if(!file)return;var reader=new FileReader();reader.onload=function(e){setImage(e.target.result);setExtracted("");setStatus("Image ready! Tap Extract Text.");};reader.readAsDataURL(file);}
-  async function extractText(){if(!image)return;setExtracting(true);setStatus("Reading text from image using AI...");try{var base64=image.split(",")[1];var mimeType=image.split(";")[0].split(":")[1];var text=await callGeminiVision(base64,mimeType,"Extract all text from this image. Format it as clean study notes with proper headings and bullet points. Return ONLY the extracted text.",1500,"pdf_analysis");setExtracted(text);setStatus("Text extracted successfully!");}catch(e){if(e.code==="OUT_OF_CREDITS"){triggerUpgradeScreen();setStatus("");}else{setStatus("Error: "+e.message);}}setExtracting(false);}
-  function saveNote(){if(!extracted.trim()){alert("Extract text first!");return;}onSave({id:Date.now(),title:title||("Scanned Note - "+new Date().toLocaleDateString()),course,color:"#F59E0B",bg:"rgba(245,158,11,0.12)",tag:"Lecture",words:extracted.split(" ").length,preview:extracted.slice(0,100),content:extracted});}
+
+  function handleFile(file){
+    if(!file) return;
+    setExtracted(""); setImage(null); setPdfFile(null);
+    if (file.type==="application/pdf" || file.name.toLowerCase().endsWith(".pdf")) {
+      var reader=new FileReader();
+      reader.onload=function(e){ setPdfFile({dataUrl:e.target.result, name:file.name}); setStatus("PDF ready! Tap Extract Text."); };
+      reader.readAsDataURL(file);
+      return;
+    }
+    var reader2=new FileReader();
+    reader2.onload=function(e){
+      setRawImage(e.target.result);
+      setImage(e.target.result);
+      setStatus("Image ready! Crop it or extract text directly.");
+    };
+    reader2.readAsDataURL(file);
+  }
+
+  function startCrop(){
+    if(!rawImage) return;
+    setBox({x:20,y:20,w:200,h:200});
+    setCropping(true);
+  }
+
+  function onDragStart(e, mode){
+    e.preventDefault();
+    var startPt = e.touches ? e.touches[0] : e;
+    var startBox = {...box};
+    var startX = startPt.clientX, startY = startPt.clientY;
+    dragRef.current = { mode:mode, startX:startX, startY:startY, startBox:startBox };
+  }
+  function onDragMove(e){
+    if(!dragRef.current) return;
+    e.preventDefault();
+    var pt = e.touches ? e.touches[0] : e;
+    var dx = pt.clientX - dragRef.current.startX;
+    var dy = pt.clientY - dragRef.current.startY;
+    var sb = dragRef.current.startBox;
+    var container = imgRef.current;
+    var maxW = container ? container.clientWidth : 320;
+    var maxH = container ? container.clientHeight : 320;
+    if (dragRef.current.mode==="move") {
+      var nx = Math.max(0, Math.min(maxW-sb.w, sb.x+dx));
+      var ny = Math.max(0, Math.min(maxH-sb.h, sb.y+dy));
+      setBox({x:nx,y:ny,w:sb.w,h:sb.h});
+    } else {
+      var nw = Math.max(40, Math.min(maxW-sb.x, sb.w+dx));
+      var nh = Math.max(40, Math.min(maxH-sb.y, sb.h+dy));
+      setBox({x:sb.x,y:sb.y,w:nw,h:nh});
+    }
+  }
+  function onDragEnd(){ dragRef.current=null; }
+
+  function confirmCrop(){
+    var img = imgRef.current;
+    if(!img){ setCropping(false); return; }
+    var scaleX = img.naturalWidth / img.clientWidth;
+    var scaleY = img.naturalHeight / img.clientHeight;
+    var canvas = document.createElement("canvas");
+    canvas.width = box.w*scaleX; canvas.height = box.h*scaleY;
+    var ctx = canvas.getContext("2d");
+    ctx.drawImage(img, box.x*scaleX, box.y*scaleY, box.w*scaleX, box.h*scaleY, 0, 0, canvas.width, canvas.height);
+    setImage(canvas.toDataURL("image/jpeg", 0.92));
+    setCropping(false);
+    setStatus("Cropped! Ready to extract text.");
+  }
+
+  async function extractText(){
+    var source = image || (pdfFile&&pdfFile.dataUrl);
+    if(!source) return;
+    setExtracting(true);setStatus("Reading text using AI...");
+    try{
+      var base64=source.split(",")[1];
+      var mimeType=source.split(";")[0].split(":")[1];
+      var text=await callGeminiVision(base64,mimeType,"Extract all text from this "+(pdfFile?"document":"image")+". Format it as clean study notes with proper headings and bullet points. Return ONLY the extracted text.",1500,"pdf_analysis");
+      setExtracted(text);setStatus("Text extracted successfully!");
+    }catch(e){
+      if(e.code==="OUT_OF_CREDITS"){triggerUpgradeScreen();setStatus("");}else{setStatus("Error: "+e.message);}
+    }
+    setExtracting(false);
+  }
+
+  function saveNote(){if(!extracted.trim()){alert("Extract text first!");return;}onSave({id:Date.now(),title:title||("Scanned Note - "+new Date().toLocaleDateString()),course,color:"#06B6D4",bg:"rgba(6,182,212,0.12)",tag:"Lecture",words:extracted.split(" ").length,preview:extracted.slice(0,100),content:extracted});}
+
+  var hasSource = image || pdfFile;
+
   return(
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
       <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
         <button onClick={onBack} style={backBtn}>←</button>
         <span style={{ fontWeight:800,fontSize:16,color:C.text }}>Scan Document</span>
-        {extracted&&<button onClick={saveNote} style={{ background:"linear-gradient(135deg,#F59E0B,#EF4444)",color:"#fff",border:"none",borderRadius:10,padding:"8px 16px",fontWeight:800,fontSize:13,cursor:"pointer" }}>Save</button>}
+        {extracted&&<button onClick={saveNote} style={{ background:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:"#fff",border:"none",borderRadius:10,padding:"8px 16px",fontWeight:800,fontSize:13,cursor:"pointer" }}>Save</button>}
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:20 }}>
-        <div style={{ background:"linear-gradient(135deg,rgba(245,158,11,0.1),rgba(239,68,68,0.1))",borderRadius:14,padding:"12px 16px",marginBottom:16,border:"1px solid rgba(245,158,11,0.2)",display:"flex",alignItems:"center",gap:10 }}>
+        <div style={{ background:"linear-gradient(135deg,rgba(6,182,212,0.1),rgba(167,139,250,0.1))",borderRadius:14,padding:"12px 16px",marginBottom:16,border:"1px solid rgba(6,182,212,0.2)",display:"flex",alignItems:"center",gap:10 }}>
           <span style={{ fontSize:24 }}>📷</span>
-          <div><div style={{ fontWeight:700,fontSize:13,color:C.amber }}>AI Document Scanner</div><div style={{ fontSize:11,color:C.muted }}>Scan notes, textbooks, whiteboards — AI extracts all text</div></div>
+          <div><div style={{ fontWeight:700,fontSize:13,color:C.cyan }}>AI Document Scanner</div><div style={{ fontSize:11,color:C.muted }}>Scan notes, textbooks, whiteboards, or upload a PDF — AI extracts all text</div></div>
         </div>
         <input value={title} onChange={function(e){setTitle(e.target.value);}} placeholder="Note title (optional)..." style={{ width:"100%",padding:"13px 16px",borderRadius:12,border:"1px solid "+C.border,fontSize:15,fontWeight:700,background:C.card,color:C.text,outline:"none",marginBottom:12,boxSizing:"border-box" }}/>
-        <div style={{ display:"flex",gap:8,marginBottom:16,flexWrap:"wrap" }}>{courses.map(function(c){return<button key={c} onClick={function(){setCourse(c);}} style={{ padding:"6px 14px",borderRadius:99,border:"2px solid",borderColor:course===c?C.amber:C.border,background:course===c?C.amber:C.card,color:course===c?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{c}</button>;})}</div>
-        <div onClick={function(){fileRef.current&&fileRef.current.click();}} style={{ background:C.card,borderRadius:20,padding:"28px 20px",border:"2px dashed "+(image?C.amber:C.border),marginBottom:16,textAlign:"center",cursor:"pointer" }}>
-          {image?(<div><img src={image} alt="scan" style={{ maxWidth:"100%",maxHeight:240,borderRadius:12,objectFit:"contain" }}/><p style={{ color:C.green,fontSize:13,fontWeight:600,marginTop:12 }}>Image ready!</p></div>)
-          :(<div><div style={{ fontSize:52,marginBottom:12 }}>📷</div><div style={{ fontWeight:700,fontSize:16,color:C.text,marginBottom:8 }}>Tap to Upload Image</div><div style={{ fontSize:13,color:C.muted }}>Take a photo or choose from gallery</div></div>)}
-        </div>
-        <input ref={fileRef} type="file" accept="image/*" capture="environment" onChange={function(e){handleFile(e.target.files[0]);}} style={{ display:"none" }}/>
-        <div style={{ display:"flex",gap:10,marginBottom:16 }}>
-          <button onClick={function(){fileRef.current&&fileRef.current.click();}} style={{ flex:1,background:C.card2,color:C.text,border:"1px solid "+C.border,borderRadius:12,padding:"12px",fontWeight:700,fontSize:14,cursor:"pointer" }}>📁 Choose File</button>
-          <button onClick={function(){var input=document.createElement("input");input.type="file";input.accept="image/*";input.capture="camera";input.onchange=function(e){handleFile(e.target.files[0]);};input.click();}} style={{ flex:1,background:C.card2,color:C.text,border:"1px solid "+C.border,borderRadius:12,padding:"12px",fontWeight:700,fontSize:14,cursor:"pointer" }}>📸 Camera</button>
-        </div>
-        {image&&<button onClick={extractText} disabled={extracting} style={{ width:"100%",background:extracting?"#374151":"linear-gradient(135deg,#F59E0B,#EF4444)",color:"#fff",border:"none",borderRadius:14,padding:"15px",fontWeight:800,fontSize:15,cursor:extracting?"not-allowed":"pointer",marginBottom:16,display:"flex",alignItems:"center",justifyContent:"center",gap:10 }}>{extracting?(<><div style={{ width:18,height:18,borderRadius:"50%",border:"2px solid rgba(255,255,255,0.3)",borderTop:"2px solid #fff",animation:"spin 1s linear infinite" }}/>Reading text...</>):"✨ Extract Text from Image"}</button>}
-        <p style={{ textAlign:"center",color:extracting?C.amber:C.muted,fontSize:13,fontWeight:600,marginBottom:16 }}>{status}</p>
-        {extracted&&(<div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+C.amber+"40" }}><div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12 }}><span style={{ fontWeight:700,fontSize:14,color:C.amber }}>📝 Extracted Text</span><button onClick={function(){navigator.clipboard&&navigator.clipboard.writeText(extracted);}} style={{ background:C.card2,border:"none",borderRadius:8,padding:"4px 10px",color:C.cyan,cursor:"pointer",fontSize:12,fontWeight:600 }}>Copy</button></div><textarea value={extracted} onChange={function(e){setExtracted(e.target.value);}} style={{ width:"100%",minHeight:200,background:"transparent",border:"none",color:C.text,fontSize:14,lineHeight:1.9,outline:"none",resize:"none",fontFamily:"inherit",boxSizing:"border-box" }}/></div>)}
+        <div style={{ display:"flex",gap:8,marginBottom:16,flexWrap:"wrap" }}>{courses.map(function(c){return<button key={c} onClick={function(){setCourse(c);}} style={{ padding:"6px 14px",borderRadius:99,border:"2px solid",borderColor:course===c?C.cyan:C.border,background:course===c?C.cyan:C.card,color:course===c?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{c}</button>;})}</div>
+
+        {!cropping && (
+          <div onClick={function(){if(!hasSource)fileRef.current&&fileRef.current.click();}} style={{ background:C.card,borderRadius:20,padding:hasSource?12:"28px 20px",border:"2px dashed "+(hasSource?C.cyan:C.border),marginBottom:16,textAlign:"center",cursor:hasSource?"default":"pointer" }}>
+            {image?(<div><img ref={imgRef} src={image} alt="scan" style={{ maxWidth:"100%",maxHeight:240,borderRadius:12,objectFit:"contain" }}/><p style={{ color:C.green,fontSize:13,fontWeight:600,marginTop:12 }}>Image ready!</p></div>)
+            :pdfFile?(<div style={{ padding:"20px 0" }}><div style={{ fontSize:44,marginBottom:10 }}>📄</div><div style={{ color:C.text,fontWeight:700,fontSize:14 }}>{pdfFile.name}</div><p style={{ color:C.green,fontSize:13,fontWeight:600,marginTop:8 }}>PDF ready!</p></div>)
+            :(<div><div style={{ fontSize:52,marginBottom:12 }}>📷</div><div style={{ fontWeight:700,fontSize:16,color:C.text,marginBottom:8 }}>Tap to Upload</div><div style={{ fontSize:13,color:C.muted }}>Image or PDF — from camera or gallery</div></div>)}
+          </div>
+        )}
+
+        {cropping && (
+          <div style={{ marginBottom:16 }}>
+            <div style={{ position:"relative",display:"inline-block",width:"100%",touchAction:"none" }}
+                 onMouseMove={onDragMove} onMouseUp={onDragEnd} onMouseLeave={onDragEnd}
+                 onTouchMove={onDragMove} onTouchEnd={onDragEnd}>
+              <img ref={imgRef} src={rawImage} alt="crop source" style={{ width:"100%",borderRadius:12,display:"block" }}/>
+              <div style={{ position:"absolute",inset:0,background:"rgba(0,0,0,0.5)",clipPath:"polygon(0 0,100% 0,100% 100%,0 100%,0 "+box.y+"px,"+ (box.x+box.w) +"px "+box.y+"px,"+(box.x+box.w)+"px "+(box.y+box.h)+"px,"+box.x+"px "+(box.y+box.h)+"px,"+box.x+"px "+box.y+"px,0 "+box.y+"px)" }}/>
+              <div onMouseDown={function(e){onDragStart(e,"move");}} onTouchStart={function(e){onDragStart(e,"move");}} style={{ position:"absolute",left:box.x,top:box.y,width:box.w,height:box.h,border:"2px solid "+C.cyan,cursor:"move" }}/>
+              <div onMouseDown={function(e){onDragStart(e,"resize");}} onTouchStart={function(e){onDragStart(e,"resize");}} style={{ position:"absolute",left:box.x+box.w-14,top:box.y+box.h-14,width:28,height:28,borderRadius:"50%",background:C.cyan,border:"3px solid #fff",cursor:"nwse-resize" }}/>
+            </div>
+            <div style={{ fontSize:12,color:C.muted,textAlign:"center",margin:"10px 0" }}>Drag the box to move it, drag the blue dot to resize</div>
+            <div style={{ display:"flex",gap:10 }}>
+              <button onClick={function(){setCropping(false);}} style={{ flex:1,background:C.card2,color:C.muted,border:"1px solid "+C.border,borderRadius:12,padding:"12px",fontWeight:700,cursor:"pointer" }}>Cancel</button>
+              <button onClick={confirmCrop} style={{ flex:2,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:"#fff",border:"none",borderRadius:12,padding:"12px",fontWeight:800,cursor:"pointer" }}>✂️ Crop</button>
+            </div>
+          </div>
+        )}
+
+        <input ref={fileRef} type="file" accept="image/*,application/pdf,.pdf" onChange={function(e){handleFile(e.target.files[0]);}} style={{ display:"none" }}/>
+
+        {!cropping && (
+          <div style={{ display:"flex",gap:10,marginBottom:16 }}>
+            <button onClick={function(){fileRef.current&&fileRef.current.click();}} style={{ flex:1,background:C.card2,color:C.text,border:"1px solid "+C.border,borderRadius:12,padding:"12px",fontWeight:700,fontSize:14,cursor:"pointer" }}>📁 Choose File</button>
+            <button onClick={function(){var input=document.createElement("input");input.type="file";input.accept="image/*";input.capture="environment";input.onchange=function(e){handleFile(e.target.files[0]);};input.click();}} style={{ flex:1,background:C.card2,color:C.text,border:"1px solid "+C.border,borderRadius:12,padding:"12px",fontWeight:700,fontSize:14,cursor:"pointer" }}>📸 Camera</button>
+          </div>
+        )}
+
+        {image && !cropping && <button onClick={startCrop} style={{ width:"100%",background:"none",border:"1px solid "+C.border,borderRadius:12,padding:"10px",color:C.cyan,fontWeight:700,fontSize:13,cursor:"pointer",marginBottom:12 }}>✂️ Crop Image</button>}
+
+        {hasSource && !cropping && <button onClick={extractText} disabled={extracting} style={{ width:"100%",background:extracting?"#374151":"linear-gradient(135deg,#06B6D4,#A78BFA)",color:"#fff",border:"none",borderRadius:14,padding:"15px",fontWeight:800,fontSize:15,cursor:extracting?"not-allowed":"pointer",marginBottom:16,display:"flex",alignItems:"center",justifyContent:"center",gap:10 }}>{extracting?(<><div style={{ width:18,height:18,borderRadius:"50%",border:"2px solid rgba(255,255,255,0.3)",borderTop:"2px solid #fff",animation:"spin 1s linear infinite" }}/>Reading text...</>):"✨ Extract Text"}</button>}
+        <p style={{ textAlign:"center",color:extracting?C.cyan:C.muted,fontSize:13,fontWeight:600,marginBottom:16 }}>{status}</p>
+        {extracted&&(<div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+C.cyan+"40" }}><div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12 }}><span style={{ fontWeight:700,fontSize:14,color:C.cyan }}>📝 Extracted Text</span><button onClick={function(){navigator.clipboard&&navigator.clipboard.writeText(extracted);}} style={{ background:C.card2,border:"none",borderRadius:8,padding:"4px 10px",color:C.cyan,cursor:"pointer",fontSize:12,fontWeight:600 }}>Copy</button></div><textarea value={extracted} onChange={function(e){setExtracted(e.target.value);}} style={{ width:"100%",minHeight:200,background:"transparent",border:"none",color:C.text,fontSize:14,lineHeight:1.9,outline:"none",resize:"none",fontFamily:"inherit",boxSizing:"border-box" }}/></div>)}
       </div>
     </div>
   );
 }
-
 // ── DRAW ──────────────────────────────────────────────────────────────────────
-function DrawScreen({ onBack }) {
+function DrawScreen({ onBack, onSave }) {
   var canvasRef=useRef(null);var [drawing,setDrawing]=useState(false);var [color,setColor]=useState("#06B6D4");var [size,setSize]=useState(4);var [tool,setTool]=useState("pen");
+  var [title,setTitle]=useState("");var [course,setCourse]=useState("General");var [hasContent,setHasContent]=useState(false);
   var colors=["#06B6D4","#A78BFA","#F59E0B","#34D399","#F87171","#fff"];
+  var courses=["General","PHY 101","MTH 101","COS 102","ENG 201","CHM 102"];
   function getPos(e,c){var r=c.getBoundingClientRect();var s=e.touches?e.touches[0]:e;return{x:(s.clientX-r.left)*(c.width/r.width),y:(s.clientY-r.top)*(c.height/r.height)};}
-  function startDraw(e){e.preventDefault();var c=canvasRef.current;var ctx=c.getContext("2d");var p=getPos(e,c);ctx.beginPath();ctx.moveTo(p.x,p.y);setDrawing(true);}
+  function startDraw(e){e.preventDefault();var c=canvasRef.current;var ctx=c.getContext("2d");var p=getPos(e,c);ctx.beginPath();ctx.moveTo(p.x,p.y);setDrawing(true);setHasContent(true);}
   function draw(e){e.preventDefault();if(!drawing)return;var c=canvasRef.current;var ctx=c.getContext("2d");var p=getPos(e,c);ctx.globalCompositeOperation=tool==="eraser"?"destination-out":"source-over";ctx.strokeStyle=color;ctx.lineWidth=tool==="eraser"?28:size;ctx.lineCap="round";ctx.lineJoin="round";ctx.lineTo(p.x,p.y);ctx.stroke();}
-  function saveDrawing(){var c=canvasRef.current;var l=document.createElement("a");l.download="drawing.png";l.href=c.toDataURL();l.click();}
+  function saveDrawing(){
+    if(!hasContent){ alert("Draw something first!"); return; }
+    var c=canvasRef.current;
+    var dataUrl=c.toDataURL("image/png");
+    onSave({ id:Date.now(), title:title||("Drawing - "+new Date().toLocaleDateString()), course, color:"#06B6D4", bg:"rgba(6,182,212,0.12)", tag:"Study", type:"drawing", words:0, preview:"🎨 Drawing", content:dataUrl });
+  }
   return(
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
       <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
         <button onClick={onBack} style={backBtn}>←</button>
         <span style={{ fontWeight:800,fontSize:16,color:C.text }}>Draw</span>
-        <div style={{ display:"flex",gap:8 }}><button onClick={function(){var c=canvasRef.current;c.getContext("2d").clearRect(0,0,c.width,c.height);}} style={{ background:C.card2,border:"none",borderRadius:8,padding:"7px 12px",color:C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>Clear</button><button onClick={saveDrawing} style={{ background:"linear-gradient(135deg,#06B6D4,#A78BFA)",border:"none",borderRadius:8,padding:"7px 12px",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer" }}>Save</button></div>
+        <div style={{ display:"flex",gap:8 }}><button onClick={function(){var c=canvasRef.current;c.getContext("2d").clearRect(0,0,c.width,c.height);setHasContent(false);}} style={{ background:C.card2,border:"none",borderRadius:8,padding:"7px 12px",color:C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>Clear</button><button onClick={saveDrawing} style={{ background:"linear-gradient(135deg,#06B6D4,#A78BFA)",border:"none",borderRadius:8,padding:"7px 12px",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer" }}>Save</button></div>
+      </div>
+      <div style={{ background:C.card,padding:"10px 16px",borderBottom:"1px solid "+C.border,display:"flex",gap:8,alignItems:"center" }}>
+        <input value={title} onChange={function(e){setTitle(e.target.value);}} placeholder="Title (optional)..." style={{ flex:1,padding:"9px 12px",borderRadius:10,border:"1px solid "+C.border,fontSize:13,background:C.bg,color:C.text,outline:"none" }}/>
+        <select value={course} onChange={function(e){setCourse(e.target.value);}} style={{ padding:"9px 10px",borderRadius:10,border:"1px solid "+C.border,fontSize:12,background:C.bg,color:C.text,outline:"none" }}>{courses.map(function(c){return<option key={c} value={c}>{c}</option>;})}</select>
       </div>
       <div style={{ background:C.card,padding:"12px 16px",display:"flex",alignItems:"center",gap:10,borderBottom:"1px solid "+C.border,flexWrap:"wrap" }}>
         <div style={{ display:"flex",gap:6 }}>{colors.map(function(c){return<button key={c} onClick={function(){setColor(c);setTool("pen");}} style={{ width:26,height:26,borderRadius:"50%",background:c,border:color===c&&tool!=="eraser"?"3px solid #fff":"2px solid rgba(255,255,255,0.15)",cursor:"pointer" }}/>;})}</div>
@@ -748,13 +935,13 @@ function AIWriteScreen({ onBack, onSave }) {
   var [prompt,setPrompt]=useState("");var [result,setResult]=useState("");var [loading,setLoading]=useState(false);var [course,setCourse]=useState("General");
   var courses=["General","PHY 101","MTH 101","COS 102","ENG 201","CHM 102"];
   var suggestions=["Summarize Newton laws of motion","Write notes on Data Structures","Explain Organic Chemistry basics","Create outline for Kinematics"];
-  async function generate(text){var q=text||prompt;if(!q.trim())return;setLoading(true);setResult("");try{var res=await callGeminiText("Write clear structured student notes with bullet points and headers for: "+q,800,"chat");setResult(res);}catch(e){if(e.code==="OUT_OF_CREDITS"){triggerUpgradeScreen();}else{setResult("Couldn't reach SAM-X — check your connection and try again.");}}setLoading(false);}
+  async function generate(text){var q=text||prompt;if(!q.trim())return;setLoading(true);setResult("");try{var res=await callGeminiText("You are writing formal university lecture notes for a student — not a chatbot reply. Do not include any introduction, preamble, or closing remarks (no phrases like \"Here are your notes\" or \"I hope this helps\"). Start immediately with the title heading and follow this exact structure using Markdown headers:\n\n# [Title of the topic]\n## Definition\n## Introduction\n## Main Explanation\n## Key Points\n## Advantages\n## Disadvantages\n## Examples\n## Important Exam Questions\n## Summary\n\nIf a section like Advantages/Disadvantages doesn't naturally apply to this specific topic, still include the header and briefly explain why it's less relevant rather than skipping it. Use bullet points under each header where appropriate.\n\nTopic: "+q,1400,"chat");setResult(res);}catch(e){if(e.code==="OUT_OF_CREDITS"){triggerUpgradeScreen();}else{setResult("Couldn't reach SAM-X — check your connection and try again.");}}setLoading(false);}
   return(
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
       <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
         <button onClick={onBack} style={backBtn}>←</button>
         <span style={{ fontWeight:800,fontSize:16,color:C.text }}>AI Write</span>
-        {result&&<button onClick={function(){onSave({id:Date.now(),title:prompt.slice(0,40)||"AI Note",course,color:"#A78BFA",bg:"rgba(167,139,250,0.12)",tag:"Study",words:result.split(" ").length,preview:result.slice(0,100),content:result});}} style={{ background:"linear-gradient(135deg,#A78BFA,#06B6D4)",color:"#fff",border:"none",borderRadius:10,padding:"8px 16px",fontWeight:800,fontSize:13,cursor:"pointer" }}>Save</button>}
+        {result&&<button onClick={function(){var m=result.match(/^#\s+(.+)/m);var noteTitle=(m&&m[1].trim())||prompt.slice(0,40)||"AI Note";onSave({id:Date.now(),title:noteTitle,course,color:"#A78BFA",bg:"rgba(167,139,250,0.12)",tag:"Study",words:result.split(" ").length,preview:result.replace(/[#*_>-]/g,"").slice(0,100),content:result});}} style={{ background:"linear-gradient(135deg,#A78BFA,#06B6D4)",color:"#fff",border:"none",borderRadius:10,padding:"8px 16px",fontWeight:800,fontSize:13,cursor:"pointer" }}>Save</button>}
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:20 }}>
         <div style={{ display:"flex",gap:8,marginBottom:14,flexWrap:"wrap" }}>{courses.map(function(c){return<button key={c} onClick={function(){setCourse(c);}} style={{ padding:"6px 14px",borderRadius:99,border:"2px solid",borderColor:course===c?C.purple:C.border,background:course===c?C.purple:C.card,color:course===c?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{c}</button>;})}</div>
@@ -784,7 +971,7 @@ function NoteDetail({ note, onBack, onDelete }) {
         {[["📝","note","Note"],["📋","summary","Summary"],["🧠","quiz","Quiz"]].map(function(item){return<button key={item[1]} onClick={function(){setView(item[1]);if(item[1]==="summary"&&!summary)generateSummary();if(item[1]==="quiz"&&quiz.length===0)generateQuiz();}} style={{ padding:"7px 16px",borderRadius:99,border:"none",background:view===item[1]?note.color:C.card2,color:view===item[1]?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer",marginTop:12 }}>{item[0]+" "+item[2]}</button>;})}
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:20 }}>
-        {view==="note"&&(<div><div style={{ display:"flex",alignItems:"center",gap:8,marginBottom:16 }}><span style={{ fontSize:11,fontWeight:700,color:note.color,background:note.bg,borderRadius:99,padding:"3px 12px" }}>{note.course}</span><span style={{ fontSize:11,color:C.muted }}>{formatRelativeDate(note.id)}</span></div><div style={{ background:C.card,borderRadius:18,padding:20,border:"1px solid "+C.border,marginBottom:16 }}><h2 style={{ color:C.text,fontSize:20,fontWeight:800,margin:"0 0 12px" }}>{note.title}</h2><div style={{ width:40,height:3,background:note.color,borderRadius:2,marginBottom:16 }}/><p style={{ margin:0,fontSize:14,color:"#CBD5E1",lineHeight:1.9,whiteSpace:"pre-line" }}>{note.content}</p></div><div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:10 }}><button onClick={function(){setView("summary");if(!summary)generateSummary();}} style={actionBtn(note.color)}>📋 AI Summary</button><button onClick={function(){setView("quiz");if(quiz.length===0)generateQuiz();}} style={actionBtn(C.purple)}>🧠 Quiz Me</button></div></div>)}
+        {view==="note"&&(<div><div style={{ display:"flex",alignItems:"center",gap:8,marginBottom:16 }}><span style={{ fontSize:11,fontWeight:700,color:note.color,background:note.bg,borderRadius:99,padding:"3px 12px" }}>{note.course}</span><span style={{ fontSize:11,color:C.muted }}>{formatRelativeDate(note.id)}</span></div><div style={{ background:C.card,borderRadius:18,padding:note.type==="drawing"?12:20,border:"1px solid "+C.border,marginBottom:16 }}>{note.type==="drawing"?<img src={note.content} alt={note.title} style={{ width:"100%",borderRadius:12,display:"block" }}/>:<div className="samx-md" style={{ fontSize:14,color:"#CBD5E1",lineHeight:1.9 }}><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>{note.content}</ReactMarkdown></div>}</div>{note.type!=="drawing"&&<div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:10 }}><button onClick={function(){setView("summary");if(!summary)generateSummary();}} style={actionBtn(note.color)}>📋 AI Summary</button><button onClick={function(){setView("quiz");if(quiz.length===0)generateQuiz();}} style={actionBtn(C.purple)}>🧠 Quiz Me</button></div>}</div>)}
         {view==="summary"&&(loading?<div style={{ textAlign:"center",padding:"60px 20px" }}><div style={{ fontSize:48,animation:"spin 2s linear infinite" }}>✨</div><p style={{ color:C.muted,marginTop:16 }}>Generating...</p></div>:summary?(<div><div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+C.border,marginBottom:14 }}><div style={{ fontSize:11,fontWeight:700,color:C.green,letterSpacing:1,marginBottom:10 }}>OVERVIEW</div><p style={{ margin:0,fontSize:14,color:"#CBD5E1",lineHeight:1.8 }}>{summary.summary}</p></div><div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+C.border,marginBottom:14 }}><div style={{ fontSize:11,fontWeight:700,color:C.amber,letterSpacing:1,marginBottom:12 }}>KEY POINTS</div>{summary.keyPoints&&summary.keyPoints.map(function(p,i){return<div key={i} style={{ display:"flex",gap:10,marginBottom:10 }}><div style={{ width:6,height:6,borderRadius:3,background:C.amber,marginTop:7,flexShrink:0 }}/><p style={{ margin:0,fontSize:14,color:"#CBD5E1",lineHeight:1.7 }}>{p}</p></div>;})}</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{summary.tags&&summary.tags.map(function(t){return<span key={t} style={{ background:C.card2,color:C.cyan,borderRadius:99,padding:"4px 14px",fontSize:12,fontWeight:700 }}>{t}</span>;})}</div></div>):null)}
         {view==="quiz"&&(loading?<div style={{ textAlign:"center",padding:"60px 20px" }}><div style={{ fontSize:48,animation:"spin 2s linear infinite" }}>🧠</div><p style={{ color:C.muted,marginTop:16 }}>Generating quiz...</p></div>:quizDone?(<div style={{ textAlign:"center",padding:"40px 20px" }}><div style={{ fontSize:64,marginBottom:16 }}>{score===quiz.length?"🏆":"📖"}</div><div style={{ fontSize:40,fontWeight:800,color:C.text }}>{score}/{quiz.length}</div><p style={{ color:C.muted,marginTop:8 }}>{score===quiz.length?"Perfect! 🔥":"Keep studying! 💪"}</p><button onClick={function(){setQuizIdx(0);setSelected(null);setScore(0);setQuizDone(false);}} style={{ marginTop:20,background:"linear-gradient(135deg,"+note.color+",#A78BFA)",color:"#fff",border:"none",borderRadius:14,padding:"13px 32px",fontWeight:800,fontSize:15,cursor:"pointer" }}>Try Again</button></div>):quiz.length>0?(<div><div style={{ display:"flex",justifyContent:"space-between",marginBottom:8 }}><span style={{ fontSize:13,color:C.muted }}>Question {quizIdx+1}/{quiz.length}</span><span style={{ fontSize:13,fontWeight:700,color:C.text }}>Score: {score}</span></div><div style={{ height:4,background:C.border,borderRadius:2,marginBottom:20 }}><div style={{ height:4,background:note.color,borderRadius:2,width:(quizIdx/quiz.length*100)+"%",transition:"width 0.3s" }}/></div><div style={{ background:C.card,borderRadius:16,padding:20,marginBottom:16,border:"1px solid "+C.border }}><p style={{ margin:0,fontSize:16,fontWeight:600,color:C.text,lineHeight:1.6 }}>{quiz[quizIdx].question}</p></div>{quiz[quizIdx].options.map(function(opt,i){var bg=C.card,border=C.border,color=C.text;if(selected!==null){if(i===quiz[quizIdx].answer){bg="rgba(52,211,153,0.15)";border="#34D399";color="#34D399";}else if(i===selected){bg="rgba(248,113,113,0.15)";border="#F87171";color="#F87171";}}return<button key={i} onClick={function(){pick(i);}} disabled={selected!==null} style={{ width:"100%",textAlign:"left",background:bg,border:"2px solid "+border,borderRadius:12,padding:"13px 16px",marginBottom:10,fontSize:14,color:color,cursor:selected!==null?"default":"pointer",fontWeight:500,display:"flex",gap:10,fontFamily:"inherit" }}><span style={{opacity:0.5}}>{String.fromCharCode(65+i)}.</span>{opt}</button>;})}</div>):null)}
       </div>
@@ -823,8 +1010,8 @@ function LibraryScreen({ notes, onNote, onDelete }) {
         ):(
           <div style={{ textAlign:"center",padding:"60px 20px" }}><div style={{ fontSize:52,marginBottom:12 }}>🔍</div><div style={{ fontWeight:800,fontSize:18,color:C.text,marginBottom:6 }}>No matches</div><div style={{ fontSize:13,color:C.muted }}>Try a different search term or clear your filters.</div></div>
         ))
-        :view==="grid"?(<div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:10 }}>{filtered.map(function(note){var isSelected=selected.includes(note.id);return<div key={note.id} style={{ background:C.card,border:"2px solid "+(isSelected?C.cyan:note.color+"22"),borderRadius:16,padding:14,cursor:"pointer",position:"relative" }} onClick={function(){onNote(note);}}><div onClick={function(e){e.stopPropagation();toggleSelect(note.id);}} style={{ position:"absolute",top:10,right:10,width:20,height:20,borderRadius:"50%",border:"2px solid "+(isSelected?C.cyan:C.border),background:isSelected?C.cyan:"transparent",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11 }}>{isSelected?"✓":""}</div><div style={{ width:36,height:36,borderRadius:10,background:note.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,marginBottom:10 }}>{note.tag==="Lecture"?"📚":note.tag==="Study"?"💡":note.tag==="Business"?"💼":"📝"}</div><div style={{ fontWeight:700,fontSize:13,color:C.text,marginBottom:4 }}>{note.title}</div><div style={{ fontSize:10,color:note.color,fontWeight:700,background:note.bg,borderRadius:99,padding:"2px 8px",display:"inline-block",marginBottom:6 }}>{note.course}</div><div style={{ fontSize:11,color:C.muted }}>{formatRelativeDate(note.id)}</div></div>;})}</div>)
-        :(filtered.map(function(note){var isSelected=selected.includes(note.id);return<div key={note.id} style={{ background:C.card,border:"2px solid "+(isSelected?C.cyan:note.color+"22"),borderRadius:16,padding:16,marginBottom:10,cursor:"pointer",display:"flex",gap:12,alignItems:"flex-start" }} onClick={function(){onNote(note);}}><div onClick={function(e){e.stopPropagation();toggleSelect(note.id);}} style={{ width:22,height:22,borderRadius:"50%",border:"2px solid "+(isSelected?C.cyan:C.border),background:isSelected?C.cyan:"transparent",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,flexShrink:0,marginTop:2 }}>{isSelected?"✓":""}</div><div style={{ width:42,height:42,borderRadius:12,background:note.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0 }}>{note.tag==="Lecture"?"📚":note.tag==="Study"?"💡":note.tag==="Business"?"💼":"📝"}</div><div style={{ flex:1 }}><div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:4 }}><div style={{ fontWeight:800,fontSize:14,color:C.text }}>{note.title}</div><div style={{ fontSize:11,color:C.muted,flexShrink:0,marginLeft:8 }}>{formatRelativeDate(note.id)}</div></div><div style={{ display:"flex",gap:6,marginBottom:6 }}><span style={{ fontSize:10,color:note.color,fontWeight:700,background:note.bg,borderRadius:99,padding:"2px 8px" }}>{note.course}</span><span style={{ fontSize:10,color:C.muted,background:"rgba(255,255,255,0.04)",borderRadius:99,padding:"2px 8px" }}>{note.tag}</span></div><div style={{ fontSize:12,color:C.muted,lineHeight:1.5,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden" }}>{note.preview}</div><div style={{ display:"flex",gap:12,marginTop:8 }}><span style={{ fontSize:11,color:C.soft }}>💬 {note.words||note.content.split(" ").length} words</span><span style={{ fontSize:11,color:note.color,marginLeft:"auto" }}>Open →</span></div></div></div>;}))}
+        :view==="grid"?(<div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:10 }}>{filtered.map(function(note){var isSelected=selected.includes(note.id);return<div key={note.id} style={{ background:C.card,border:"2px solid "+(isSelected?C.cyan:note.color+"22"),borderRadius:16,padding:14,cursor:"pointer",position:"relative" }} onClick={function(){onNote(note);}}><div onClick={function(e){e.stopPropagation();toggleSelect(note.id);}} style={{ position:"absolute",top:10,right:10,width:20,height:20,borderRadius:"50%",border:"2px solid "+(isSelected?C.cyan:C.border),background:isSelected?C.cyan:"transparent",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11 }}>{isSelected?"✓":""}</div><div style={{ width:36,height:36,borderRadius:10,background:note.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,marginBottom:10 }}>{note.type==="drawing"?"🎨":note.tag==="Lecture"?"📚":note.tag==="Study"?"💡":note.tag==="Business"?"💼":"📝"}</div><div style={{ fontWeight:700,fontSize:13,color:C.text,marginBottom:4 }}>{note.title}</div><div style={{ fontSize:10,color:note.color,fontWeight:700,background:note.bg,borderRadius:99,padding:"2px 8px",display:"inline-block",marginBottom:6 }}>{note.course}</div><div style={{ fontSize:11,color:C.muted }}>{formatRelativeDate(note.id)}</div></div>;})}</div>)
+        :(filtered.map(function(note){var isSelected=selected.includes(note.id);return<div key={note.id} style={{ background:C.card,border:"2px solid "+(isSelected?C.cyan:note.color+"22"),borderRadius:16,padding:16,marginBottom:10,cursor:"pointer",display:"flex",gap:12,alignItems:"flex-start" }} onClick={function(){onNote(note);}}><div onClick={function(e){e.stopPropagation();toggleSelect(note.id);}} style={{ width:22,height:22,borderRadius:"50%",border:"2px solid "+(isSelected?C.cyan:C.border),background:isSelected?C.cyan:"transparent",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,flexShrink:0,marginTop:2 }}>{isSelected?"✓":""}</div><div style={{ width:42,height:42,borderRadius:12,background:note.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0 }}>{note.type==="drawing"?"🎨":note.tag==="Lecture"?"📚":note.tag==="Study"?"💡":note.tag==="Business"?"💼":"📝"}</div><div style={{ flex:1 }}><div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:4 }}><div style={{ fontWeight:800,fontSize:14,color:C.text }}>{note.title}</div><div style={{ fontSize:11,color:C.muted,flexShrink:0,marginLeft:8 }}>{formatRelativeDate(note.id)}</div></div><div style={{ display:"flex",gap:6,marginBottom:6 }}><span style={{ fontSize:10,color:note.color,fontWeight:700,background:note.bg,borderRadius:99,padding:"2px 8px" }}>{note.course}</span><span style={{ fontSize:10,color:C.muted,background:"rgba(255,255,255,0.04)",borderRadius:99,padding:"2px 8px" }}>{note.tag}</span></div><div style={{ fontSize:12,color:C.muted,lineHeight:1.5,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden" }}>{note.preview}</div><div style={{ display:"flex",gap:12,marginTop:8 }}><span style={{ fontSize:11,color:C.soft }}>{note.type==="drawing"?"🎨 Drawing":"💬 "+(note.words||note.content.split(" ").length)+" words"}</span><span style={{ fontSize:11,color:note.color,marginLeft:"auto" }}>Open →</span></div></div></div>;}))}
       </div>
     </div>
   );
@@ -880,13 +1067,17 @@ function DashboardScreen({ notes, user, credits, plan }) {
 }
 
 // ── HOME ──────────────────────────────────────────────────────────────────────
-function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, onChat, user }) {
+function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, onChat, user, onNotifications, onProfile, unreadCount, profile }) {
   var [search,setSearch]=useState("");var [filter,setFilter]=useState("All");
   var filters=["All","Lecture","Study","Business","Personal"];
   var filtered=notes.filter(function(n){return(n.title.toLowerCase().includes(search.toLowerCase())||n.course.toLowerCase().includes(search.toLowerCase()))&&(filter==="All"||n.tag===filter);});
   var hour=new Date().getHours();
   var greeting=hour<12?"Good morning":hour<17?"Good afternoon":"Good evening";
   var firstName = user&&user.displayName ? user.displayName.split(" ")[0] : "Student";
+  var todayCount = notes.filter(function(n){ var r=formatRelativeDate(n.id); return r==="Just now"||/m ago$/.test(r)||r==="Today"; }).length;
+  var studyGoal = 3;
+  var lastNote = notes.length ? notes.slice().sort(function(a,b){return (b.id||0)-(a.id||0);})[0] : null;
+  var revisionNote = notes.length>1 ? notes.slice().sort(function(a,b){return (a.id||0)-(b.id||0);})[0] : null;
   return(
     <div style={{ flex:1,overflowY:"auto" }}>
       <div style={{ background:"linear-gradient(135deg,#0A0F1E 0%,#1E1B4B 60%,#0A0F1E 100%)",padding:"24px 20px 28px",position:"relative",overflow:"hidden" }}>
@@ -897,10 +1088,10 @@ function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, onChat,
             <span style={{ fontWeight:800,fontSize:20,color:C.text }}>Jotting <span style={{ color:C.cyan }}>AI</span></span>
           </div>
           <div style={{ display:"flex",gap:8 }}>
-            <button style={{ background:"rgba(255,255,255,0.08)",border:"none",borderRadius:10,width:38,height:38,cursor:"pointer",fontSize:17 }}>🔔</button>
-            <div style={{ width:38,height:38,borderRadius:"50%",overflow:"hidden",background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:17 }}>
+            <button onClick={onNotifications} style={{ position:"relative",background:"rgba(255,255,255,0.08)",border:"none",borderRadius:10,width:38,height:38,cursor:"pointer",fontSize:17 }}>🔔{unreadCount>0&&<span style={{ position:"absolute",top:-2,right:-2,background:C.red,color:"#fff",borderRadius:99,minWidth:16,height:16,fontSize:9,fontWeight:800,display:"flex",alignItems:"center",justifyContent:"center",padding:"0 3px" }}>{unreadCount>9?"9+":unreadCount}</span>}</button>
+            <button onClick={onProfile} style={{ width:38,height:38,borderRadius:"50%",overflow:"hidden",background:"linear-gradient(135deg,#06B6D4,#A78BFA)",border:"none",display:"flex",alignItems:"center",justifyContent:"center",fontSize:17,cursor:"pointer",padding:0 }}>
               {user&&user.photoURL?<img src={user.photoURL} alt="u" style={{ width:38,height:38,objectFit:"cover" }}/>:"👤"}
-            </div>
+            </button>
           </div>
         </div>
         <p style={{ color:"rgba(255,255,255,0.45)",fontSize:13,margin:"0 0 4px" }}>{greeting} 👋</p>
@@ -917,6 +1108,36 @@ function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, onChat,
             {[["🎙️","Voice\nNote",C.cyan,onVoice],["✨","AI\nWrite",C.purple,onAIWrite],["💬","AI\nChat",C.cyan,onChat],["📷","Scan\nDoc",C.amber,onScan],["🖊️","Draw",C.green,onDraw]].map(function(item){return<button key={item[1]} onClick={item[3]} style={{ background:C.card,border:"1px solid "+item[2]+"30",borderRadius:14,padding:"14px 8px",cursor:"pointer",textAlign:"center" }}><div style={{ width:38,height:38,borderRadius:10,background:item[2]+"20",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 8px",fontSize:20 }}>{item[0]}</div><span style={{ fontSize:11,fontWeight:700,color:C.soft,whiteSpace:"pre-line",lineHeight:1.3 }}>{item[1]}</span></button>;}) }
           </div>
         </div>
+        <div style={{ marginBottom:22 }}>
+          <p style={{ fontWeight:800,fontSize:16,color:C.text,margin:"0 0 14px" }}>Your Day</p>
+          <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:10 }}>
+            <div style={{ background:C.card,borderRadius:16,padding:16,border:"1px solid "+C.border }}>
+              <div style={{ fontSize:11,color:C.muted,fontWeight:700,marginBottom:8 }}>🎯 TODAY'S GOAL</div>
+              <div style={{ fontWeight:800,fontSize:20,color:C.text,marginBottom:6 }}>{Math.min(todayCount,studyGoal)}/{studyGoal}</div>
+              <div style={{ height:6,background:C.card2,borderRadius:99,overflow:"hidden" }}><div style={{ height:"100%",width:Math.min(100,(todayCount/studyGoal)*100)+"%",background:"linear-gradient(90deg,#06B6D4,#A78BFA)",borderRadius:99 }}/></div>
+              <div style={{ fontSize:11,color:C.muted,marginTop:6 }}>notes today</div>
+            </div>
+            <div style={{ background:"linear-gradient(135deg,#F59E0B15,#F59E0B05)",borderRadius:16,padding:16,border:"1px solid #F59E0B30" }}>
+              <div style={{ fontSize:11,color:C.muted,fontWeight:700,marginBottom:8 }}>🔥 STUDY STREAK</div>
+              <div style={{ fontWeight:800,fontSize:20,color:C.amber,marginBottom:6 }}>{(profile&&profile.streak)||0} day{((profile&&profile.streak)||0)===1?"":"s"}</div>
+              <div style={{ fontSize:11,color:C.muted }}>{(profile&&profile.streak)>=3?"Keep it up!":"Use the app daily to build a streak"}</div>
+            </div>
+            {lastNote && (
+              <button onClick={function(){onNote(lastNote);}} style={{ background:C.card,borderRadius:16,padding:16,border:"1px solid "+C.border,textAlign:"left",cursor:"pointer" }}>
+                <div style={{ fontSize:11,color:C.muted,fontWeight:700,marginBottom:8 }}>▶️ CONTINUE</div>
+                <div style={{ fontWeight:700,fontSize:13,color:C.text,marginBottom:4,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis" }}>{lastNote.title}</div>
+                <div style={{ fontSize:11,color:C.muted }}>{formatRelativeDate(lastNote.id)}</div>
+              </button>
+            )}
+            {revisionNote && (
+              <button onClick={function(){onNote(revisionNote);}} style={{ background:C.card,borderRadius:16,padding:16,border:"1px solid "+C.border,textAlign:"left",cursor:"pointer" }}>
+                <div style={{ fontSize:11,color:C.muted,fontWeight:700,marginBottom:8 }}>📖 REVISE THIS</div>
+                <div style={{ fontWeight:700,fontSize:13,color:C.text,marginBottom:4,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis" }}>{revisionNote.title}</div>
+                <div style={{ fontSize:11,color:C.muted }}>Haven't reviewed in a while</div>
+              </button>
+            )}
+          </div>
+        </div>
         <div style={{ display:"flex",gap:8,marginBottom:16,overflowX:"auto",paddingBottom:4 }}>
           {filters.map(function(f){return<button key={f} onClick={function(){setFilter(f);}} style={{ padding:"7px 16px",borderRadius:99,border:"none",background:filter===f?C.cyan:C.card,color:filter===f?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap",flexShrink:0 }}>{f}</button>;}) }
         </div>
@@ -925,7 +1146,7 @@ function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, onChat,
           <span style={{ fontSize:12,color:C.muted,fontWeight:600 }}>{filtered.length} notes</span>
         </div>
         {filtered.length===0?<div style={{ textAlign:"center",padding:"40px 20px" }}><div style={{ fontSize:48,marginBottom:12 }}>📝</div><p style={{ color:C.muted,fontSize:15 }}>No notes yet. Tap Voice Note to start!</p></div>
-        :filtered.slice(0,5).map(function(note){return<button key={note.id} onClick={function(){onNote(note);}} style={{ width:"100%",background:C.card,border:"1px solid "+note.color+"22",borderRadius:18,padding:16,marginBottom:12,cursor:"pointer",textAlign:"left" }}><div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10 }}><div style={{ display:"flex",alignItems:"center",gap:10 }}><div style={{ width:42,height:42,borderRadius:12,background:note.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,border:"1px solid "+note.color+"30",flexShrink:0 }}>{note.tag==="Lecture"?"📚":note.tag==="Study"?"💡":note.tag==="Business"?"💼":"📝"}</div><div><div style={{ fontWeight:800,fontSize:14,color:C.text,marginBottom:3 }}>{note.title}</div><span style={{ fontSize:11,fontWeight:700,color:note.color,background:note.bg,borderRadius:99,padding:"2px 8px" }}>{note.course}</span></div></div><div style={{ textAlign:"right" }}><div style={{ fontSize:11,color:C.muted,marginBottom:4 }}>{formatRelativeDate(note.id)}</div><span style={{ background:note.bg,borderRadius:99,padding:"2px 8px",fontSize:10,fontWeight:700,color:note.color }}>{note.tag}</span></div></div><p style={{ margin:"0 0 10px",fontSize:13,color:C.muted,lineHeight:1.6,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden" }}>{note.preview}</p><div style={{ display:"flex",alignItems:"center",paddingTop:10,borderTop:"1px solid "+C.border }}><span style={{ fontSize:11,color:C.muted }}>✨ AI features available</span><span style={{ fontSize:11,color:note.color,marginLeft:"auto",fontWeight:700 }}>Open →</span></div></button>;})}
+        :filtered.slice(0,5).map(function(note){return<button key={note.id} onClick={function(){onNote(note);}} style={{ width:"100%",background:C.card,border:"1px solid "+note.color+"22",borderRadius:18,padding:16,marginBottom:12,cursor:"pointer",textAlign:"left" }}><div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10 }}><div style={{ display:"flex",alignItems:"center",gap:10 }}><div style={{ width:42,height:42,borderRadius:12,background:note.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,border:"1px solid "+note.color+"30",flexShrink:0 }}>{note.type==="drawing"?"🎨":note.tag==="Lecture"?"📚":note.tag==="Study"?"💡":note.tag==="Business"?"💼":"📝"}</div><div><div style={{ fontWeight:800,fontSize:14,color:C.text,marginBottom:3 }}>{note.title}</div><span style={{ fontSize:11,fontWeight:700,color:note.color,background:note.bg,borderRadius:99,padding:"2px 8px" }}>{note.course}</span></div></div><div style={{ textAlign:"right" }}><div style={{ fontSize:11,color:C.muted,marginBottom:4 }}>{formatRelativeDate(note.id)}</div><span style={{ background:note.bg,borderRadius:99,padding:"2px 8px",fontSize:10,fontWeight:700,color:note.color }}>{note.tag}</span></div></div><p style={{ margin:"0 0 10px",fontSize:13,color:C.muted,lineHeight:1.6,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden" }}>{note.preview}</p><div style={{ display:"flex",alignItems:"center",paddingTop:10,borderTop:"1px solid "+C.border }}><span style={{ fontSize:11,color:C.muted }}>✨ AI features available</span><span style={{ fontSize:11,color:note.color,marginLeft:"auto",fontWeight:700 }}>Open →</span></div></button>;})}
       </div>
     </div>
   );
@@ -1155,8 +1376,6 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession 
 
   return(
     <div style={{ flex:1, display:"flex", flexDirection:"column", background:C.bg, position:"relative" }}>
-      <style>{".samx-md p{margin:4px 0}.samx-md ul,.samx-md ol{padding-left:20px;margin:6px 0}.samx-md h1,.samx-md h2,.samx-md h3{margin:10px 0 6px;font-size:15px}.samx-md code{background:rgba(6,182,212,0.15);color:#06B6D4;padding:2px 6px;border-radius:5px;font-size:13px;font-family:monospace}.samx-md pre{background:#0A0F1E;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:12px;overflow-x:auto;margin:8px 0}.samx-md pre code{background:transparent;color:#E2E8F0;padding:0}.samx-md table{border-collapse:collapse;width:100%;font-size:13px;margin:8px 0}.samx-md th,.samx-md td{border:1px solid rgba(255,255,255,0.08);padding:6px 10px;text-align:left}.samx-md th{background:rgba(255,255,255,0.05)}.samx-md blockquote{border-left:3px solid #06B6D4;padding-left:10px;margin:8px 0;color:#94A3B8}"}</style>
-
       <div style={{ background:C.card, padding:"16px 20px", borderBottom:"1px solid "+C.border, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
         <div style={{ display:"flex", alignItems:"center", gap:10 }}>
           <button onClick={onBack} style={backBtn}>←</button>
@@ -1334,6 +1553,115 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession 
   );
 }
 
+// ── PROFILE & ACCOUNT ──────────────────────────────────────────────────────────
+function ProfileScreen({ onBack, user, plan, credits, profile, onSaveProfile, onLogout }) {
+  var [school, setSchool] = useState(profile.school||"");
+  var [department, setDepartment] = useState(profile.department||"");
+  var [level, setLevel] = useState(profile.level||"");
+  var [saving, setSaving] = useState(false);
+  var [saved, setSaved] = useState(false);
+  var [resetSent, setResetSent] = useState(false);
+
+  var dirty = school!==(profile.school||"") || department!==(profile.department||"") || level!==(profile.level||"");
+
+  async function save(){
+    setSaving(true);
+    await onSaveProfile({ school:school.trim(), department:department.trim(), level:level });
+    setSaving(false);
+    setSaved(true);
+    setTimeout(function(){setSaved(false);}, 2000);
+  }
+
+  async function changePassword(){
+    if(!user||!user.email) return;
+    try{ await sendPasswordResetEmail(auth, user.email); setResetSent(true); }
+    catch(e){ alert("Couldn't send reset email — try again in a moment."); }
+  }
+
+  return (
+    <div style={{ flex:1, background:C.bg, display:"flex", flexDirection:"column" }}>
+      <div style={{ background:C.card, padding:"16px 20px", display:"flex", alignItems:"center", gap:12, borderBottom:"1px solid "+C.border }}>
+        <button onClick={onBack} style={backBtn}>←</button>
+        <span style={{ fontWeight:800, fontSize:16, color:C.text }}>Profile & Account</span>
+      </div>
+      <div style={{ flex:1, overflowY:"auto", padding:20 }}>
+        <div style={{ textAlign:"center", marginBottom:24 }}>
+          <div style={{ width:84,height:84,borderRadius:"50%",overflow:"hidden",background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:36,margin:"0 auto 14px" }}>
+            {user&&user.photoURL ? <img src={user.photoURL} alt="profile" style={{ width:84,height:84,objectFit:"cover" }}/> : "👤"}
+          </div>
+          <div style={{ fontWeight:800, fontSize:18, color:C.text }}>{(user&&user.displayName)||"Student"}</div>
+          <div style={{ fontSize:13, color:C.muted }}>{user&&user.email}</div>
+          <span style={{ display:"inline-block", marginTop:8, background:(PLANS[plan]||PLANS.free).color+"25", color:(PLANS[plan]||PLANS.free).color, borderRadius:99, padding:"4px 14px", fontSize:12, fontWeight:700 }}>{(PLANS[plan]||PLANS.free).name} Plan · {credits} credits</span>
+        </div>
+
+        <div style={{ background:C.card, borderRadius:16, padding:18, marginBottom:16, border:"1px solid "+C.border }}>
+          <div style={{ fontWeight:800, fontSize:14, color:C.text, marginBottom:14 }}>Academic Info</div>
+          <label style={{ fontSize:12, color:C.muted, fontWeight:600 }}>School</label>
+          <input value={school} onChange={function(e){setSchool(e.target.value);}} placeholder="e.g. University of Lagos" style={{ width:"100%", padding:"11px 14px", borderRadius:12, border:"1px solid "+C.border, background:C.bg, color:C.text, fontSize:14, outline:"none", margin:"6px 0 14px", boxSizing:"border-box" }}/>
+          <label style={{ fontSize:12, color:C.muted, fontWeight:600 }}>Department</label>
+          <input value={department} onChange={function(e){setDepartment(e.target.value);}} placeholder="e.g. Computer Science" style={{ width:"100%", padding:"11px 14px", borderRadius:12, border:"1px solid "+C.border, background:C.bg, color:C.text, fontSize:14, outline:"none", margin:"6px 0 14px", boxSizing:"border-box" }}/>
+          <label style={{ fontSize:12, color:C.muted, fontWeight:600 }}>Level</label>
+          <div style={{ display:"flex", gap:8, marginTop:6, flexWrap:"wrap" }}>
+            {["100L","200L","300L","400L","500L","Postgrad"].map(function(lv){return<button key={lv} onClick={function(){setLevel(lv);}} style={{ padding:"7px 14px", borderRadius:99, border:"2px solid", borderColor:level===lv?C.cyan:C.border, background:level===lv?C.cyan:C.card2, color:level===lv?"#0A0F1E":C.muted, fontSize:12, fontWeight:700, cursor:"pointer" }}>{lv}</button>;})}
+          </div>
+          {dirty && <button onClick={save} disabled={saving} style={{ width:"100%", marginTop:16, background:saving?C.card2:"linear-gradient(135deg,#06B6D4,#A78BFA)", color:saving?C.muted:"#fff", border:"none", borderRadius:12, padding:"12px", fontWeight:800, fontSize:14, cursor:saving?"default":"pointer" }}>{saving?"Saving...":"Save Changes"}</button>}
+          {saved && <div style={{ textAlign:"center", color:C.green, fontSize:12, fontWeight:700, marginTop:10 }}>✓ Saved</div>}
+        </div>
+
+        <div style={{ background:C.card, borderRadius:16, border:"1px solid "+C.border, overflow:"hidden", marginBottom:16 }}>
+          <Row icon="⭐" label="Subscription" sub={(PLANS[plan]||PLANS.free).name+" plan"}/>
+          <Row icon="🔥" label="Study Streak" sub={(profile.streak||0)+" day"+(profile.streak===1?"":"s")+" in a row"}/>
+          <Row icon="🔑" label="Change Password" sub={resetSent?"Reset email sent — check your inbox":"Sends a reset link to your email"} onPress={changePassword}/>
+        </div>
+
+        <button onClick={onLogout} style={{ width:"100%", background:"rgba(248,113,113,0.1)", border:"1px solid rgba(248,113,113,0.3)", borderRadius:14, padding:"14px", color:C.red, fontWeight:800, fontSize:14, cursor:"pointer" }}>Log Out</button>
+      </div>
+    </div>
+  );
+}
+
+// ── NOTIFICATION CENTER ────────────────────────────────────────────────────────
+function NotificationScreen({ onBack, notifications, onMarkRead, onMarkAllRead, notifEnabled, setNotifEnabled }) {
+  var TYPE_ICON = { study:"📚", ai_complete:"✨", streak:"🔥", app_update:"🚀", assignment:"📋", daily:"🎯", recording:"🎙️" };
+  var unreadCount = notifications.filter(function(n){return !n.read;}).length;
+  return (
+    <div style={{ flex:1, background:C.bg, display:"flex", flexDirection:"column" }}>
+      <div style={{ background:C.card, padding:"16px 20px", display:"flex", justifyContent:"space-between", alignItems:"center", borderBottom:"1px solid "+C.border }}>
+        <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+          <button onClick={onBack} style={backBtn}>←</button>
+          <span style={{ fontWeight:800, fontSize:16, color:C.text }}>Notifications</span>
+        </div>
+        {unreadCount>0 && <button onClick={onMarkAllRead} style={{ background:"none", border:"none", color:C.cyan, fontSize:12, fontWeight:700, cursor:"pointer" }}>Mark all read</button>}
+      </div>
+      <div style={{ flex:1, overflowY:"auto", padding:20 }}>
+        <div style={{ background:C.card, borderRadius:14, padding:"14px 16px", marginBottom:18, display:"flex", justifyContent:"space-between", alignItems:"center", border:"1px solid "+C.border }}>
+          <div><div style={{ fontWeight:700, fontSize:14, color:C.text }}>Push Notifications</div><div style={{ fontSize:12, color:C.muted }}>Study reminders and alerts on your device</div></div>
+          <Toggle value={notifEnabled} onChange={function(v){ setNotifEnabled(v); if(v) requestNotificationPermission(); }} color={C.purple}/>
+        </div>
+        {notifications.length===0 ? (
+          <div style={{ textAlign:"center", padding:"60px 20px" }}>
+            <div style={{ fontSize:48, marginBottom:12 }}>🔔</div>
+            <div style={{ fontWeight:700, fontSize:16, color:C.text, marginBottom:6 }}>All caught up</div>
+            <div style={{ fontSize:13, color:C.muted }}>Study reminders, AI completions, and streak milestones will show up here.</div>
+          </div>
+        ) : notifications.map(function(n){return(
+          <button key={n.id} onClick={function(){ if(!n.read) onMarkRead(n.id); }} style={{ width:"100%", textAlign:"left", display:"flex", gap:12, background:n.read?C.card:C.card2, border:"1px solid "+(n.read?C.border:C.cyan+"40"), borderRadius:14, padding:14, marginBottom:10, cursor:"pointer" }}>
+            <div style={{ width:38,height:38,borderRadius:10,background:C.card2,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0 }}>{TYPE_ICON[n.type]||"🔔"}</div>
+            <div style={{ minWidth:0, flex:1 }}>
+              <div style={{ display:"flex", justifyContent:"space-between", gap:8 }}>
+                <span style={{ fontWeight:700, fontSize:14, color:C.text }}>{n.title}</span>
+                {!n.read && <span style={{ width:8,height:8,borderRadius:"50%",background:C.cyan,flexShrink:0,marginTop:5 }}/>}
+              </div>
+              <div style={{ fontSize:13, color:C.muted, marginTop:2, lineHeight:1.5 }}>{n.message}</div>
+              <div style={{ fontSize:11, color:C.muted, marginTop:6 }}>{formatRelativeDate(n.ts)}</div>
+            </div>
+          </button>
+        );})}
+      </div>
+    </div>
+  );
+}
+
 // ── PRICING / UPGRADE ─────────────────────────────────────────────────────────
 function PricingScreen({ onBack, plan, credits }) {
   var [cycle, setCycle] = useState("monthly");
@@ -1436,10 +1764,6 @@ function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings
   function Section({ id, icon, title, color, children }) {
     var isOpen=openSection===id;
     return<div style={{ background:C.card,borderRadius:16,marginBottom:12,border:"1px solid "+C.border,overflow:"hidden" }}><button onClick={function(){setOpenSection(isOpen?null:id);}} style={{ width:"100%",display:"flex",justifyContent:"space-between",alignItems:"center",padding:"16px",background:"none",border:"none",cursor:"pointer" }}><div style={{ display:"flex",alignItems:"center",gap:12 }}><div style={{ width:36,height:36,borderRadius:10,background:color+"20",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18 }}>{icon}</div><span style={{ fontWeight:700,fontSize:15,color:C.text }}>{title}</span></div><span style={{ color:C.muted,fontSize:20 }}>{isOpen?"v":">"}</span></button>{isOpen&&<div style={{ padding:"0 16px 16px",borderTop:"1px solid "+C.border }}>{children}</div>}</div>;
-  }
-
-  function Row({ icon, label, sub, right, danger, onPress }) {
-    return<div onClick={onPress} style={{ display:"flex",alignItems:"center",justifyContent:"space-between",padding:"13px 0",borderBottom:"1px solid "+C.border,cursor:onPress?"pointer":"default" }}><div style={{ display:"flex",alignItems:"center",gap:10 }}>{icon&&<span style={{ fontSize:18 }}>{icon}</span>}<div><div style={{ fontSize:14,fontWeight:600,color:danger?C.red:C.text }}>{label}</div>{sub&&<div style={{ fontSize:11,color:C.muted,marginTop:1 }}>{sub}</div>}</div></div>{right!==undefined?right:<span style={{ color:C.muted,fontSize:16 }}>›</span>}</div>;
   }
 
   return(
@@ -1562,8 +1886,41 @@ export default function App() {
   });
   var [plan, setPlan] = useState("free");
   var [credits, setCredits] = useState(PLANS.free.monthlyCredits);
+  var [profile, setProfile] = useState({ school:"", department:"", level:"", streak:0 });
+  var [notifEnabled, setNotifEnabled] = useState(function(){ try{ return localStorage.getItem("jotting_notifEnabled")==="1"; }catch(e){ return false; } });
+  useEffect(function(){ try{ localStorage.setItem("jotting_notifEnabled", notifEnabled?"1":"0"); }catch(e){} }, [notifEnabled]);
+  var [notifCenter, setNotifCenter] = useState([]);
   useEffect(function(){ try{ localStorage.setItem("jotting_recQuality", recQuality); }catch(e){} }, [recQuality]);
   useEffect(function(){ try{ localStorage.setItem("jotting_recSettings", JSON.stringify(recSettings)); }catch(e){} }, [recSettings]);
+
+  function addNotification(type, title, message){
+    setNotifCenter(function(list){
+      var updated = [makeNotif(type,title,message), ...list].slice(0,50);
+      if (user) persistNotifsLocal(user.uid, updated);
+      return updated;
+    });
+    if (notifEnabled) sendNotification(title, message);
+  }
+  var addNotificationRef = useRef(addNotification);
+  useEffect(function(){ addNotificationRef.current = addNotification; }); // no dep array: refreshes every render, always current
+  function markNotifRead(id){
+    setNotifCenter(function(list){
+      var updated = list.map(function(n){ return n.id===id ? {...n, read:true} : n; });
+      if (user) persistNotifsLocal(user.uid, updated);
+      return updated;
+    });
+  }
+  function markAllNotifsRead(){
+    setNotifCenter(function(list){
+      var updated = list.map(function(n){ return {...n, read:true}; });
+      if (user) persistNotifsLocal(user.uid, updated);
+      return updated;
+    });
+  }
+  async function saveProfile(fields){
+    setProfile(function(p){ return {...p, ...fields}; });
+    if (user) await saveProfileFields(user.uid, fields);
+  }
 
   // Let any AI helper function (defined outside this component) update the credit
   // balance shown here, and let any screen jump to the upgrade page, without props
@@ -1572,7 +1929,7 @@ export default function App() {
     updateGlobalCredits = function(remaining){ setCredits(remaining); };
     triggerUpgradeScreen = function(){ setScreen("pricing"); };
     return function(){ updateGlobalCredits = function(){}; triggerUpgradeScreen = function(){}; };
-  }, []);
+  }, [user]);
 
   // Listen for auth state
   useEffect(function() {
@@ -1620,6 +1977,22 @@ export default function App() {
           setPlan(account.plan||"free");
           setCredits(displayCredits);
         });
+        var cachedNotifs = loadNotifsLocal(firebaseUser.uid);
+        if (cachedNotifs.length > 0) setNotifCenter(cachedNotifs);
+        // App update announcements: bump this version string whenever you ship something
+        // worth telling students about, and each user sees the update notice once.
+        var APP_UPDATE_VERSION = "2026-07-subscriptions";
+        if (localStorage.getItem("jotting_lastUpdateSeen_"+firebaseUser.uid) !== APP_UPDATE_VERSION) {
+          addNotificationRef.current("app_update", "🚀 New: Plans & AI Credits", "Jotting AI now has Free, Pro, and Premium plans — check Settings to see your usage.");
+          localStorage.setItem("jotting_lastUpdateSeen_"+firebaseUser.uid, APP_UPDATE_VERSION);
+        }
+        loadOrInitProfile(firebaseUser.uid).then(function(prof){
+          setProfile(prof);
+          var milestones = [3,7,14,30,60,100];
+          if (milestones.indexOf(prof.streak)!==-1) {
+            addNotificationRef.current("streak", "🔥 "+prof.streak+"-day streak!", "You've used Jotting AI "+prof.streak+" days in a row. Keep it going!");
+          }
+        });
         var isNew = !localStorage.getItem("jotting_seen_"+firebaseUser.uid);
         if (isNew) { setShowOnboarding(true); localStorage.setItem("jotting_seen_"+firebaseUser.uid,"1"); }
       } else {
@@ -1628,6 +2001,8 @@ export default function App() {
         setChatSessions([]);
         setPlan("free");
         setCredits(PLANS.free.monthlyCredits);
+        setProfile({ school:"", department:"", level:"", streak:0 });
+        setNotifCenter([]);
         setAuthLoading(false);
       }
     });
@@ -1643,6 +2018,7 @@ export default function App() {
       if (user) persistNotesLocal(user.uid, updated);
       return updated;
     });
+    addNotification("ai_complete", "✨ Note ready", "\""+newNote.title+"\" has been generated and saved to your Library.");
     go("home","home");
     // Sync to Firestore in the background — a slow/broken connection should
     // never block the user from saving and moving on.
@@ -1719,9 +2095,9 @@ export default function App() {
   // Onboarding
   if (showOnboarding) {
     return (
-      <div style={{ minHeight:"100vh",background:"#06081A",display:"flex",justifyContent:"center",alignItems:"flex-start",padding:"20px 0" }}>
+      <div style={{ height:"100dvh",background:"#06081A",display:"flex",justifyContent:"center",alignItems:"center",overflow:"hidden" }}>
         <style>{"@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');*{box-sizing:border-box;font-family:'DM Sans',sans-serif;}body{margin:0;background:#06081A;}button,textarea,input{font-family:'DM Sans',sans-serif;}::-webkit-scrollbar{width:0;}@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}"}</style>
-        <div style={{ width:"100%",maxWidth:400,minHeight:"calc(100vh - 40px)",background:C.bg,borderRadius:36,overflow:"hidden",display:"flex",flexDirection:"column",boxShadow:"0 24px 80px rgba(6,182,212,0.12)" }}>
+        <div style={{ width:"100%",maxWidth:400,height:"100dvh",background:C.bg,overflow:"hidden",display:"flex",flexDirection:"column",boxShadow:"0 24px 80px rgba(6,182,212,0.12)" }}>
           <OnboardingScreen onDone={function(){setShowOnboarding(false);}}/>
         </div>
       </div>
@@ -1731,9 +2107,9 @@ export default function App() {
   // Login screen
   if (!user) {
     return (
-      <div style={{ minHeight:"100vh",background:"#06081A",display:"flex",justifyContent:"center",alignItems:"flex-start",padding:"20px 0" }}>
+      <div style={{ height:"100dvh",background:"#06081A",display:"flex",justifyContent:"center",alignItems:"center",overflow:"hidden" }}>
         <style>{"@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');*{box-sizing:border-box;font-family:'DM Sans',sans-serif;}body{margin:0;background:#06081A;}button,textarea,input{font-family:'DM Sans',sans-serif;}::-webkit-scrollbar{width:0;}input::placeholder{color:#4B5563;}@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}"}</style>
-        <div style={{ width:"100%",maxWidth:400,minHeight:"calc(100vh - 40px)",background:C.bg,borderRadius:36,overflow:"hidden",display:"flex",flexDirection:"column",boxShadow:"0 24px 80px rgba(6,182,212,0.12)" }}>
+        <div style={{ width:"100%",maxWidth:400,height:"100dvh",background:C.bg,overflow:"hidden",display:"flex",flexDirection:"column",boxShadow:"0 24px 80px rgba(6,182,212,0.12)" }}>
           <LoginScreen onLogin={function(u){setUser(u);}}/>
         </div>
       </div>
@@ -1742,22 +2118,24 @@ export default function App() {
 
   // Main app
   return (
-    <div style={{ minHeight:"100vh",background:"#06081A",display:"flex",justifyContent:"center",alignItems:"flex-start",padding:"20px 0" }}>
-      <style>{"\n@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');\n*{box-sizing:border-box;font-family:'DM Sans',sans-serif;}\nbody{margin:0;background:#06081A;}\nbutton,textarea,input{font-family:'DM Sans',sans-serif;}\n::-webkit-scrollbar{width:0;}\ninput::placeholder,textarea::placeholder{color:#4B5563;}\n@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}\n@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0.4)}50%{box-shadow:0 0 0 20px rgba(239,68,68,0)}}\n@keyframes wv{from{transform:scaleY(0.3)}to{transform:scaleY(1.2)}}\n@keyframes dot{from{opacity:0.3;transform:scale(0.7)}to{opacity:1;transform:scale(1)}}\n"}</style>
-      <div style={{ width:"100%",maxWidth:400,minHeight:"calc(100vh - 40px)",background:C.bg,borderRadius:36,overflow:"hidden",display:"flex",flexDirection:"column",boxShadow:"0 24px 80px rgba(6,182,212,0.12), 0 0 0 1px rgba(255,255,255,0.06)" }}>
+    <div style={{ height:"100dvh",background:"#06081A",display:"flex",justifyContent:"center",alignItems:"center",overflow:"hidden" }}>
+      <style>{"\n@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');\n*{box-sizing:border-box;font-family:'DM Sans',sans-serif;}\nhtml,body{height:100%;overflow:hidden;position:fixed;width:100%;margin:0;background:#06081A;}\nbutton,textarea,input{font-family:'DM Sans',sans-serif;}\n::-webkit-scrollbar{width:0;}\ninput::placeholder,textarea::placeholder{color:#4B5563;}\n@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}\n@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0.4)}50%{box-shadow:0 0 0 20px rgba(239,68,68,0)}}\n@keyframes wv{from{transform:scaleY(0.3)}to{transform:scaleY(1.2)}}\n@keyframes dot{from{opacity:0.3;transform:scale(0.7)}to{opacity:1;transform:scale(1)}}\n.samx-md p{margin:6px 0;}\n.samx-md ul,.samx-md ol{padding-left:20px;margin:8px 0;}\n.samx-md li{margin:4px 0;}\n.samx-md h1{margin:4px 0 14px;font-size:22px;font-weight:800;color:#F1F5F9;border-bottom:2px solid rgba(6,182,212,0.3);padding-bottom:8px;}\n.samx-md h2{margin:20px 0 8px;font-size:16px;font-weight:800;color:#06B6D4;}\n.samx-md h3{margin:12px 0 6px;font-size:14px;font-weight:700;color:#A78BFA;}\n.samx-md strong{color:#F1F5F9;}\n.samx-md code{background:rgba(6,182,212,0.15);color:#06B6D4;padding:2px 6px;border-radius:5px;font-size:13px;font-family:monospace;}\n.samx-md pre{background:#0A0F1E;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:12px;overflow-x:auto;margin:8px 0;}\n.samx-md pre code{background:transparent;color:#E2E8F0;padding:0;}\n.samx-md table{border-collapse:collapse;width:100%;font-size:13px;margin:10px 0;}\n.samx-md th,.samx-md td{border:1px solid rgba(255,255,255,0.08);padding:6px 10px;text-align:left;}\n.samx-md th{background:rgba(255,255,255,0.05);}\n.samx-md blockquote{border-left:3px solid #06B6D4;padding-left:10px;margin:8px 0;color:#94A3B8;}\n"}</style>
+      <div style={{ width:"100%",maxWidth:400,height:"100dvh",background:C.bg,overflow:"hidden",display:"flex",flexDirection:"column",boxShadow:"0 24px 80px rgba(6,182,212,0.12), 0 0 0 1px rgba(255,255,255,0.06)" }}>
         {cloudLoading&&<div style={{ background:"rgba(6,182,212,0.1)",padding:"10px",textAlign:"center",fontSize:12,color:C.cyan,fontWeight:600 }}>☁️ Syncing your notes...</div>}
         <div style={{ flex:1,display:"flex",flexDirection:"column",overflowY:"auto",minHeight:0 }}>
-          {screen==="home"&&<HomeScreen notes={notes} user={user} onNote={function(n){setActiveNote(n);go("detail");}} onVoice={function(){go("voice","new");}} onDraw={function(){go("draw");}} onAIWrite={function(){go("aiwrite");}} onScan={function(){go("scan");}} onChat={function(){go("ai");}}/>}
+          {screen==="home"&&<HomeScreen notes={notes} user={user} profile={profile} onNote={function(n){setActiveNote(n);go("detail");}} onVoice={function(){go("voice","new");}} onDraw={function(){go("draw");}} onAIWrite={function(){go("aiwrite");}} onScan={function(){go("scan");}} onChat={function(){go("ai");}} onNotifications={function(){setScreen("notifications");}} onProfile={function(){setScreen("profile");}} unreadCount={notifCenter.filter(function(n){return !n.read;}).length}/>}
           {screen==="library"&&<LibraryScreen notes={notes} onNote={function(n){setActiveNote(n);go("detail");}} onDelete={deleteNote}/>}
           {screen==="dashboard"&&<DashboardScreen notes={notes} user={user} credits={credits} plan={plan}/>}
           {screen==="detail"&&activeNote&&<NoteDetail note={activeNote} onBack={function(){go(tab==="library"?"library":"home",tab);}} onDelete={deleteNote}/>}
           {screen==="voice"&&<VoiceNoteScreen onBack={function(){go("home","home");}} onSave={saveNote} recQuality={recQuality} recSettings={recSettings}/>}
-          {screen==="draw"&&<DrawScreen onBack={function(){go("home","home");}}/>}
+          {screen==="draw"&&<DrawScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
           {screen==="aiwrite"&&<AIWriteScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
           {screen==="scan"&&<ScanDocScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
           {screen==="ai"&&<AIScreen notes={notes} onBack={function(){go("home","home");}} chatSessions={chatSessions} onSaveSession={saveChatSession} onDeleteSession={deleteChatSession}/>}
           {screen==="settings"&&<SettingsScreen user={user} onLogout={handleLogout} recQuality={recQuality} setRecQuality={setRecQuality} recSettings={recSettings} setRecSettings={setRecSettings} plan={plan} credits={credits} onViewPlans={function(){setScreen("pricing");}}/>}
           {screen==="pricing"&&<PricingScreen onBack={function(){go("settings","settings");}} plan={plan} credits={credits}/>}
+          {screen==="notifications"&&<NotificationScreen onBack={function(){go(tab,tab);}} notifications={notifCenter} onMarkRead={markNotifRead} onMarkAllRead={markAllNotifsRead} notifEnabled={notifEnabled} setNotifEnabled={setNotifEnabled}/>}
+          {screen==="profile"&&<ProfileScreen onBack={function(){go(tab,tab);}} user={user} plan={plan} credits={credits} profile={profile} onSaveProfile={saveProfile} onLogout={handleLogout}/>}
         </div>
         <div style={{ background:C.card2,borderTop:"1px solid "+C.border,padding:"10px 10px 16px",display:"flex",justifyContent:"space-around",alignItems:"center",flexShrink:0 }}>
           {NAV.map(function(item){return(
