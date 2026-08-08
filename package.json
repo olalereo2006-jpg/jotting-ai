@@ -17,6 +17,7 @@
     "rehype-katex": "^7.0.1",
     "remark-gfm": "^4.0.1",
     "remark-math": "^6.0.0",
+    "web-push": "^3.6.7",
     "web-vitals": "^2.1.4"
   },
   "scripts": {
