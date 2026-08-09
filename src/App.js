@@ -845,7 +845,6 @@ function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings, onSaveRecord
   // this screen is freshly mounted each time it's navigated to (conditionally rendered
   // by App based on `screen`), so resumeAudio is only ever meant to be consumed once,
   // at open time — re-running this on every resumeAudio identity change isn't wanted.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(function(){
     if (resumeAudio && resumeAudio.blob) {
       partsRef.current = [resumeAudio.blob];
@@ -855,7 +854,7 @@ function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings, onSaveRecord
       setPhase("stopped");
       setStatus("Recording loaded — choose what kind of notes you'd like.");
     }
-  }, []);
+  }, [resumeAudio]); 
 
   useEffect(function(){
     return function(){
