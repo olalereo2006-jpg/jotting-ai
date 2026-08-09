@@ -33,7 +33,6 @@ const googleProvider = new GoogleAuthProvider();
 // The matching SECRET key belongs only on the server — see netlify/functions/manage-subscription.js.
 const PAYSTACK_PUBLIC_KEY = "pk_test_844aba6310fb21c4d884d331382792495bc5b1e5";
 
-
 // Web Push VAPID public key — identifies your server to browsers' push services so a
 // push subscription can only be used by you, not anyone who happens to see the endpoint
 // URL. Safe to ship client-side (that's the whole point of the public/private split).
@@ -41,7 +40,6 @@ const PAYSTACK_PUBLIC_KEY = "pk_test_844aba6310fb21c4d884d331382792495bc5b1e5";
 // set as a Netlify env var for netlify/functions/send-reminders.js. Regenerate anytime
 // with `npx web-push generate-vapid-keys` if you'd rather use your own.
 const VAPID_PUBLIC_KEY = "BFedshU80TzJPnPEB0FQHUMpQ3CMxuA9ObT84auybyoLBwix2g8zvwf02j-tFlffG6OGA3Z-T7WxrcOx5l7pOwU";
-
 // ── Theme system ────────────────────────────────────────────────────────────
 // `C` is read all over the app as plain property access (C.bg, C.text, ...) at
 // render time rather than being destructured once — so switching themes is just
@@ -511,11 +509,8 @@ function persistPrivacySettings(userId, settings){
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 // ── Browser push notifications (for study reminders) ───────────────────────────
-function requestNotificationPermission(){
-  if ("Notification" in window && Notification.permission==="default") {
-    Notification.requestPermission().catch(function(){});
-  }
-}
+// Permission is now requested inside subscribeToPush() as part of the real push
+// subscription flow, so there's no separate standalone "just ask permission" step.
 function sendNotification(title, body){
   if ("Notification" in window && Notification.permission==="granted") {
     try{ new Notification(title, { body:body, icon:"/favicon.ico" }); }catch(e){}
@@ -846,7 +841,11 @@ function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings, onSaveRecord
   function removeCourse(c){if(c==="General")return;setCourses(function(p){return p.filter(function(x){return x!==c;});});if(course===c)setCourse("General");}
 
   // If we arrived here via "Transcribe" on a previously saved-for-later recording, load
-  // its audio straight in and skip live recording entirely.
+  // its audio straight in and skip live recording entirely. Deliberately mount-once:
+  // this screen is freshly mounted each time it's navigated to (conditionally rendered
+  // by App based on `screen`), so resumeAudio is only ever meant to be consumed once,
+  // at open time — re-running this on every resumeAudio identity change isn't wanted.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(function(){
     if (resumeAudio && resumeAudio.blob) {
       partsRef.current = [resumeAudio.blob];
