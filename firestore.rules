@@ -1,0 +1,114 @@
+// firestore.rules
+//
+// Audited against every collection/doc(db,...) and collection(db,...) call actually
+// present in App_login.js — nothing here is guessed. Two ownership patterns are used,
+// matching how the client writes data:
+//   (a) doc ID IS the uid (accounts, profiles)              → check request.auth.uid == docId
+//   (b) doc ID is auto-generated or client-chosen, but the   → check a `userId`/`uid` field
+//       document carries an owner field (notes, recordings,    on the document instead
+//       chats, assignments, pushSubscriptions)
+//
+// Deploy with: firebase deploy --only firestore:rules
+// (requires firestore.rules to be referenced in firebase.json — see note at the bottom)
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── accounts/{uid} — plan + AI credits ──────────────────────────────────
+    // THE critical one. Server (Admin SDK, via manage-subscription.js / generate.js)
+    // is the ONLY writer — Admin SDK calls bypass these rules entirely, so
+    // `allow write: if false` does not block your own server functions, only the
+    // browser. If this were ever relaxed to allow client writes, a technical student
+    // could set their own plan to "premium" and credits to any number for free.
+    match /accounts/{uid} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow write: if false;
+    }
+
+    // ── notes/{noteId} ───────────────────────────────────────────────────────
+    match /notes/{noteId} {
+      allow read, delete: if request.auth != null && request.auth.uid == resource.data.userId;
+      allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
+      // On update, also forbid changing which user a doc belongs to — otherwise an
+      // owner could "reassign" their own note's userId field to someone else's uid.
+      allow update: if request.auth != null && request.auth.uid == resource.data.userId
+                    && request.resource.data.userId == resource.data.userId;
+    }
+
+    // ── recordings/{recordingId} — Firestore metadata only; the actual audio file
+    // lives in Storage and is governed separately by storage.rules below.
+    match /recordings/{recordingId} {
+      allow read, delete: if request.auth != null && request.auth.uid == resource.data.userId;
+      allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
+      allow update: if request.auth != null && request.auth.uid == resource.data.userId
+                    && request.resource.data.userId == resource.data.userId;
+    }
+
+    // ── chats/{chatId} — SAM-X conversation history ─────────────────────────
+    match /chats/{chatId} {
+      allow read, delete: if request.auth != null && request.auth.uid == resource.data.userId;
+      allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
+      allow update: if request.auth != null && request.auth.uid == resource.data.userId
+                    && request.resource.data.userId == resource.data.userId;
+    }
+
+    // ── assignments/{assignmentId} ───────────────────────────────────────────
+    match /assignments/{assignmentId} {
+      allow read, delete: if request.auth != null && request.auth.uid == resource.data.userId;
+      allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
+      allow update: if request.auth != null && request.auth.uid == resource.data.userId
+                    && request.resource.data.userId == resource.data.userId;
+      // NOTE: send-reminders.js updates `lastRemindedDate` on this doc via the
+      // Admin SDK, which — same as accounts — bypasses these rules entirely, so this
+      // owner-only rule doesn't need a carve-out for it.
+    }
+
+    // ── examResults/{resultId} — Exam Mode score history (Advanced Analytics) ──
+    // Added when Exam Mode started persisting attempts instead of being fully
+    // ephemeral. Same owner-only pattern as notes/recordings/chats/assignments —
+    // no fraud value here (worst case a student fakes their own score history,
+    // which only misleads themselves), so no special server-only lockdown needed.
+    match /examResults/{resultId} {
+      allow read, delete: if request.auth != null && request.auth.uid == resource.data.userId;
+      allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
+      allow update: if request.auth != null && request.auth.uid == resource.data.userId
+                    && request.resource.data.userId == resource.data.userId;
+    }
+
+    // ── profiles/{uid} — school/department/level/streak/notifPrefs ──────────
+    // Deliberately client-writable, unlike accounts: nothing stored here has fraud
+    // value. Worst case a student edits their own streak number or notification
+    // preferences, which only affects their own experience.
+    match /profiles/{uid} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // ── pushSubscriptions/{uid}_{deviceHash} — Web Push endpoints ────────────
+    // Doc IDs follow a "{uid}_{hash}" convention, but rules can't reliably parse
+    // that back apart — ownership is enforced via the `uid` FIELD instead, same
+    // pattern as notes/recordings/chats/assignments (which use `userId`; this
+    // collection uses `uid` — check App_login.js's subscribeToPush if that ever
+    // changes). No fraud risk either way: owning a subscription doc only lets you
+    // (un)subscribe your own device, never touch credits or another account.
+    match /pushSubscriptions/{subId} {
+      allow read, delete: if request.auth != null && request.auth.uid == resource.data.uid;
+      allow create: if request.auth != null && request.auth.uid == request.resource.data.uid;
+      allow update: if request.auth != null && request.auth.uid == resource.data.uid
+                    && request.resource.data.uid == resource.data.uid;
+    }
+
+    // Deny anything not explicitly matched above. Redundant with Firestore's own
+    // default-deny behavior, but left in on purpose so intent is explicit — if you
+    // add a new collection later and forget to add a rule for it, this still blocks
+    // it rather than silently falling through to an implicit allow.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
+
+// ── firebase.json ────────────────────────────────────────────────────────────
+// If you don't already have Firestore rules configured, make sure firebase.json
+// points at this file, e.g.:
+//   { "firestore": { "rules": "firestore.rules" } }

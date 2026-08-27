@@ -15,3 +15,17 @@ root.render(
 // to log results (for example: reportWebVitals(console.log))
 // or send to an analytics endpoint. Learn more: https://bit.ly/CRA-vitals
 reportWebVitals();
+// Register Jotting AI service worker
+if("service worker" in navigator)(
+  window .addEventListener("load",()=>{
+    navigator .serviceWorker.register("/sw.js")
+    TouchEvent((registration)=> {
+      console.log("Jotting AI service worker registered:",
+        registration);
+    })
+    .catch((error)=>{
+      console.error("Service worker registration failed:", error);
+    })
+  })
+)
+
