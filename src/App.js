@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { initializeApp } from "firebase/app";
-import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, sendPasswordResetEmail, GoogleAuthProvider, signInWithPopup } from "firebase/auth";
+import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, sendPasswordResetEmail, sendEmailVerification, GoogleAuthProvider, signInWithPopup } from "firebase/auth";
 import { getFirestore, collection, addDoc, getDocs, getDoc, deleteDoc, doc, setDoc, query, where } from "firebase/firestore";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -20,6 +20,7 @@ import { buildRecommendations, WEAK_TOPIC_MASTERY_THRESHOLD, EXAM_PREP_MASTERY_T
 import { updateTopicMasteryFromQuizAttempt } from "./services/topicMasteryService";
 import { materialsRepository, MATERIAL_TYPES } from "./repositories/materialsRepository";
 import { coursesRepository } from "./repositories/coursesRepository";
+import { semestersRepository } from "./repositories/semestersRepository";
 
 // ── Firebase Config ───────────────────────────────────────────────────────────
 const firebaseConfig = {
@@ -46,7 +47,8 @@ const googleProvider = new GoogleAuthProvider();
 // popup, never move money or touch account data on its own. Get this from your
 // Paystack dashboard (Settings → API Keys) and swap in your live key when ready.
 // The matching SECRET key belongs only on the server — see netlify/functions/manage-subscription.js.
-const PAYSTACK_PUBLIC_KEY = "pk_test_REPLACE_WITH_YOUR_PAYSTACK_PUBLIC_KEY";
+//const PAYSTACK_PUBLIC_KEY = "pk_test_REPLACE_WITH_YOUR_PAYSTACK_PUBLIC_KEY";
+const PAYSTACK_PUBLIC_KEY = "pk_live_35f814871b22cf97cf0fdf9007d2be2e82300aca";
 
 // Web Push VAPID public key — identifies your server to browsers' push services so a
 // push subscription can only be used by you, not anyone who happens to see the endpoint
@@ -54,7 +56,8 @@ const PAYSTACK_PUBLIC_KEY = "pk_test_REPLACE_WITH_YOUR_PAYSTACK_PUBLIC_KEY";
 // This one was freshly generated for you — pair it with the matching VAPID_PRIVATE_KEY
 // set as a Netlify env var for netlify/functions/send-reminders.js. Regenerate anytime
 // with `npx web-push generate-vapid-keys` if you'd rather use your own.
-const VAPID_PUBLIC_KEY = "BCewO3bPQScLntwHiEpsHOCfNSPtl5I7CaqnbkE_dQk12bh9bbuyVsyYxAFkoNgifT1eD9wXTFyDfDksrvE1SsY";
+//const VAPID_PUBLIC_KEY = "BCewO3bPQScLntwHiEpsHOCfNSPtl5I7CaqnbkE_dQk12bh9bbuyVsyYxAFkoNgifT1eD9wXTFyDfDksrvE1SsY";
+const VAPID_PUBLIC_KEY = "BFedshU80TzJPnPEB0FQHUMpQ3CMxuA9ObT84auybyoLBwix2g8zvwf02j-tFlffG6OGA3Z-T7WxrcOx5l7pOwU";
 
 // ── Theme system ────────────────────────────────────────────────────────────
 // `C` is read all over the app as plain property access (C.bg, C.text, ...) at
@@ -95,8 +98,8 @@ function applyTheme(name){
 // so if you change numbers here, update that file too.
 const PLANS = {
   free:    { id:"free",    name:"Free",    priceMonthly:0,   priceYearly:0,     monthlyCredits:60,   color:C.muted,  tagline:"Get started",          features:["Unlimited notes & Library","60 AI credits / month","Voice recording & transcription","AI Chat, Scan Doc & quizzes"] },
-  pro:     { id:"pro",     name:"Pro",     priceMonthly:550, priceYearly:5500,  monthlyCredits:400,  color:C.cyan,   tagline:"For regular studying",   features:["Everything in Free","400 AI credits / month","Faster, priority AI responses","More cloud storage","Priority support"] },
-  premium: { id:"premium", name:"Premium", priceMonthly:1500,priceYearly:15000, monthlyCredits:1500, color:C.purple, tagline:"For serious exam prep",  features:["Everything in Pro","1,500 AI credits / month","AI Study Planner","Exam Mode","Advanced AI Tutor","Advanced analytics & maximum storage"] },
+  pro:     { id:"pro",     name:"Pro",     priceMonthly:550, priceYearly:5500,  monthlyCredits:400,  color:C.cyan,   tagline:"For regular studying",   features:["Everything in Free","400 AI credits / month","Faster, priority AI responses","Priority support","AI Study Planner","Advanced AI Tutor","Advanced Analytics","More cloud storage"] },
+  premium: { id:"premium", name:"Premium", priceMonthly:1500,priceYearly:15000, monthlyCredits:1500, color:C.purple, tagline:"For serious exam prep",  features:["Everything in Pro","1,500 AI credits / month","Exam Mode","Maximum storage"] },
 };
 const LOW_CREDIT_WARNING_THRESHOLD = 10;
 
@@ -382,13 +385,11 @@ async function deleteRecordingMeta(recordingId){
   try{ await deleteDoc(doc(db,"recordings",recordingId)); }catch(e){ console.error("Recording meta delete error:", e); }
 }
 async function loadRecordingsFromCloud(userId){
-  try{
-    var q = query(collection(db,"recordings"), where("userId","==",userId));
-    var snap = await getDocs(q);
-    var list = snap.docs.map(function(d){ return d.data(); });
-    list.sort(function(a,b){ return (b.createdAt||0)-(a.createdAt||0); });
-    return list;
-  }catch(e){ console.error("Recordings load error:", e); return []; }
+  var q = query(collection(db,"recordings"), where("userId","==",userId));
+  var snap = await getDocs(q);
+  var list = snap.docs.map(function(d){ return d.data(); });
+  list.sort(function(a,b){ return (b.createdAt||0)-(a.createdAt||0); });
+  return list;
 }
 // ── Recording metadata: local durable cache — now IndexedDB via recordingsRepository ──
 // Recording METADATA (title/course/duration/size/mimeType/transcribed/noteId) used
@@ -435,13 +436,27 @@ async function migrateRecordingsFromLocalStorage(uid){
 
 // Reconciles the repository with a freshly computed "merged" recordings list
 // (local ∪ Firestore) — the same full-replace job persistRecordingsLocal used to
-// do against localStorage: anything no longer in the merged list is removed
+// do against localStorage: anything CONFIRMED no longer valid is removed
 // locally too, everything else is written/updated.
-async function syncRecordingsToRepository(uid, recordingsList){
+//
+// baselineIds: the ids recordingsRepository.list() returned at the very start
+// of this login/reload cycle, BEFORE the Firestore fetch that produced
+// `recordingsList` ran — same protection as assignmentsRepository's equivalent
+// sync function, and for the same reason. This matters MORE here than
+// anywhere else: a recording's metadata entry is the only thing that makes
+// its audio Blob (in the separate jotting_audio_db) reachable at all. A
+// student very often opens Jotting specifically to record a lecture — if
+// this reconcile treats "not in my merge result yet" as "confirmed gone" and
+// purges a just-saved recording's metadata, the actual audio bytes are left
+// behind as an orphaned, unreachable Blob nobody can get back to. Only a
+// record that was part of the STARTING snapshot and is now missing from
+// `recordingsList` counts as "confirmed gone" (e.g. deleted on another
+// device); anything created mid-cycle is left alone.
+async function syncRecordingsToRepository(uid, recordingsList, baselineIds){
   var existing = await recordingsRepository.list(uid);
   var keepIds = {};
   recordingsList.forEach(function(r){ keepIds[r.id] = true; });
-  var stale = existing.filter(function(r){ return !keepIds[r.id]; });
+  var stale = existing.filter(function(r){ return baselineIds[r.id] && !keepIds[r.id]; });
   await Promise.all(stale.map(function(r){ return recordingsRepository.delete(r.id); }));
   await Promise.all(recordingsList.map(function(r){ return recordingsRepository.create(r); }));
 }
@@ -765,13 +780,11 @@ async function saveAssignmentToCloud(userId, assignment) {
   } catch(e) { console.error("Assignment save error:", e); return null; }
 }
 async function loadAssignmentsFromCloud(userId) {
-  try {
-    var q = query(collection(db, "assignments"), where("userId","==",userId));
-    var snap = await getDocs(q);
-    var list = snap.docs.map(function(d){ return {...d.data(), firestoreId:d.id}; });
-    list.sort(function(a,b){ return (a.dueDate||"").localeCompare(b.dueDate||""); });
-    return list;
-  } catch(e) { console.error("Assignments load error:", e); return []; }
+  var q = query(collection(db, "assignments"), where("userId","==",userId));
+  var snap = await getDocs(q);
+  var list = snap.docs.map(function(d){ return {...d.data(), firestoreId:d.id}; });
+  list.sort(function(a,b){ return (a.dueDate||"").localeCompare(b.dueDate||""); });
+  return list;
 }
 async function deleteAssignmentFromCloud(firestoreId) {
   try { await deleteDoc(doc(db, "assignments", firestoreId)); } catch(e) { console.error("Assignment delete error:", e); }
@@ -823,13 +836,25 @@ async function migrateAssignmentsFromLocalStorage(uid){
 
 // Reconciles the repository with a freshly computed "merged" assignments list
 // (unsynced local ∪ Firestore) — the same full-replace job persistAssignmentsLocal
-// used to do against localStorage: anything no longer in the merged list is removed
+// used to do against localStorage: anything CONFIRMED no longer valid is removed
 // locally too (e.g. deleted from another device), everything else written/updated.
-async function syncAssignmentsToRepository(uid, assignmentsList){
+//
+// baselineIds: the ids assignmentsRepository.list() returned at the very start
+// of this login/reload cycle, BEFORE the Firestore fetch that produced
+// `assignmentsList` ran. Only a record that was part of THAT starting
+// snapshot and is now missing from `assignmentsList` counts as "confirmed
+// gone" and gets purged. A record NOT in the baseline — created locally
+// while this reconcile was still in flight (e.g. the student added an
+// assignment moments after opening the app) — is left alone even though
+// this particular merge doesn't know about it yet. Not knowing about
+// something yet is never the same as it being deleted; treating the two the
+// same is what let a brand-new assignment get wiped from IndexedDB before it
+// ever reached Firestore.
+async function syncAssignmentsToRepository(uid, assignmentsList, baselineIds){
   var existing = await assignmentsRepository.list(uid);
   var keepIds = {};
   assignmentsList.forEach(function(a){ keepIds[a.id] = true; });
-  var stale = existing.filter(function(a){ return !keepIds[a.id]; });
+  var stale = existing.filter(function(a){ return baselineIds[a.id] && !keepIds[a.id]; });
   await Promise.all(stale.map(function(a){ return assignmentsRepository.delete(a.id); }));
   await Promise.all(assignmentsList.map(function(a){ return assignmentsRepository.create(a); }));
 }
@@ -875,7 +900,73 @@ async function loadOrInitAccount(userId) {
 }
 function currentMonthKey(){ var d=new Date(); return d.getFullYear()+"-"+d.getMonth(); }
 
-// ── Profile (school/department/level) + daily study streak ────────────────────
+// ── Local plan entitlement (Paystack verification durability) ──────────────────
+// loadOrInitAccount above is correctly Firestore-only for CREDITS — that's a
+// metered, server-consumed resource, and the server must stay the sole writer.
+// But it means the student's unlocked PLAN has exactly one path to survive a
+// refresh or re-login: a specific Firestore write on the server completing
+// successfully. If that write is ever delayed, dropped, or fails for any
+// reason after a payment that genuinely WAS verified moments earlier
+// (verifyAndApply below did get a success response from the server), the
+// plan silently reverts to Free next time the account loads — the student
+// paid, the payment was verified, and the app still shows them as Free.
+//
+// This is a local, durable record of a server-verified entitlement, so the
+// unlock survives independently of that one Firestore write. It is written
+// in exactly one place (verifyAndApply's success path) — directly after a
+// genuine server verify_payment success — never from Paystack's own
+// client-side popup callback alone, and never from merely tapping Upgrade.
+// Firestore/loadOrInitAccount is untouched and still runs on every login;
+// this only steps in when its result would otherwise contradict a payment
+// this same device already had verified.
+var PLAN_RANK = { free:0, pro:1, premium:2 };
+// Shared "does this plan meet or exceed this tier" check, used by every feature
+// gate below instead of each screen re-deriving its own plan==="premium" string
+// comparison. Pass tier "pro" for a feature Pro-and-above can use (Advanced AI
+// Tutor, AI Study Planner, Advanced Analytics); pass tier "premium" for a
+// feature that stays genuinely Premium-only (Exam Mode).
+function planAtLeast(plan, tier){ return (PLAN_RANK[plan]||0) >= (PLAN_RANK[tier]||0); }
+function loadLocalEntitlement(userId){
+  try{ var raw = localStorage.getItem("jotting_entitlement_"+userId); return raw ? JSON.parse(raw) : null; }
+  catch(e){ return null; }
+}
+function persistLocalEntitlement(userId, entitlement){
+  try{ localStorage.setItem("jotting_entitlement_"+userId, JSON.stringify(entitlement)); }catch(e){}
+}
+function clearLocalEntitlement(userId){
+  try{ localStorage.removeItem("jotting_entitlement_"+userId); }catch(e){}
+}
+// Resolves the plan/credits to actually use at login: Firestore's account
+// data, unless a locally-verified entitlement outranks it — the one case
+// that matters is exactly the bug above (Firestore says Free, but this
+// device verified a paid plan). A local entitlement can never rank BELOW
+// what Firestore reports without an explicit downgrade clearing it (see
+// startDowngrade in PricingScreen), so this never fights a Firestore value
+// that's already correct or has since moved further ahead (e.g. upgraded
+// again from a different device).
+function resolveAccountWithLocalEntitlement(userId, account){
+  var monthKey = currentMonthKey();
+  var resolvedPlan = account.plan||"free";
+  var displayCredits = account.creditsMonthKey !== monthKey
+    ? (PLANS[resolvedPlan]||PLANS.free).monthlyCredits
+    : (typeof account.credits==="number" ? account.credits : PLANS.free.monthlyCredits);
+  var localEntitlement = loadLocalEntitlement(userId);
+  if (localEntitlement && (PLAN_RANK[localEntitlement.plan]||0) > (PLAN_RANK[resolvedPlan]||0)) {
+    resolvedPlan = localEntitlement.plan;
+    // This branch only fires when Firestore's plan is STRICTLY lower-ranked
+    // than the verified local entitlement — meaning Firestore's account doc
+    // doesn't reflect this plan at all yet, so whatever credit number it
+    // has belongs to that lower (wrong) plan and is never usable here,
+    // current month or not. Always use the correct plan's own allotment.
+    // (If Firestore ever does catch up and report this same plan, ranks
+    // become equal, this branch stops firing, and Firestore's own
+    // server-tracked live balance takes over naturally — see below.)
+    displayCredits = localEntitlement.monthlyCredits;
+  }
+  return { plan:resolvedPlan, credits:displayCredits };
+}
+
+// ── Profile (school/faculty/department/level) + daily study streak ────────────
 // Unlike credits, a streak is just a motivational number — no real harm if a
 // student could nudge it, so this collection can be read/written directly by its
 // own owner (unlike the locked-down `accounts` collection).
@@ -887,7 +978,7 @@ async function loadOrInitProfile(userId) {
     var snap = await getDoc(ref);
     var today = dayKey();
     if (!snap.exists()) {
-      var fresh = { school:"", department:"", level:"", streak:1, lastActiveDay:today };
+      var fresh = { school:"", faculty:"", department:"", level:"", streak:1, lastActiveDay:today };
       await setDoc(ref, fresh);
       return fresh;
     }
@@ -900,7 +991,7 @@ async function loadOrInitProfile(userId) {
       return updated;
     }
     return data;
-  } catch(e) { console.error("Profile load error:", e); return { school:"", department:"", level:"", streak:1, lastActiveDay:dayKey() }; }
+  } catch(e) { console.error("Profile load error:", e); return { school:"", faculty:"", department:"", level:"", streak:1, lastActiveDay:dayKey() }; }
 }
 async function saveProfileFields(userId, fields) {
   try { await setDoc(doc(db, "profiles", userId), fields, { merge:true }); } catch(e) { console.error("Profile save error:", e); }
@@ -915,8 +1006,8 @@ function loadNotifsLocal(userId) {
 function persistNotifsLocal(userId, list) {
   try { localStorage.setItem("jotting_notifcenter_"+userId, JSON.stringify(list)); } catch(e){}
 }
-function makeNotif(type, title, message){
-  return { id:"n_"+Date.now()+"_"+Math.floor(Math.random()*1000), type:type, title:title, message:message, ts:Date.now(), read:false };
+function makeNotif(type, title, message, route){
+  return { id:"n_"+Date.now()+"_"+Math.floor(Math.random()*1000), type:type, title:title, message:message, ts:Date.now(), read:false, route:route||null };
 }
 
 // ── PIN Lock (device-level convenience lock, not encryption) ───────────────────
@@ -1012,19 +1103,81 @@ function Row({ icon, label, sub, right, danger, onPress }) {
 var backBtn = { background:"rgba(255,255,255,0.08)",border:"none",borderRadius:10,width:36,height:36,cursor:"pointer",color:"#fff",fontSize:18,display:"flex",alignItems:"center",justifyContent:"center" };
 function actionBtn(color){ return { background:color+"15",border:"1px solid "+color+"40",borderRadius:12,padding:"12px",fontSize:13,fontWeight:700,color:color,cursor:"pointer",fontFamily:"inherit" }; }
 
+// ── Shared Course picker (real Course IDs) ──────────────────────────────────
+// One picker, used everywhere a screen previously had its own ad-hoc course
+// list — VoiceNoteScreen's own working-but-ephemeral "+Add Course" (never
+// persisted, reset on remount), ScanDocScreen/DrawScreen/CreateNoteScreen/
+// AIWriteScreen's fully hardcoded ["General","PHY 101",...] arrays (unrelated
+// to the student's real data), and AssignmentsScreen/StudyPlannerScreen/
+// ExamModeScreen's note-derived-only lists. That fragmentation — seven
+// independent course-list derivations, only one of which ever wrote anywhere
+// real — is exactly what real Course records (coursesRepository) fix.
+//
+// `realCourses` — the actual persisted Course records (App's `courses` state).
+// `legacyNames` — optional plain-text course names from existing notes/
+// assignments/recordings that predate real Course records — still shown so
+// nothing a student already typed disappears from any picker, purely additive
+// display, never written back as a Course unless the student explicitly adds it.
+// `value`/`onSelect` for single-select; `values`/`onToggle` for multi-select
+// (StudyPlannerScreen). `onCreateCourse(codeText)` calls App's real addCourse
+// handler — from here on, "Add Course" persists for real instead of resetting
+// the moment the screen unmounts.
+//
+// Deliberately NO inline delete/remove chip here (VoiceNoteScreen's old
+// removeCourse() only ever deleted from that screen's own local, ephemeral
+// list — harmless). A real Course is a persisted entity now; removing one is a
+// deliberate action that belongs in a dedicated course-management surface, not
+// a stray "X" a student can tap by accident while jotting a lecture note.
+// updateCourseRecord/deleteCourseRecord already exist at the App level, ready
+// for that surface whenever it's built — just not wired to any UI yet.
+function CourseChipPicker({ realCourses, legacyNames, value, values, multi, onSelect, onToggle, onCreateCourse, color }){
+  var accent = color || C.cyan;
+  var [showAdd, setShowAdd] = useState(false);
+  var [draft, setDraft] = useState("");
+  var realNames = (realCourses||[]).map(function(c){ return c.code || c.title; }).filter(Boolean);
+  var allNames = Array.from(new Set(["General"].concat(realNames).concat(legacyNames||[])));
+  var isSelected = multi
+    ? function(n){ return (values||[]).includes(n); }
+    : function(n){ return value===n; };
+  function pick(n){ multi ? onToggle(n) : onSelect(n); }
+  async function submitAdd(){
+    var code = draft.trim().toUpperCase();
+    if (!code) return;
+    if (allNames.includes(code)) { pick(code); setDraft(""); setShowAdd(false); return; }
+    var created = await onCreateCourse(code);
+    pick(code);
+    setDraft(""); setShowAdd(false);
+    return created;
+  }
+  return (
+    <div>
+      <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10 }}>
+        <span style={{ fontSize:13,fontWeight:700,color:C.soft }}>{multi?"Select Courses":"Select Course"}</span>
+        <button onClick={function(){setShowAdd(function(s){return !s;});}} style={{ background:accent+"20",border:"1px solid "+accent+"40",borderRadius:8,padding:"5px 12px",color:accent,fontSize:12,fontWeight:700,cursor:"pointer" }}>+ Add Course</button>
+      </div>
+      {showAdd&&(<div style={{ background:C.card2,borderRadius:14,padding:14,marginBottom:12,border:"1px solid "+accent+"30" }}><div style={{ display:"flex",gap:8 }}><input value={draft} onChange={function(e){setDraft(e.target.value);}} onKeyDown={function(e){if(e.key==="Enter")submitAdd();}} placeholder="e.g. BIO 201" style={{ flex:1,padding:"10px 14px",borderRadius:10,border:"1px solid "+C.border,background:C.bg,color:C.text,outline:"none",fontSize:14 }}/><button onClick={submitAdd} style={{ background:accent,border:"none",borderRadius:10,padding:"10px 16px",color:"#0A0F1E",fontWeight:800,cursor:"pointer" }}>Add</button><button onClick={function(){setShowAdd(false);}} style={{ background:C.card,border:"1px solid "+C.border,borderRadius:10,padding:"10px 12px",color:C.muted,cursor:"pointer" }}>X</button></div></div>)}
+      <div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{allNames.map(function(n){ var sel=isSelected(n); return(
+        <button key={n} onClick={function(){pick(n);}} style={{ padding:"7px 14px",borderRadius:99,border:"2px solid",borderColor:sel?accent:C.border,background:sel?accent:C.card,color:sel?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{n}</button>
+      );})}</div>
+    </div>
+  );
+}
+
 // ── ONBOARDING SCREEN ─────────────────────────────────────────────────────────
 function OnboardingScreen({ onDone }) {
   var [page, setPage] = useState(0);
   var pages = [
-    { icon:"🎵", title:"Welcome to Jotting AI", desc:"The smartest note-taking app for Nigerian university students", color:"#06B6D4", bg:"linear-gradient(135deg,#0A0F1E,#1E1B4B)" },
+    { icon:"🎵", iconImg:"/jotting-logo.png", title:"Welcome to Jotting AI", desc:"The smartest note-taking app for Nigerian university students", color:"#06B6D4", bg:"linear-gradient(135deg,#0A0F1E,#1E1B4B)" },
     { icon:"🎙️", title:"Record Your Lectures", desc:"Record your lecturer's voice and our AI converts it to perfect notes automatically", color:"#A78BFA", bg:"linear-gradient(135deg,#0A0F1E,#1E0B4B)" },
-    { icon:"🤖", title:"AI-Powered Learning", desc:"Get instant summaries, quizzes, and flashcards from your notes using SAM-X AI", color:"#34D399", bg:"linear-gradient(135deg,#0A0F1E,#0B1E1B)" },
+    { icon:"🤖", iconImg:"/samx-logo.png", title:"AI-Powered Learning", desc:"Get instant summaries, quizzes, and flashcards from your notes using SAM-X AI", color:"#34D399", bg:"linear-gradient(135deg,#0A0F1E,#0B1E1B)" },
     { icon:"📚", title:"Study Smarter", desc:"Library, Dashboard, Push Notifications — everything you need to ace your exams", color:"#F59E0B", bg:"linear-gradient(135deg,#0A0F1E,#1E1A0A)" },
   ];
   var p = pages[page];
   return (
     <div style={{ flex:1,background:p.bg,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:32,textAlign:"center" }}>
-      <div style={{ fontSize:80,marginBottom:24 }}>{p.icon}</div>
+      {p.iconImg
+        ? <div style={{ width:96,height:96,borderRadius:26,overflow:"hidden",marginBottom:24 }}><img src={p.iconImg} alt="" style={{ width:"100%",height:"100%",objectFit:"cover" }}/></div>
+        : <div style={{ fontSize:80,marginBottom:24 }}>{p.icon}</div>}
       <h1 style={{ color:C.text,fontSize:26,fontWeight:800,margin:"0 0 14px",letterSpacing:-0.5 }}>{p.title}</h1>
       <p style={{ color:C.muted,fontSize:15,lineHeight:1.7,margin:"0 0 40px" }}>{p.desc}</p>
       {/* Dots */}
@@ -1062,6 +1215,9 @@ function LoginScreen({ onLogin }) {
       "auth/too-many-requests": "Too many attempts. Please wait and try again.",
       "auth/network-request-failed": "No internet connection. Check your network.",
       "auth/popup-closed-by-user": "Google sign-in was cancelled.",
+      "auth/popup-blocked": "Your browser blocked the sign-in popup. Please allow popups for this site and try again.",
+      "auth/cancelled-popup-request": "Please wait for the current sign-in attempt to finish before trying again.",
+      "auth/account-exists-with-different-credential": "This email is already registered with a password. Try logging in with your email and password instead.",
     };
     return msgs[code] || "Something went wrong. Please try again.";
   }
@@ -1075,8 +1231,9 @@ function LoginScreen({ onLogin }) {
       if (mode === "signup") {
         var cred = await createUserWithEmailAndPassword(auth, email.trim(), password);
         await updateProfile(cred.user, { displayName: name.trim() });
-        setSuccess("Account created successfully!");
-        onLogin(cred.user);
+        try{ await sendEmailVerification(cred.user); }catch(e){ console.error("Verification email send failed:", e); }
+        setSuccess("Account created! We've sent a verification link to your email.");
+        onLogin(cred.user, { justSignedUp:true });
       } else {
         var loginCred = await signInWithEmailAndPassword(auth, email.trim(), password);
         onLogin(loginCred.user);
@@ -1088,12 +1245,26 @@ function LoginScreen({ onLogin }) {
   }
 
   async function handleGoogle() {
-    setLoading(true); setError("");
+    setLoading(true); setError(""); setSuccess("");
     try {
       var result = await signInWithPopup(auth, googleProvider);
       onLogin(result.user);
     } catch(e) {
-      setError(getErrorMsg(e.code));
+      // Some hosting setups (Netlify's default headers among them) send a
+      // Cross-Origin-Opener-Policy that blocks the channel Firebase uses to
+      // confirm the popup's result, so it falls back to polling
+      // window.closed — which COOP also blocks — and reports
+      // "popup-closed-by-user" even when sign-in genuinely succeeded and
+      // Firebase's own auth state already updated. Trusting that code at
+      // face value was showing "cancelled" for logins that actually worked.
+      // auth.currentUser reflects Firebase's real internal state regardless
+      // of whether the popup could report back, so check that before
+      // concluding the person actually cancelled.
+      if (e.code==="auth/popup-closed-by-user" && auth.currentUser) {
+        onLogin(auth.currentUser);
+      } else {
+        setError(getErrorMsg(e.code));
+      }
     }
     setLoading(false);
   }
@@ -1114,7 +1285,7 @@ function LoginScreen({ onLogin }) {
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
       {/* Header */}
       <div style={{ background:"linear-gradient(135deg,#0A0F1E,#1E1B4B)",padding:"40px 24px 32px",textAlign:"center" }}>
-        <div style={{ width:70,height:70,borderRadius:20,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:34,margin:"0 auto 16px" }}>🎵</div>
+        <div style={{ width:70,height:70,borderRadius:20,overflow:"hidden",margin:"0 auto 16px" }}><img src="/jotting-logo.png" alt="Jotting AI" style={{ width:"100%",height:"100%",objectFit:"cover" }}/></div>
         <h1 style={{ color:C.text,fontSize:26,fontWeight:800,margin:"0 0 6px" }}>Jotting <span style={{ color:C.cyan }}>AI</span></h1>
         <p style={{ color:C.muted,fontSize:13,margin:0 }}>Smart notes for Nigerian students</p>
       </div>
@@ -1225,7 +1396,7 @@ function LoginScreen({ onLogin }) {
 }
 
 // ── VOICE SCREEN ──────────────────────────────────────────────────────────────
-function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings, onSaveRecording, onDeleteRecording, onMarkTranscribed, onOpenRecordings, resumeAudio }) {
+function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings, onSaveRecording, onDeleteRecording, onMarkTranscribed, onOpenRecordings, resumeAudio, courses, onCreateCourse }) {
   recQuality = recQuality || "Medium";
   recSettings = recSettings || { noise:true, autoTranscribe:false, speakerID:false, autoSave:false };
   var QUALITY_BITRATE = { Low:16000, Medium:32000, High:64000 };
@@ -1242,10 +1413,9 @@ function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings, onSaveRecord
     ["done","✅ Completed successfully"],
   ];
 
-  var [phase,setPhase]=useState("idle"); // idle | recording | paused | deciding | stopped | transcribing | reviewing
+  var [phase,setPhase]=useState("idle"); // idle | recording | paused | interrupted | deciding | stopped | transcribing | reviewing
   var [elapsed,setElapsed]=useState(0);
-  var [title,setTitle]=useState("");var [courses,setCourses]=useState(["General"]);var [course,setCourse]=useState("General");
-  var [showAddCourse,setShowAddCourse]=useState(false);var [newCourse,setNewCourse]=useState("");
+  var [title,setTitle]=useState("");var [course,setCourse]=useState("General");
   var [status,setStatus]=useState("Tap the mic to start recording");
   var [wantFull,setWantFull]=useState(true);var [wantSmart,setWantSmart]=useState(true);var [wantSummary,setWantSummary]=useState(true);
   var [outputs,setOutputs]=useState({full:"",smart:"",summary:""});
@@ -1266,10 +1436,12 @@ function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings, onSaveRecord
   var mimeTypeRef=useRef("audio/webm");
   var savedRecordingIdRef=useRef(null); // id of the Lecture Recordings entry auto-saved for this session
   var audioInputRef=useRef(null);
+  // true while WE are the ones deliberately stopping the track/recorder
+  // (Stop Recording, or unmounting this screen) — so the track's own "ended"
+  // event that naturally follows isn't mistaken for an unexpected interruption.
+  var intentionalStopRef=useRef(false);
 
   var fmt=function(s){return String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0");};
-  function addCourse(){var c=newCourse.trim().toUpperCase();if(!c||courses.includes(c))return;setCourses(function(p){return[...p,c];});setNewCourse("");setShowAddCourse(false);}
-  function removeCourse(c){if(c==="General")return;setCourses(function(p){return p.filter(function(x){return x!==c;});});if(course===c)setCourse("General");}
 
   // If we arrived here via "Transcribe" on a previously saved-for-later recording, load
   // its audio straight in and skip live recording entirely. Deliberately mount-once:
@@ -1290,12 +1462,40 @@ function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings, onSaveRecord
 
   useEffect(function(){
     return function(){
+      intentionalStopRef.current = true;
       keepGoingRef.current = false;
       clearInterval(timerRef.current);
       try{ mediaRecorderRef.current && mediaRecorderRef.current.state!=="inactive" && mediaRecorderRef.current.stop(); }catch(e){}
       try{ streamRef.current && streamRef.current.getTracks().forEach(function(t){t.stop();}); }catch(e){}
     };
   }, []);
+
+  // Attaches interruption watchers to the live mic track. Screen-lock is the
+  // most common real-world trigger: many phones suspend or fully end mic
+  // capture the moment the screen locks, especially in a browser tab rather
+  // than an installed PWA. We never try to fight that or force background
+  // capture — we only react to what the browser actually reports.
+  function attachTrackWatchers(track){
+    if (!track) return; // defensive — getAudioTracks()[0] should always exist after a successful getUserMedia({audio:true}), but never assume
+    track.onended = handleMicInterrupted;
+    track.onmute = handleMicInterrupted;
+  }
+  // Fires when the mic track ends/mutes unexpectedly, or MediaRecorder itself
+  // errors, while we're actively recording — most commonly the phone's screen
+  // locking. Stops cleanly (the recorder's own onstop below still fires,
+  // preserving whatever audio was captured so far into partsRef.current — no
+  // audio is lost), then hands control back to the student: a clear message
+  // plus a manual Resume button once they're back with the screen on.
+  // Recovery is always a deliberate tap, never automatic.
+  function handleMicInterrupted(){
+    if (intentionalStopRef.current) return; // we caused this ourselves (Stop/unmount) — not an interruption
+    clearInterval(timerRef.current);
+    keepGoingRef.current = false;
+    try{ mediaRecorderRef.current && mediaRecorderRef.current.state!=="inactive" && mediaRecorderRef.current.stop(); }catch(e){}
+    try{ streamRef.current && streamRef.current.getTracks().forEach(function(t){t.stop();}); }catch(e){}
+    setPhase("interrupted");
+    setStatus("Recording paused — the microphone became unavailable. This usually happens when the screen locks. Keep your screen on, then tap Resume.");
+  }
 
   // Builds a fresh MediaRecorder on the existing mic stream and starts it. Used both for
   // the very first segment and to silently pick back up right after an internal rotation.
@@ -1304,6 +1504,7 @@ function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings, onSaveRecord
     chunksRef.current = [];
     var recorder = new MediaRecorder(stream, { mimeType: mimeTypeRef.current, audioBitsPerSecond: QUALITY_BITRATE[recQuality]||32000 });
     recorder.ondataavailable = function(e){ if(e.data && e.data.size>0) chunksRef.current.push(e.data); };
+    recorder.onerror = function(){ handleMicInterrupted(); };
     recorder.onstop = function(){
       var blob = new Blob(chunksRef.current, { type: mimeTypeRef.current });
       chunksRef.current = [];
@@ -1334,6 +1535,8 @@ function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings, onSaveRecord
     try{
       var stream = await navigator.mediaDevices.getUserMedia({ audio: { noiseSuppression: !!recSettings.noise, echoCancellation:true } });
       streamRef.current = stream;
+      intentionalStopRef.current = false;
+      attachTrackWatchers(stream.getAudioTracks()[0]);
       var mimeType = "audio/webm";
       if (window.MediaRecorder && MediaRecorder.isTypeSupported){
         if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) mimeType = "audio/webm;codecs=opus";
@@ -1365,15 +1568,40 @@ function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings, onSaveRecord
     setPhase("recording");
     setStatus("Recording...");
   }
+  // Recovery from an interruption (see handleMicInterrupted above) — re-acquires
+  // the microphone fresh and starts a new segment that continues appending to
+  // the SAME partsRef.current array, so the final recording still stitches
+  // together everything from before and after the interruption. Always a
+  // deliberate tap, never automatic — matches "recover when microphone capture
+  // resumes," not "keep trying to record in the background."
+  async function resumeAfterInterruption(){
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){ setStatus("Your browser doesn't support audio recording."); return; }
+    setStatus("Reconnecting to your microphone...");
+    try{
+      var stream = await navigator.mediaDevices.getUserMedia({ audio: { noiseSuppression: !!recSettings.noise, echoCancellation:true } });
+      streamRef.current = stream;
+      intentionalStopRef.current = false;
+      attachTrackWatchers(stream.getAudioTracks()[0]);
+      keepGoingRef.current = true;
+      beginSegment();
+      setPhase("recording");
+      setStatus("Recording...");
+      startTicking();
+    }catch(e){
+      setStatus("Still couldn't reach the microphone — make sure your screen is on and unlocked, then tap Resume again.");
+    }
+  }
   // Bundles all auto-split segments into one file and uploads it to the Lecture Recordings
   // library — this is the "every recording is saved automatically" behaviour. Runs in the
   // background so it never blocks the student from moving on.
+  // Returns the underlying save Promise (see saveRecordingFromSession in App) instead of
+  // firing it and forgetting — stopRecording() below now actually waits for it.
   function finalizeRecordingSave(){
-    if(!onSaveRecording || partsRef.current.length===0) return;
+    if(!onSaveRecording || partsRef.current.length===0) return Promise.resolve();
     var combined = new Blob(partsRef.current, { type: mimeTypeRef.current });
     var recordingId = "rec_"+Date.now();
     savedRecordingIdRef.current = recordingId; // set synchronously — Delete works even before upload finishes
-    onSaveRecording(recordingId, combined, mimeTypeRef.current, {
+    return onSaveRecording(recordingId, combined, mimeTypeRef.current, {
       title: title || ("Lecture Recording - "+new Date().toLocaleDateString()),
       course: course,
       durationSeconds: elapsed
@@ -1381,19 +1609,50 @@ function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings, onSaveRecord
   }
 
   function stopRecording(){
+    intentionalStopRef.current = true; // the mic track ending as a result of this is expected, not an interruption
     clearInterval(timerRef.current);
     keepGoingRef.current = false; // this stop is final — don't auto-open another segment
     try{ mediaRecorderRef.current && mediaRecorderRef.current.stop(); }catch(e){}
     try{ streamRef.current && streamRef.current.getTracks().forEach(function(t){t.stop();}); }catch(e){}
     // small delay so the final segment's onstop finishes building its blob first
     setTimeout(function(){
-      finalizeRecordingSave();
+      var savePromise = finalizeRecordingSave();
+      // Previously: finalizeRecordingSave() was fired and immediately ignored,
+      // then the "✅ Your recording has been saved" modal (phase "deciding")
+      // appeared right away — including a "Save Recording for Later" button
+      // that navigates straight away via onBack. If the student tapped that
+      // (reasonably, since they'd just been told it was saved) while the
+      // metadata/audio IndexedDB writes were still in flight, closing the
+      // screen could abort those writes before they committed, and the
+      // recording would be gone despite the confirmation shown moments
+      // earlier — exactly the "disappears after reopen" symptom.
+      //
+      // The autoTranscribe branch never shows that modal at all (it goes
+      // straight into transcription), so the false-claim bug doesn't apply
+      // there — left exactly as it was, still firing the save in the
+      // background without waiting on it. Only the "deciding" modal is now
+      // gated on the save having genuinely finished.
       if (recSettings.autoTranscribe) {
+        savePromise.catch(function(){
+          setAudioSizeWarning("Couldn't save this recording to your library — check your device storage. Your notes below are safe either way.");
+        });
         setPhase("stopped");
         setStatus("Nice! Now choose what kind of notes you'd like.");
         transcribe();
       } else {
-        setPhase("deciding");
+        savePromise.then(function(){
+          setPhase("deciding");
+        }).catch(function(){
+          // Genuinely failed to save (not just slow) — never claim success.
+          // The in-memory audio (partsRef.current) is still intact though, so
+          // the student can still convert straight to notes from it; they
+          // just won't get an automatic Lecture Recordings library backup.
+          // Reuses the existing amber warning-banner UI (same one used for
+          // the "large part" notice below) rather than adding new UI.
+          setAudioSizeWarning("Couldn't save this recording to your library — check your device storage. You can still convert it to notes now.");
+          setPhase("stopped");
+          setStatus("Nice! Now choose what kind of notes you'd like.");
+        });
       }
     }, 300);
   }
@@ -1540,8 +1799,12 @@ function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings, onSaveRecord
             <div>
               <div style={{ fontWeight:800,fontSize:14,color:C.cyan,marginBottom:3 }}>Record Lecture</div>
               <div style={{ fontSize:12,color:C.muted,lineHeight:1.5 }}>Record your lecture or explanation. Jotting AI will automatically convert it into organised study notes — no typing needed.</div>
+              <div style={{ fontSize:11,color:C.amber,lineHeight:1.5,marginTop:8,fontWeight:600 }}>📱 Keep your screen on while recording — locking it can interrupt the microphone on some phones.</div>
             </div>
           </div>
+        )}
+        {phase==="idle"&&(
+          <div style={{ fontSize:11,color:C.muted,lineHeight:1.5,marginBottom:8,textAlign:"center" }}>Recording a long lecture? Your phone's built-in voice recorder works too — just upload the file below afterward for transcription and organised notes.</div>
         )}
         {phase==="idle"&&(
           <button onClick={function(){audioInputRef.current&&audioInputRef.current.click();}} style={{ width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:8,background:C.card,border:"1px dashed "+C.border,borderRadius:12,padding:"11px",color:C.soft,fontSize:13,fontWeight:700,cursor:"pointer",marginBottom:16 }}>📁 Upload an MP3, M4A, or WAV instead</button>
@@ -1549,22 +1812,24 @@ function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings, onSaveRecord
         <input ref={audioInputRef} type="file" accept="audio/mpeg,audio/mp4,audio/wav,audio/x-m4a,.mp3,.m4a,.wav" onChange={handleAudioUpload} style={{display:"none"}}/>
         <input value={title} onChange={function(e){setTitle(e.target.value);}} placeholder="Note title (optional)..." style={{ width:"100%",padding:"13px 16px",borderRadius:12,border:"1px solid "+C.border,fontSize:15,fontWeight:700,background:C.card,color:C.text,outline:"none",marginBottom:14,boxSizing:"border-box" }}/>
         <div style={{ marginBottom:16 }}>
-          <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10 }}><span style={{ fontSize:13,fontWeight:700,color:C.soft }}>Select Course</span><button onClick={function(){setShowAddCourse(function(s){return !s;});}} style={{ background:C.cyan+"20",border:"1px solid "+C.cyan+"40",borderRadius:8,padding:"5px 12px",color:C.cyan,fontSize:12,fontWeight:700,cursor:"pointer" }}>+ Add Course</button></div>
-          {showAddCourse&&(<div style={{ background:C.card2,borderRadius:14,padding:14,marginBottom:12,border:"1px solid "+C.cyan+"30" }}><div style={{ display:"flex",gap:8 }}><input value={newCourse} onChange={function(e){setNewCourse(e.target.value);}} onKeyDown={function(e){if(e.key==="Enter")addCourse();}} placeholder="e.g. BIO 201" style={{ flex:1,padding:"10px 14px",borderRadius:10,border:"1px solid "+C.border,background:C.bg,color:C.text,outline:"none",fontSize:14 }}/><button onClick={addCourse} style={{ background:C.cyan,border:"none",borderRadius:10,padding:"10px 16px",color:"#0A0F1E",fontWeight:800,cursor:"pointer" }}>Add</button><button onClick={function(){setShowAddCourse(false);}} style={{ background:C.card,border:"1px solid "+C.border,borderRadius:10,padding:"10px 12px",color:C.muted,cursor:"pointer" }}>X</button></div></div>)}
-          <div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{courses.map(function(c){return(<div key={c} style={{ display:"flex" }}><button onClick={function(){setCourse(c);}} style={{ padding:"7px 14px",borderRadius:c==="General"?99:"99px 0 0 99px",border:"2px solid",borderColor:course===c?C.cyan:C.border,borderRight:c!=="General"?"none":undefined,background:course===c?C.cyan:C.card,color:course===c?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{c}</button>{c!=="General"&&<button onClick={function(){removeCourse(c);}} style={{ padding:"7px 8px",borderRadius:"0 99px 99px 0",border:"2px solid",borderColor:course===c?C.cyan:C.border,borderLeft:"none",background:course===c?C.cyan:C.card,color:C.red,fontSize:11,cursor:"pointer" }}>X</button>}</div>);})}</div>
+          <CourseChipPicker realCourses={courses} value={course} onSelect={setCourse} onCreateCourse={onCreateCourse} color={C.cyan}/>
         </div>
 
-        <div style={{ background:C.card,borderRadius:24,padding:"28px 20px",border:"2px solid "+(phase==="recording"?C.red:phase==="paused"?C.amber:C.border),marginBottom:16,textAlign:"center" }}>
-          <div onClick={phase==="idle"?startRecording:undefined} style={{ width:110,height:110,borderRadius:"50%",background:phase==="recording"?"linear-gradient(135deg,#EF4444,#F87171)":phase==="paused"?"linear-gradient(135deg,#F59E0B,#FCD34D)":"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 20px",cursor:phase==="idle"?"pointer":"default",fontSize:46,boxShadow:phase==="recording"?"0 0 0 14px rgba(239,68,68,0.12)":"0 8px 32px rgba(6,182,212,0.35)",animation:phase==="recording"?"pulse 1.5s ease-in-out infinite":"none" }}>{phase==="paused"?"⏸":"🎙️"}</div>
-          {(phase==="recording"||phase==="paused")&&<div style={{ fontSize:40,fontWeight:800,color:phase==="paused"?C.amber:C.red,marginBottom:12,fontFamily:"monospace",letterSpacing:3 }}>⏱ {fmt(elapsed)}</div>}
+        <div style={{ background:C.card,borderRadius:24,padding:"28px 20px",border:"2px solid "+(phase==="recording"?C.red:(phase==="paused"||phase==="interrupted")?C.amber:C.border),marginBottom:16,textAlign:"center" }}>
+          <div onClick={phase==="idle"?startRecording:undefined} style={{ width:110,height:110,borderRadius:"50%",background:phase==="recording"?"linear-gradient(135deg,#EF4444,#F87171)":(phase==="paused"||phase==="interrupted")?"linear-gradient(135deg,#F59E0B,#FCD34D)":"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 20px",cursor:phase==="idle"?"pointer":"default",fontSize:46,boxShadow:phase==="recording"?"0 0 0 14px rgba(239,68,68,0.12)":"0 8px 32px rgba(6,182,212,0.35)",animation:phase==="recording"?"pulse 1.5s ease-in-out infinite":"none" }}>{phase==="interrupted"?"📱":phase==="paused"?"⏸":"🎙️"}</div>
+          {(phase==="recording"||phase==="paused"||phase==="interrupted")&&<div style={{ fontSize:40,fontWeight:800,color:(phase==="paused"||phase==="interrupted")?C.amber:C.red,marginBottom:12,fontFamily:"monospace",letterSpacing:3 }}>⏱ {fmt(elapsed)}</div>}
           {(phase==="recording"||phase==="paused")&&partCount>0&&<div style={{ fontSize:11,color:C.muted,marginBottom:8 }}>🔄 Long recording detected — continuing automatically (part {partCount+1})</div>}
           <div style={{ display:"flex",justifyContent:"center",marginBottom:14 }}><Wave active={phase==="recording"} color={phase==="recording"?"#EF4444":C.cyan} size={1.6}/></div>
-          <p style={{ color:phase==="recording"?C.red:phase==="paused"?C.amber:C.muted,fontSize:14,fontWeight:600,margin:"0 0 20px" }}>{status}</p>
+          <p style={{ color:phase==="recording"?C.red:(phase==="paused"||phase==="interrupted")?C.amber:C.muted,fontSize:14,fontWeight:600,margin:"0 0 20px" }}>{status}</p>
           <div style={{ display:"flex",gap:10,justifyContent:"center" }}>
             {phase==="idle"&&<button onClick={startRecording} style={{ background:"linear-gradient(135deg,#EF4444,#F87171)",color:"#fff",border:"none",borderRadius:14,padding:"14px 36px",fontWeight:800,fontSize:15,cursor:"pointer",boxShadow:"0 4px 20px rgba(239,68,68,0.4)" }}>🎤 Start Recording</button>}
             {(phase==="recording"||phase==="paused")&&<div style={{ display:"flex",gap:10 }}>
               {phase==="recording"?<button onClick={pauseRecording} style={{ background:C.amber,color:"#0A0F1E",border:"none",borderRadius:14,padding:"13px 24px",fontWeight:800,fontSize:14,cursor:"pointer" }}>⏸ Pause</button>:<button onClick={resumeRecording} style={{ background:C.green,color:"#0A0F1E",border:"none",borderRadius:14,padding:"13px 24px",fontWeight:800,fontSize:14,cursor:"pointer" }}>▶ Resume</button>}
               <button onClick={stopRecording} style={{ background:"rgba(248,113,113,0.15)",color:C.red,border:"2px solid "+C.red+"40",borderRadius:14,padding:"13px 24px",fontWeight:800,fontSize:14,cursor:"pointer" }}>⏹ Stop Recording</button>
+            </div>}
+            {phase==="interrupted"&&<div style={{ display:"flex",gap:10,flexWrap:"wrap",justifyContent:"center" }}>
+              <button onClick={resumeAfterInterruption} style={{ background:C.green,color:"#0A0F1E",border:"none",borderRadius:14,padding:"13px 24px",fontWeight:800,fontSize:14,cursor:"pointer" }}>🔄 Resume Recording</button>
+              <button onClick={stopRecording} style={{ background:"rgba(248,113,113,0.15)",color:C.red,border:"2px solid "+C.red+"40",borderRadius:14,padding:"13px 24px",fontWeight:800,fontSize:14,cursor:"pointer" }}>⏹ Finish &amp; Save</button>
             </div>}
           </div>
         </div>
@@ -1639,22 +1904,27 @@ function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings, onSaveRecord
 // audio lazily rather than the parent holding every blob in memory at once.
 function LocalAudioPlayer({ recordingId }) {
   var [url, setUrl] = useState(null);
-  var [status, setStatus] = useState("loading"); // loading | ready | missing
+  var [status, setStatus] = useState("loading"); // loading | ready | unavailable
   useEffect(function(){
     var objectUrl = null;
     var cancelled = false;
     getAudioBlobLocal(recordingId).then(function(blob){
       if (cancelled) return;
-      if (!blob) { setStatus("missing"); return; }
+      // A blob that's missing entirely, or present but empty (e.g. an
+      // interrupted save left a zero-byte entry), is caught here. A blob
+      // that has bytes but isn't valid decodable audio only reveals itself
+      // once the browser actually tries to play it — see the <audio>
+      // element's onError below for that case.
+      if (!blob || !(blob instanceof Blob) || blob.size===0) { setStatus("unavailable"); return; }
       objectUrl = URL.createObjectURL(blob);
       setUrl(objectUrl);
       setStatus("ready");
-    }).catch(function(){ if (!cancelled) setStatus("missing"); });
+    }).catch(function(){ if (!cancelled) setStatus("unavailable"); });
     return function(){ cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
   }, [recordingId]);
   if (status==="loading") return <div style={{ fontSize:12,color:C.muted,marginBottom:10 }}>Loading audio...</div>;
-  if (status==="missing") return <div style={{ fontSize:12,color:C.amber,marginBottom:10 }}>🎧 Audio isn't on this device — recordings are saved locally, not in the cloud.</div>;
-  return <audio controls preload="none" src={url} style={{ width:"100%",height:36,marginBottom:10 }}/>;
+  if (status==="unavailable") return <div style={{ fontSize:12,color:C.amber,marginBottom:10 }}>🎧 This audio can't be played — it may be missing from this device or the file may be damaged.</div>;
+  return <audio controls preload="none" src={url} onError={function(){ setStatus("unavailable"); }} style={{ width:"100%",height:36,marginBottom:10 }}/>;
 }
 
 function RecordingsScreen({ onBack, recordings, onRename, onDelete, onTranscribe }) {
@@ -1726,7 +1996,7 @@ function RecordingsScreen({ onBack, recordings, onRename, onDelete, onTranscribe
 }
 
 // ── SCAN DOC ──────────────────────────────────────────────────────────────────
-function ScanDocScreen({ onBack, onSave }) {
+function ScanDocScreen({ onBack, onSave, courses, onCreateCourse }) {
   var [image,setImage]=useState(null); // final (possibly cropped) image data URL, or null while a PDF is loaded
   var [pdfFile,setPdfFile]=useState(null); // {dataUrl, name} when a PDF was chosen instead of an image
   var [cropping,setCropping]=useState(false);
@@ -1734,7 +2004,6 @@ function ScanDocScreen({ onBack, onSave }) {
   var [box,setBox]=useState({x:20,y:20,w:200,h:200}); // crop rectangle, in on-screen px relative to the preview
   var [extracting,setExtracting]=useState(false);var [extracted,setExtracted]=useState("");var [title,setTitle]=useState("");var [course,setCourse]=useState("General");var [status,setStatus]=useState("Take a photo or upload an image or PDF");
   var fileRef=useRef(null); var imgRef=useRef(null); var dragRef=useRef(null);
-  var courses=["General","PHY 101","MTH 101","COS 102","ENG 201","CHM 102"];
 
   function handleFile(file){
     if(!file) return;
@@ -1835,7 +2104,7 @@ function ScanDocScreen({ onBack, onSave }) {
           <div><div style={{ fontWeight:700,fontSize:13,color:C.cyan }}>AI Document Scanner</div><div style={{ fontSize:11,color:C.muted }}>Scan notes, textbooks, whiteboards, or upload a PDF — AI extracts all text</div></div>
         </div>
         <input value={title} onChange={function(e){setTitle(e.target.value);}} placeholder="Note title (optional)..." style={{ width:"100%",padding:"13px 16px",borderRadius:12,border:"1px solid "+C.border,fontSize:15,fontWeight:700,background:C.card,color:C.text,outline:"none",marginBottom:12,boxSizing:"border-box" }}/>
-        <div style={{ display:"flex",gap:8,marginBottom:16,flexWrap:"wrap" }}>{courses.map(function(c){return<button key={c} onClick={function(){setCourse(c);}} style={{ padding:"6px 14px",borderRadius:99,border:"2px solid",borderColor:course===c?C.cyan:C.border,background:course===c?C.cyan:C.card,color:course===c?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{c}</button>;})}</div>
+        <div style={{ marginBottom:16 }}><CourseChipPicker realCourses={courses} value={course} onSelect={setCourse} onCreateCourse={onCreateCourse} color={C.cyan}/></div>
 
         {!cropping && (
           <div onClick={function(){if(!hasSource)fileRef.current&&fileRef.current.click();}} style={{ background:C.card,borderRadius:20,padding:hasSource?12:"28px 20px",border:"2px dashed "+(hasSource?C.cyan:C.border),marginBottom:16,textAlign:"center",cursor:hasSource?"default":"pointer" }}>
@@ -1882,11 +2151,25 @@ function ScanDocScreen({ onBack, onSave }) {
   );
 }
 // ── DRAW ──────────────────────────────────────────────────────────────────────
-function DrawScreen({ onBack, onSave }) {
+function DrawScreen({ onBack, onSave, courses, onCreateCourse }) {
   var canvasRef=useRef(null);var [drawing,setDrawing]=useState(false);var [color,setColor]=useState("#06B6D4");var [size,setSize]=useState(4);var [tool,setTool]=useState("pen");
   var [title,setTitle]=useState("");var [course,setCourse]=useState("General");var [hasContent,setHasContent]=useState(false);
   var colors=["#06B6D4","#A78BFA","#F59E0B","#34D399","#F87171","#fff"];
-  var courses=["General","PHY 101","MTH 101","COS 102","ENG 201","CHM 102"];
+  // Sourced from real Course records now (coursesRepository), not a hardcoded
+  // list unrelated to the student's actual data. Kept as a <select> rather than
+  // switching to the shared chip picker — this toolbar is a tight single row,
+  // and a chip picker would break that layout; "+ Add new course" below is the
+  // compact-toolbar equivalent of the chip picker's "+ Add Course" button.
+  var courseNames = Array.from(new Set(["General"].concat((courses||[]).map(function(c){return c.code||c.title;}).filter(Boolean))));
+  async function handleCourseChange(e){
+    var v = e.target.value;
+    if (v==="__add__") {
+      var name = window.prompt("New course code (e.g. BIO 201):");
+      if (name && name.trim()) { var code=name.trim().toUpperCase(); await onCreateCourse(code); setCourse(code); }
+      return;
+    }
+    setCourse(v);
+  }
   function getPos(e,c){var r=c.getBoundingClientRect();var s=e.touches?e.touches[0]:e;return{x:(s.clientX-r.left)*(c.width/r.width),y:(s.clientY-r.top)*(c.height/r.height)};}
   function startDraw(e){e.preventDefault();var c=canvasRef.current;var ctx=c.getContext("2d");var p=getPos(e,c);ctx.beginPath();ctx.moveTo(p.x,p.y);setDrawing(true);setHasContent(true);}
   function draw(e){e.preventDefault();if(!drawing)return;var c=canvasRef.current;var ctx=c.getContext("2d");var p=getPos(e,c);ctx.globalCompositeOperation=tool==="eraser"?"destination-out":"source-over";ctx.strokeStyle=color;ctx.lineWidth=tool==="eraser"?28:size;ctx.lineCap="round";ctx.lineJoin="round";ctx.lineTo(p.x,p.y);ctx.stroke();}
@@ -1905,7 +2188,7 @@ function DrawScreen({ onBack, onSave }) {
       </div>
       <div style={{ background:C.card,padding:"10px 16px",borderBottom:"1px solid "+C.border,display:"flex",gap:8,alignItems:"center" }}>
         <input value={title} onChange={function(e){setTitle(e.target.value);}} placeholder="Title (optional)..." style={{ flex:1,padding:"9px 12px",borderRadius:10,border:"1px solid "+C.border,fontSize:13,background:C.bg,color:C.text,outline:"none" }}/>
-        <select value={course} onChange={function(e){setCourse(e.target.value);}} style={{ padding:"9px 10px",borderRadius:10,border:"1px solid "+C.border,fontSize:12,background:C.bg,color:C.text,outline:"none" }}>{courses.map(function(c){return<option key={c} value={c}>{c}</option>;})}</select>
+        <select value={course} onChange={handleCourseChange} style={{ padding:"9px 10px",borderRadius:10,border:"1px solid "+C.border,fontSize:12,background:C.bg,color:C.text,outline:"none" }}>{courseNames.map(function(c){return<option key={c} value={c}>{c}</option>;})}<option value="__add__">+ Add new course...</option></select>
       </div>
       <div style={{ background:C.card,padding:"12px 16px",display:"flex",alignItems:"center",gap:10,borderBottom:"1px solid "+C.border,flexWrap:"wrap" }}>
         <div style={{ display:"flex",gap:6 }}>{colors.map(function(c){return<button key={c} onClick={function(){setColor(c);setTool("pen");}} style={{ width:26,height:26,borderRadius:"50%",background:c,border:color===c&&tool!=="eraser"?"3px solid #fff":"2px solid rgba(255,255,255,0.15)",cursor:"pointer" }}/>;})}</div>
@@ -1927,9 +2210,8 @@ function DrawScreen({ onBack, onSave }) {
 // every one of those four screens already calls — same id/course/tag shape,
 // same local+cloud persistence, same landing on NoteDetail afterward. Nothing
 // about how a note gets saved is reimplemented here.
-function CreateNoteScreen({ onBack, onSave }) {
+function CreateNoteScreen({ onBack, onSave, courses, onCreateCourse }) {
   var [title,setTitle]=useState("");var [content,setContent]=useState("");var [course,setCourse]=useState("General");
-  var courses=["General","PHY 101","MTH 101","COS 102","ENG 201","CHM 102"];
   function save(){
     if(!content.trim()){ alert("Write something first!"); return; }
     onSave({ id:Date.now(), title:title||("Note - "+new Date().toLocaleDateString()), course, color:"#06B6D4", bg:"rgba(6,182,212,0.12)", tag:"Study", words:content.split(" ").length, preview:content.slice(0,100), content:content });
@@ -1943,7 +2225,7 @@ function CreateNoteScreen({ onBack, onSave }) {
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:20 }}>
         <input value={title} onChange={function(e){setTitle(e.target.value);}} placeholder="Note title (optional)..." style={{ width:"100%",padding:"13px 16px",borderRadius:12,border:"1px solid "+C.border,fontSize:15,fontWeight:700,background:C.card,color:C.text,outline:"none",marginBottom:14,boxSizing:"border-box" }}/>
-        <div style={{ display:"flex",gap:8,marginBottom:16,flexWrap:"wrap" }}>{courses.map(function(c){return<button key={c} onClick={function(){setCourse(c);}} style={{ padding:"6px 14px",borderRadius:99,border:"2px solid",borderColor:course===c?C.cyan:C.border,background:course===c?C.cyan:C.card,color:course===c?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{c}</button>;})}</div>
+        <div style={{ marginBottom:16 }}><CourseChipPicker realCourses={courses} value={course} onSelect={setCourse} onCreateCourse={onCreateCourse} color={C.cyan}/></div>
         <textarea value={content} onChange={function(e){setContent(e.target.value);}} placeholder="Start typing your note..." style={{ width:"100%",minHeight:320,padding:16,borderRadius:16,border:"1px solid "+C.border,background:C.card,color:C.text,fontSize:14,lineHeight:1.9,outline:"none",resize:"none",fontFamily:"inherit",boxSizing:"border-box" }}/>
       </div>
     </div>
@@ -1958,13 +2240,22 @@ function CreateNoteScreen({ onBack, onSave }) {
 // exact same optimistic-local-update-then-persist shape addAssignment()
 // already uses; it isn't a new persistence pattern, just applied to a store
 // that never had one wired in.
-function UploadMaterialScreen({ onBack, onSave }) {
-  var [title,setTitle]=useState("");var [type,setType]=useState("pdf");var [course,setCourse]=useState("");var [tagsText,setTagsText]=useState("");var [error,setError]=useState("");
-  function save(){
+function UploadMaterialScreen({ onBack, onSave, courses, onCreateCourse }) {
+  var [title,setTitle]=useState("");var [type,setType]=useState("pdf");var [course,setCourse]=useState("General");var [tagsText,setTagsText]=useState("");var [error,setError]=useState("");
+  // Materials need a REAL Course id — materialsRepository's own documented
+  // contract calls courseId "id of the Course this material belongs to," not a
+  // name — but until now nothing ever gave it one (the old free-text input just
+  // shoved the typed string straight into courseId). Resolve the picked name to
+  // an existing Course, or create one on the fly (covers "General," or any
+  // legacy name that's never been a real Course before) so courseId is always
+  // real going forward, with zero extra steps for the student.
+  async function save(){
     if(!title.trim()){ setError("Give this material a title."); return; }
-    if(!course.trim()){ setError("Which course is this for?"); return; }
+    if(!course){ setError("Which course is this for?"); return; }
     var tags = tagsText.split(",").map(function(t){return t.trim();}).filter(Boolean);
-    onSave({ title:title.trim(), type:type, courseId:course.trim(), tags:tags });
+    var match = (courses||[]).find(function(c){ return (c.code||c.title)===course; });
+    var courseRecord = match || await onCreateCourse(course);
+    onSave({ title:title.trim(), type:type, courseId:courseRecord.id, courseName:course, tags:tags });
   }
   return(
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
@@ -1980,7 +2271,7 @@ function UploadMaterialScreen({ onBack, onSave }) {
           <label style={{ fontSize:12,fontWeight:700,color:C.soft,display:"block",marginBottom:8 }}>TYPE</label>
           <div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{MATERIAL_TYPES.map(function(t){return<button key={t} onClick={function(){setType(t);}} style={{ padding:"7px 14px",borderRadius:99,border:"2px solid",borderColor:type===t?C.cyan:C.border,background:type===t?C.cyan:C.card,color:type===t?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{MATERIAL_TYPE_ICON[t]+" "+MATERIAL_TYPE_LABEL[t]}</button>;})}</div>
         </div>
-        <input value={course} onChange={function(e){setCourse(e.target.value);}} placeholder="Course (e.g. PHY 101)" style={{ width:"100%",padding:"11px 14px",borderRadius:12,border:"1px solid "+C.border,fontSize:13,background:C.card,color:C.text,outline:"none",marginBottom:14,boxSizing:"border-box" }}/>
+        <div style={{ marginBottom:14 }}><CourseChipPicker realCourses={courses} value={course} onSelect={setCourse} onCreateCourse={onCreateCourse} color={C.cyan}/></div>
         <input value={tagsText} onChange={function(e){setTagsText(e.target.value);}} placeholder="Tags, comma separated (optional)" style={{ width:"100%",padding:"11px 14px",borderRadius:12,border:"1px solid "+C.border,fontSize:13,background:C.card,color:C.text,outline:"none",marginBottom:14,boxSizing:"border-box" }}/>
         {error&&<div style={{ background:"rgba(248,113,113,0.1)",border:"1px solid rgba(248,113,113,0.3)",borderRadius:10,padding:"10px 14px",marginBottom:12,fontSize:13,color:C.red,fontWeight:600 }}>⚠️ {error}</div>}
       </div>
@@ -1989,9 +2280,8 @@ function UploadMaterialScreen({ onBack, onSave }) {
 }
 
 // ── AI WRITE ──────────────────────────────────────────────────────────────────
-function AIWriteScreen({ onBack, onSave }) {
+function AIWriteScreen({ onBack, onSave, courses, onCreateCourse }) {
   var [prompt,setPrompt]=useState("");var [result,setResult]=useState("");var [loading,setLoading]=useState(false);var [course,setCourse]=useState("General");
-  var courses=["General","PHY 101","MTH 101","COS 102","ENG 201","CHM 102"];
   var suggestions=["Summarize Newton laws of motion","Write notes on Data Structures","Explain Organic Chemistry basics","Create outline for Kinematics"];
   async function generate(text){var q=text||prompt;if(!q.trim())return;setLoading(true);setResult("");try{var res=await callGeminiText("You are writing formal university lecture notes for a student — not a chatbot reply. Do not include any introduction, preamble, or closing remarks (no phrases like \"Here are your notes\" or \"I hope this helps\"). Start immediately with the title heading and follow this exact structure using Markdown headers:\n\n# [Title of the topic]\n## Definition\n## Introduction\n## Main Explanation\n## Key Points\n## Advantages\n## Disadvantages\n## Examples\n## Important Exam Questions\n## Summary\n\nIf a section like Advantages/Disadvantages doesn't naturally apply to this specific topic, still include the header and briefly explain why it's less relevant rather than skipping it. Use bullet points under each header where appropriate.\n\nTopic: "+q,1400,"chat");setResult(res);}catch(e){if(e.code==="OUT_OF_CREDITS"){triggerUpgradeScreen();}else{setResult("Couldn't reach SAM-X — check your connection and try again.");}}setLoading(false);}
   return(
@@ -2002,7 +2292,7 @@ function AIWriteScreen({ onBack, onSave }) {
         {result&&<button onClick={function(){var m=result.match(/^#\s+(.+)/m);var noteTitle=(m&&m[1].trim())||prompt.slice(0,40)||"AI Note";onSave({id:Date.now(),title:noteTitle,course,color:"#A78BFA",bg:"rgba(167,139,250,0.12)",tag:"Study",words:result.split(" ").length,preview:result.replace(/[#*_>-]/g,"").slice(0,100),content:result});}} style={{ background:"linear-gradient(135deg,#A78BFA,#06B6D4)",color:"#fff",border:"none",borderRadius:10,padding:"8px 16px",fontWeight:800,fontSize:13,cursor:"pointer" }}>Save</button>}
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:20 }}>
-        <div style={{ display:"flex",gap:8,marginBottom:14,flexWrap:"wrap" }}>{courses.map(function(c){return<button key={c} onClick={function(){setCourse(c);}} style={{ padding:"6px 14px",borderRadius:99,border:"2px solid",borderColor:course===c?C.purple:C.border,background:course===c?C.purple:C.card,color:course===c?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{c}</button>;})}</div>
+        <div style={{ marginBottom:14 }}><CourseChipPicker realCourses={courses} value={course} onSelect={setCourse} onCreateCourse={onCreateCourse} color={C.purple}/></div>
         <div style={{ display:"flex",gap:10,marginBottom:16 }}><input value={prompt} onChange={function(e){setPrompt(e.target.value);}} onKeyDown={function(e){if(e.key==="Enter")generate();}} placeholder="What should I write notes about?" style={{ flex:1,padding:"13px 16px",borderRadius:14,border:"1px solid "+C.border,fontSize:14,background:C.card,color:C.text,outline:"none" }}/><button onClick={function(){generate();}} disabled={loading} style={{ width:48,height:48,borderRadius:14,background:"linear-gradient(135deg,#A78BFA,#06B6D4)",border:"none",cursor:"pointer",fontSize:20,flexShrink:0 }}>✨</button></div>
         {!result&&!loading&&suggestions.map(function(s){return<button key={s} onClick={function(){setPrompt(s);generate(s);}} style={{ width:"100%",textAlign:"left",background:C.card,border:"1px solid "+C.border,borderRadius:12,padding:"12px 16px",color:C.soft,fontSize:13,cursor:"pointer",marginBottom:8,fontFamily:"inherit" }}>{s}</button>;})}
         {loading&&<div style={{ textAlign:"center",padding:"40px 20px" }}><div style={{ fontSize:48,animation:"spin 2s linear infinite" }}>✨</div><p style={{ color:C.muted }}>Writing your notes...</p></div>}
@@ -2012,9 +2302,99 @@ function AIWriteScreen({ onBack, onSave }) {
   );
 }
 
+// ── Quiz JSON parsing & validation (shared by Quiz Me + Exam Mode) ─────────────
+// Two failure modes this fixes:
+//   1) The model wraps the array in code fences with inconsistent casing/whitespace,
+//      or adds a sentence of preamble/trailing text around the JSON despite being
+//      told not to — naive string splitting used to choke on this.
+//   2) Even once parsed, a truncated/partially-malformed response can contain a
+//      question missing `options`, a bad `answer` index, etc. Every question is
+//      now validated individually instead of trusting the whole array blindly.
+function extractJSONArrayText(raw){
+  var text = (raw||"").trim();
+  var fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenceMatch) text = fenceMatch[1].trim();
+  var start = text.indexOf("[");
+  var end = text.lastIndexOf("]");
+  if (start!==-1 && end!==-1 && end>start) text = text.slice(start, end+1);
+  return text.trim();
+}
+
+function parseQuizQuestions(raw){
+  var jsonText = extractJSONArrayText(raw);
+  var parsed;
+  try{ parsed = JSON.parse(jsonText); }
+  catch(e){ throw new Error("SAM-X's response wasn't valid quiz JSON — try generating again."); }
+  if (!Array.isArray(parsed)) throw new Error("SAM-X didn't return a list of questions — try generating again.");
+  var valid = parsed.filter(function(q){
+    return q && typeof q.question==="string" && q.question.trim()
+      && Array.isArray(q.options) && q.options.length>=2
+      && q.options.every(function(o){ return typeof o==="string" && o.trim(); })
+      && typeof q.answer==="number" && q.answer>=0 && q.answer<q.options.length;
+  });
+  if (valid.length===0) throw new Error("SAM-X's response didn't contain any valid questions — try generating again.");
+  // Reject generic meta-questions ("What is the topic?", "What is this about?") —
+  // these are what a content-starved or under-specified request degrades to, and
+  // silently showing one as if it were a real quiz question is worse than an
+  // honest error. Anchored to match the WHOLE question, not just "contains this
+  // wording", so a genuinely specific question that happens to use the word
+  // "topic" in context (e.g. "What is the main topic of the Krebs cycle's third
+  // stage?") is never wrongly rejected — only the bare, content-free template is.
+  var substantive = valid.filter(function(q){ return !isGenericMetaQuestion(q.question); });
+  if (substantive.length===0) throw new Error("SAM-X could only come up with a generic question, not specific ones from your notes — try adding more content to this note, or generate again.");
+  return substantive;
+}
+var GENERIC_QUIZ_QUESTION_PATTERNS = [
+  /^what\s+is\s+the\s+(main\s+)?topic\??$/i,
+  /^what\s+is\s+this\s+(note\s+)?about\??$/i,
+  /^what\s+topic\s+does\s+this\s+(note\s+)?cover\??$/i,
+  /^what\s+is\s+being\s+discussed\??$/i,
+  /^what\s+subject\s+is\s+this\??$/i,
+  /^what\s+is\s+the\s+subject\s+of\s+(this|these)\s+notes\??$/i,
+];
+function isGenericMetaQuestion(questionText){
+  var t = (questionText||"").trim();
+  return GENERIC_QUIZ_QUESTION_PATTERNS.some(function(re){ return re.test(t); });
+}
+
+// ── Flashcard JSON parsing & validation ─────────────────────────────────────
+// Reuses extractJSONArrayText (same fence/prose-stripping fix as quizzes) rather
+// than the old naive `raw.split("```json")...` — that approach left any preamble
+// text intact and caused a hard parse failure instead of a clean extraction.
+// Each card is validated individually (non-empty front AND back) so one malformed
+// entry doesn't take down the whole deck.
+function parseFlashcards(raw){
+  var jsonText = extractJSONArrayText(raw);
+  var parsed;
+  try{ parsed = JSON.parse(jsonText); }
+  catch(e){ throw new Error("SAM-X's response wasn't valid flashcard JSON — try generating again."); }
+  if (!Array.isArray(parsed)) throw new Error("SAM-X didn't return a list of flashcards — try generating again.");
+  var valid = parsed.filter(function(c){
+    return c && typeof c.front==="string" && c.front.trim() && typeof c.back==="string" && c.back.trim();
+  }).map(function(c){ return { front:c.front.trim(), back:c.back.trim() }; });
+  if (valid.length===0) throw new Error("SAM-X's response didn't contain any valid flashcards — try generating again.");
+  return valid;
+}
+
+// Token budget scaled to the number of cards actually requested, instead of the
+// old flat 1800-token cap. That flat cap is the real root cause of "only 1-8
+// cards even when asking for more": ~1800 tokens is roughly enough room for a
+// complete, well-formed JSON array of about 8 short front/back cards, so for
+// bigger requests (15/20/30) the model would produce a smaller-but-VALID array
+// that fits the budget and stop there — no error, just silently fewer cards.
+// ~110 tokens covers a typical {"front":"...","back":"..."} entry (short prompt
+// + a 1-2 sentence answer + JSON punctuation); 200 tokens covers the array
+// brackets/formatting overhead. This is a per-request calculation, not a single
+// enlarged constant, so it scales correctly whether 8 or 30 cards are asked for.
+var FLASHCARD_TOKENS_PER_CARD = 110;
+var FLASHCARD_TOKEN_OVERHEAD = 200;
+function flashcardMaxTokens(numCards){
+  return FLASHCARD_TOKEN_OVERHEAD + numCards*FLASHCARD_TOKENS_PER_CARD;
+}
+
 // ── NOTE DETAIL ───────────────────────────────────────────────────────────────
 function NoteDetail({ note, onBack, onDelete, onUpdate, onSaveQuiz }) {
-  var [view,setView]=useState("note");var [summary,setSummary]=useState(null);var [quiz,setQuiz]=useState([]);var [quizIdx,setQuizIdx]=useState(0);var [selected,setSelected]=useState(null);var [score,setScore]=useState(0);var [quizDone,setQuizDone]=useState(false);var [loading,setLoading]=useState(false);
+  var [view,setView]=useState("note");var [summary,setSummary]=useState(null);var [quiz,setQuiz]=useState([]);var [quizIdx,setQuizIdx]=useState(0);var [selected,setSelected]=useState(null);var [score,setScore]=useState(0);var [quizDone,setQuizDone]=useState(false);var [loading,setLoading]=useState(false);var [quizError,setQuizError]=useState(null);
   var [displayTitle,setDisplayTitle]=useState(note.title);
   var [displayContent,setDisplayContent]=useState(note.content);
   var [renaming,setRenaming]=useState(false);var [titleDraft,setTitleDraft]=useState(note.title);
@@ -2024,7 +2404,37 @@ function NoteDetail({ note, onBack, onDelete, onUpdate, onSaveQuiz }) {
   function saveRename(){ var t=titleDraft.trim()||displayTitle; setDisplayTitle(t); setRenaming(false); onUpdate&&onUpdate(note.id,{title:t}); }
   function saveContentEdit(){ var c=contentDraft; if(!c||!c.trim()){setEditingContent(false);return;} setDisplayContent(c); setEditingContent(false); onUpdate&&onUpdate(note.id,{content:c,words:c.split(" ").length,preview:c.slice(0,100)}); }
   async function generateSummary(){setLoading(true);setView("summary");try{var raw=await callGeminiText("Summarize these notes. Return ONLY JSON: {\"summary\":\"...\",\"keyPoints\":[\"...\"],\"tags\":[\"...\"]} NOTES: "+displayContent,800,"summary");setSummary(JSON.parse(raw.split("```json").join("").split("```").join("").trim()));}catch(e){if(e.code==="OUT_OF_CREDITS"){triggerUpgradeScreen();}else{setSummary({summary:"This covers "+displayTitle+".",keyPoints:["Review definitions","Practice problems"],tags:[note.course,note.tag]});}}setLoading(false);}
-  async function generateQuiz(){setLoading(true);setView("quiz");try{var raw=await callGeminiText("Create 5 MCQ from these notes. Return ONLY JSON array: [{\"question\":\"...\",\"options\":[\"A\",\"B\",\"C\",\"D\"],\"answer\":0}] NOTES: "+displayContent,800,"quiz");var q=JSON.parse(raw.split("```json").join("").split("```").join("").trim());setQuiz(q);if(onSaveQuiz)onSaveQuiz(q,{noteId:note.id,course:note.course,source:"quizme"});setQuizIdx(0);setSelected(null);setScore(0);setQuizDone(false);}catch(e){if(e.code==="OUT_OF_CREDITS"){triggerUpgradeScreen();}else{setQuiz([{question:"What is the main topic?",options:[note.course,"History","Math","Art"],answer:0}]);}}setLoading(false);}
+  async function generateQuiz(){
+    // Guard against generating a quiz from a note that doesn't have enough
+    // real content to draw questions from (a near-empty note, or — since the
+    // Quiz tab is reachable even for a drawing note, whose `content` is a
+    // base64 image data URL, not text — content that isn't actually prose at
+    // all). Sending that to the AI is exactly what produces a single generic
+    // "What is the topic?" filler question; catching it here means the
+    // student gets an honest, specific message instead, and no AI call (and
+    // no credit) is spent on a request that can't succeed.
+    var wordCount = (displayContent||"").trim().split(/\s+/).filter(Boolean).length;
+    if (note.type==="drawing" || wordCount<30) {
+      setView("quiz"); setQuizError(null);
+      setQuiz([]);
+      setQuizError(note.type==="drawing"
+        ? "This is a drawing note — Quiz Me needs written content to generate questions from."
+        : "This note doesn't have enough content yet to generate a meaningful quiz. Add more detail, then try again.");
+      return;
+    }
+    setLoading(true);setView("quiz");setQuizError(null);
+    try{
+      var raw=await callGeminiText("Create 10 multiple choice questions covering a good spread of the material below — not just the first section. Every question must test a specific fact, term, definition, process, or claim that actually appears in these notes. Never include a generic question like \"What is the topic?\" or \"What is this about?\" — if you can't find enough distinct, specific things to ask about, return fewer questions rather than padding with a generic one. Return ONLY a JSON array, no preamble: [{\"question\":\"...\",\"options\":[\"A\",\"B\",\"C\",\"D\"],\"answer\":0}]\n\nNOTES:\n"+displayContent,1600,"quiz");
+      var q=parseQuizQuestions(raw);
+      setQuiz(q);
+      if(onSaveQuiz)onSaveQuiz(q,{noteId:note.id,course:note.course,source:"quizme"});
+      setQuizIdx(0);setSelected(null);setScore(0);setQuizDone(false);
+    }catch(e){
+      if(e.code==="OUT_OF_CREDITS"){triggerUpgradeScreen();}
+      else{ setQuiz([]); setQuizError(e.message||"Couldn't generate a quiz — check your connection and try again."); }
+    }
+    setLoading(false);
+  }
   function pick(i){if(selected!==null)return;setSelected(i);if(i===quiz[quizIdx].answer)setScore(function(s){return s+1;});setTimeout(function(){if(quizIdx+1<quiz.length){setQuizIdx(function(q){return q+1;});setSelected(null);}else setQuizDone(true);},900);}
   return(
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
@@ -2062,7 +2472,7 @@ function NoteDetail({ note, onBack, onDelete, onUpdate, onSaveQuiz }) {
           {note.type!=="drawing"&&!editingContent&&<div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:10 }}><button onClick={function(){setView("summary");if(!summary)generateSummary();}} style={actionBtn(note.color)}>📋 AI Summary</button><button onClick={function(){setView("quiz");if(quiz.length===0)generateQuiz();}} style={actionBtn(C.purple)}>🧠 Quiz Me</button></div>}
         </div>)}
         {view==="summary"&&(loading?<div style={{ textAlign:"center",padding:"60px 20px" }}><div style={{ fontSize:48,animation:"spin 2s linear infinite" }}>✨</div><p style={{ color:C.muted,marginTop:16 }}>Generating...</p></div>:summary?(<div><div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+C.border,marginBottom:14 }}><div style={{ fontSize:11,fontWeight:700,color:C.green,letterSpacing:1,marginBottom:10 }}>OVERVIEW</div><p style={{ margin:0,fontSize:14,color:"#CBD5E1",lineHeight:1.8 }}>{summary.summary}</p></div><div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+C.border,marginBottom:14 }}><div style={{ fontSize:11,fontWeight:700,color:C.amber,letterSpacing:1,marginBottom:12 }}>KEY POINTS</div>{summary.keyPoints&&summary.keyPoints.map(function(p,i){return<div key={i} style={{ display:"flex",gap:10,marginBottom:10 }}><div style={{ width:6,height:6,borderRadius:3,background:C.amber,marginTop:7,flexShrink:0 }}/><p style={{ margin:0,fontSize:14,color:"#CBD5E1",lineHeight:1.7 }}>{p}</p></div>;})}</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{summary.tags&&summary.tags.map(function(t){return<span key={t} style={{ background:C.card2,color:C.cyan,borderRadius:99,padding:"4px 14px",fontSize:12,fontWeight:700 }}>{t}</span>;})}</div></div>):null)}
-        {view==="quiz"&&(loading?<div style={{ textAlign:"center",padding:"60px 20px" }}><div style={{ fontSize:48,animation:"spin 2s linear infinite" }}>🧠</div><p style={{ color:C.muted,marginTop:16 }}>Generating quiz...</p></div>:quizDone?(<div style={{ textAlign:"center",padding:"40px 20px" }}><div style={{ fontSize:64,marginBottom:16 }}>{score===quiz.length?"🏆":"📖"}</div><div style={{ fontSize:40,fontWeight:800,color:C.text }}>{score}/{quiz.length}</div><p style={{ color:C.muted,marginTop:8 }}>{score===quiz.length?"Perfect! 🔥":"Keep studying! 💪"}</p><button onClick={function(){setQuizIdx(0);setSelected(null);setScore(0);setQuizDone(false);}} style={{ marginTop:20,background:"linear-gradient(135deg,"+note.color+",#A78BFA)",color:"#fff",border:"none",borderRadius:14,padding:"13px 32px",fontWeight:800,fontSize:15,cursor:"pointer" }}>Try Again</button></div>):quiz.length>0?(<div><div style={{ display:"flex",justifyContent:"space-between",marginBottom:8 }}><span style={{ fontSize:13,color:C.muted }}>Question {quizIdx+1}/{quiz.length}</span><span style={{ fontSize:13,fontWeight:700,color:C.text }}>Score: {score}</span></div><div style={{ height:4,background:C.border,borderRadius:2,marginBottom:20 }}><div style={{ height:4,background:note.color,borderRadius:2,width:(quizIdx/quiz.length*100)+"%",transition:"width 0.3s" }}/></div><div style={{ background:C.card,borderRadius:16,padding:20,marginBottom:16,border:"1px solid "+C.border }}><p style={{ margin:0,fontSize:16,fontWeight:600,color:C.text,lineHeight:1.6 }}>{quiz[quizIdx].question}</p></div>{quiz[quizIdx].options.map(function(opt,i){var bg=C.card,border=C.border,color=C.text;if(selected!==null){if(i===quiz[quizIdx].answer){bg="rgba(52,211,153,0.15)";border="#34D399";color="#34D399";}else if(i===selected){bg="rgba(248,113,113,0.15)";border="#F87171";color="#F87171";}}return<button key={i} onClick={function(){pick(i);}} disabled={selected!==null} style={{ width:"100%",textAlign:"left",background:bg,border:"2px solid "+border,borderRadius:12,padding:"13px 16px",marginBottom:10,fontSize:14,color:color,cursor:selected!==null?"default":"pointer",fontWeight:500,display:"flex",gap:10,fontFamily:"inherit" }}><span style={{opacity:0.5}}>{String.fromCharCode(65+i)}.</span>{opt}</button>;})}</div>):null)}
+        {view==="quiz"&&(loading?<div style={{ textAlign:"center",padding:"60px 20px" }}><div style={{ fontSize:48,animation:"spin 2s linear infinite" }}>🧠</div><p style={{ color:C.muted,marginTop:16 }}>Generating quiz...</p></div>:quizError?(<div style={{ textAlign:"center",padding:"40px 20px" }}><div style={{ fontSize:48,marginBottom:12 }}>⚠️</div><div style={{ fontWeight:800,fontSize:15,color:C.text,marginBottom:8 }}>Couldn't generate a quiz</div><p style={{ color:C.muted,fontSize:13,marginBottom:20 }}>{quizError}</p><button onClick={generateQuiz} style={{ background:"linear-gradient(135deg,"+note.color+",#A78BFA)",color:"#fff",border:"none",borderRadius:14,padding:"12px 28px",fontWeight:800,fontSize:14,cursor:"pointer" }}>Try Again</button></div>):quizDone?(<div style={{ textAlign:"center",padding:"40px 20px" }}><div style={{ fontSize:64,marginBottom:16 }}>{score===quiz.length?"🏆":"📖"}</div><div style={{ fontSize:40,fontWeight:800,color:C.text }}>{score}/{quiz.length}</div><p style={{ color:C.muted,marginTop:8 }}>{score===quiz.length?"Perfect! 🔥":"Keep studying! 💪"}</p><button onClick={function(){setQuizIdx(0);setSelected(null);setScore(0);setQuizDone(false);}} style={{ marginTop:20,background:"linear-gradient(135deg,"+note.color+",#A78BFA)",color:"#fff",border:"none",borderRadius:14,padding:"13px 32px",fontWeight:800,fontSize:15,cursor:"pointer" }}>Try Again</button></div>):quiz.length>0?(<div><div style={{ display:"flex",justifyContent:"space-between",marginBottom:8 }}><span style={{ fontSize:13,color:C.muted }}>Question {quizIdx+1}/{quiz.length}</span><span style={{ fontSize:13,fontWeight:700,color:C.text }}>Score: {score}</span></div><div style={{ height:4,background:C.border,borderRadius:2,marginBottom:20 }}><div style={{ height:4,background:note.color,borderRadius:2,width:(quizIdx/quiz.length*100)+"%",transition:"width 0.3s" }}/></div><div style={{ background:C.card,borderRadius:16,padding:20,marginBottom:16,border:"1px solid "+C.border }}><p style={{ margin:0,fontSize:16,fontWeight:600,color:C.text,lineHeight:1.6 }}>{quiz[quizIdx].question}</p></div>{quiz[quizIdx].options.map(function(opt,i){var bg=C.card,border=C.border,color=C.text;if(selected!==null){if(i===quiz[quizIdx].answer){bg="rgba(52,211,153,0.15)";border="#34D399";color="#34D399";}else if(i===selected){bg="rgba(248,113,113,0.15)";border="#F87171";color="#F87171";}}return<button key={i} onClick={function(){pick(i);}} disabled={selected!==null} style={{ width:"100%",textAlign:"left",background:bg,border:"2px solid "+border,borderRadius:12,padding:"13px 16px",marginBottom:10,fontSize:14,color:color,cursor:selected!==null?"default":"pointer",fontWeight:500,display:"flex",gap:10,fontFamily:"inherit" }}><span style={{opacity:0.5}}>{String.fromCharCode(65+i)}.</span>{opt}</button>;})}</div>):null)}
       </div>
     </div>
   );
@@ -2185,7 +2595,7 @@ function DashboardScreen({ notes, user, credits, plan, profile, onOpenAnalytics,
         <button onClick={onOpenAnalytics} style={{ width:"100%",display:"flex",alignItems:"center",gap:14,background:"linear-gradient(135deg,rgba(245,158,11,0.12),rgba(239,68,68,0.12))",border:"1px solid rgba(245,158,11,0.3)",borderRadius:18,padding:"18px",cursor:"pointer",textAlign:"left" }}>
           <div style={{ width:44,height:44,borderRadius:12,background:"linear-gradient(135deg,#F59E0B,#EF4444)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,flexShrink:0 }}>📊</div>
           <div style={{ flex:1 }}>
-            <div style={{ display:"flex",alignItems:"center",gap:8 }}><span style={{ fontWeight:800,fontSize:14,color:C.text }}>Advanced Analytics</span>{plan!=="premium"&&<span style={{ fontSize:9,fontWeight:800,color:C.amber,background:"rgba(245,158,11,0.15)",borderRadius:99,padding:"2px 7px" }}>PRO</span>}</div>
+            <div style={{ display:"flex",alignItems:"center",gap:8 }}><span style={{ fontWeight:800,fontSize:14,color:C.text }}>Advanced Analytics</span>{!planAtLeast(plan,"pro")&&<span style={{ fontSize:9,fontWeight:800,color:C.amber,background:"rgba(245,158,11,0.15)",borderRadius:99,padding:"2px 7px" }}>PRO</span>}</div>
             <div style={{ fontSize:12,color:C.muted,marginTop:2 }}>30-day trends, course health, exam score history &amp; more</div>
           </div>
           <span style={{ color:C.muted,fontSize:18 }}>›</span>
@@ -2202,7 +2612,7 @@ function DashboardScreen({ notes, user, credits, plan, profile, onOpenAnalytics,
 // required Exam Mode to actually start persisting results (it was fully ephemeral
 // before this), so this is the first place that data has ever been usable.
 function AdvancedAnalyticsScreen({ notes, assignments, examResults, plan, onBack, onUpgrade }) {
-  if (plan!=="premium") {
+  if (!planAtLeast(plan, "pro")) {
     return (
       <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
         <div style={{ background:C.card,padding:"16px 20px",display:"flex",alignItems:"center",gap:12,borderBottom:"1px solid "+C.border }}>
@@ -2211,9 +2621,9 @@ function AdvancedAnalyticsScreen({ notes, assignments, examResults, plan, onBack
         </div>
         <div style={{ flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:32,textAlign:"center" }}>
           <div style={{ fontSize:56,marginBottom:16 }}>📊</div>
-          <div style={{ fontWeight:800,fontSize:18,color:C.text,marginBottom:8 }}>Advanced Analytics is a Premium feature</div>
+          <div style={{ fontWeight:800,fontSize:18,color:C.text,marginBottom:8 }}>Advanced Analytics is a Pro feature</div>
           <p style={{ color:C.muted,fontSize:13,lineHeight:1.6,marginBottom:24,maxWidth:280 }}>30-day trends, study time patterns, course health, and real exam score history — not just the basics.</p>
-          <button onClick={onUpgrade} style={{ background:"linear-gradient(135deg,#F59E0B,#EF4444)",color:"#fff",border:"none",borderRadius:14,padding:"14px 32px",fontWeight:800,fontSize:15,cursor:"pointer" }}>🚀 Upgrade to Premium</button>
+          <button onClick={onUpgrade} style={{ background:"linear-gradient(135deg,#F59E0B,#EF4444)",color:"#fff",border:"none",borderRadius:14,padding:"14px 32px",fontWeight:800,fontSize:15,cursor:"pointer" }}>🚀 Upgrade to Pro</button>
         </div>
       </div>
     );
@@ -2396,7 +2806,7 @@ function missionCtaFor(type){
   })[type] || { label:"Open" };
 }
 
-function CommandCenterScreen({ notes, recordings, assignments, topicMastery, user, plan, onVoice, onDraw, onAIWrite, onScan, onChat, onRecordings, onStudyPlanner, onExamMode, onAssignments, onFlashcards, onAITutor, onSearch, onNotifications, onProfile, unreadCount, onOpenMission, onOpenCourse, onOpenTopic, onStartStudySession, onOpenVault, onOpenUpcoming, onOpenProgress, onCreateNote, onUploadMaterial, onAddAssignmentDirect }) {
+function CommandCenterScreen({ notes, recordings, assignments, topicMastery, courses, user, plan, onVoice, onDraw, onAIWrite, onScan, onChat, onRecordings, onStudyPlanner, onExamMode, onAssignments, onFlashcards, onAITutor, onSearch, onNotifications, onProfile, unreadCount, onOpenMission, onOpenCourse, onOpenTopic, onStartStudySession, onOpenVault, onOpenUpcoming, onOpenProgress, onCreateNote, onUploadMaterial, onAddAssignmentDirect }) {
   var [showAddMenu, setShowAddMenu] = useState(false);
   var [showAskMenu, setShowAskMenu] = useState(false);
   var [askMenuPhase, setAskMenuPhase] = useState("options"); // "options" | "course" — course sub-step only shown for "Ask about this course" when there's more than one course
@@ -2430,7 +2840,10 @@ function CommandCenterScreen({ notes, recordings, assignments, topicMastery, use
   var medCount = recommendations.filter(function(r){return r.priority==="medium";}).length;
   var lowCount = recommendations.filter(function(r){return r.priority==="low";}).length;
 
-  var courseList = Array.from(new Set(notes.map(function(n){return n.course;})));
+  // Widened to include real Course records (not just note-derived names) so a
+  // course with materials/a study plan but not a single note yet still shows
+  // up as a chip here — real courses first, then any legacy note-only names.
+  var courseList = Array.from(new Set((courses||[]).map(function(c){return c.code||c.title;}).filter(Boolean).concat(notes.map(function(n){return n.course;}))));
   var courseCounts = {};
   notes.forEach(function(n){ courseCounts[n.course]=(courseCounts[n.course]||0)+1; });
 
@@ -2440,7 +2853,10 @@ function CommandCenterScreen({ notes, recordings, assignments, topicMastery, use
   var upcomingAssignments = assignments.filter(function(a){ return !a.completed && a.dueDate; })
     .slice().sort(function(a,b){ return (a.dueDate||"").localeCompare(b.dueDate||""); }).slice(0,4);
 
-  var QUICK_ACTIONS = [["🎤","Record\nLecture",C.cyan,onVoice,false],["✨","AI\nWrite",C.purple,onAIWrite,false],["💬","Ask\nJotting",C.cyan,function(){setShowAskMenu(true);},false],["📷","Scan\nDoc",C.amber,onScan,false],["🖊️","Draw",C.green,onDraw,false],["📁","My\nRecordings",C.purple,onRecordings,false],["🗓️","Study\nPlanner",C.amber,onStudyPlanner,true],["🎯","Exam\nMode",C.red,onExamMode,true],["📋","Assignments",C.green,onAssignments,false],["🗂️","Flashcards",C.purple,onFlashcards,false],["🎓","AI\nTutor",C.amber,onAITutor,true],["🧭","Study\nSession",C.cyan,onStartStudySession,false],["🗄️","Study\nVault",C.cyan,onOpenVault,false],["📅","Upcoming",C.purple,onOpenUpcoming,false],["📈","Progress",C.cyan,onOpenProgress,false]];
+  // 5th element is the required plan tier for a locked action: false = no gate,
+  // "pro" = Pro-and-above (Study Planner, AI Tutor), "premium" = Premium-only
+  // (Exam Mode) — checked against planAtLeast() below, not a plain "premium" string.
+  var QUICK_ACTIONS = [["🎤","Record\nLecture",C.cyan,onVoice,false],["✨","AI\nWrite",C.purple,onAIWrite,false],["💬","Ask\nJotting",C.cyan,function(){setShowAskMenu(true);},false],["📷","Scan\nDoc",C.amber,onScan,false],["🖊️","Draw",C.green,onDraw,false],["📁","My\nRecordings",C.purple,onRecordings,false],["🗓️","Study\nPlanner",C.amber,onStudyPlanner,"pro"],["🎯","Exam\nMode",C.red,onExamMode,"premium"],["📋","Assignments",C.green,onAssignments,false],["🗂️","Flashcards",C.purple,onFlashcards,false],["🎓","AI\nTutor",C.amber,onAITutor,"pro"],["🧭","Study\nSession",C.cyan,onStartStudySession,false],["🗄️","Study\nVault",C.cyan,onOpenVault,false],["📅","Upcoming",C.purple,onOpenUpcoming,false],["📈","Progress",C.cyan,onOpenProgress,false]];
 
   // Every option here funnels into the SAME AIScreen instance via onChat(seed)
   // — this is a launcher for different ways to start talking to SAM-X, not a
@@ -2484,7 +2900,7 @@ function CommandCenterScreen({ notes, recordings, assignments, topicMastery, use
         <div style={{ position:"absolute",top:-40,right:-40,width:160,height:160,borderRadius:"50%",background:"rgba(6,182,212,0.07)" }}/>
         <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20,position:"relative" }}>
           <div style={{ display:"flex",alignItems:"center",gap:10 }}>
-            <div style={{ width:40,height:40,borderRadius:12,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20 }}>🎵</div>
+            <div style={{ width:40,height:40,borderRadius:12,overflow:"hidden" }}><img src="/jotting-logo.png" alt="Jotting AI" style={{ width:"100%",height:"100%",objectFit:"cover" }}/></div>
             <span style={{ fontWeight:800,fontSize:20,color:C.text }}>Jotting <span style={{ color:C.cyan }}>AI</span></span>
           </div>
           <div style={{ display:"flex",gap:8 }}>
@@ -2556,7 +2972,7 @@ function CommandCenterScreen({ notes, recordings, assignments, topicMastery, use
               {courseList.map(function(c){ return(
                 <button key={c} onClick={function(){onOpenCourse(c);}} style={{ background:C.card,border:"1px solid "+C.border,borderRadius:14,padding:"12px 16px",flexShrink:0,minWidth:100,cursor:"pointer",textAlign:"left",fontFamily:"inherit" }}>
                   <div style={{ fontWeight:800,fontSize:13,color:C.text,whiteSpace:"nowrap" }}>{c}</div>
-                  <div style={{ fontSize:11,color:C.muted,marginTop:3 }}>{courseCounts[c]} note{courseCounts[c]===1?"":"s"}</div>
+                  <div style={{ fontSize:11,color:C.muted,marginTop:3 }}>{courseCounts[c]||0} note{courseCounts[c]===1?"":"s"}</div>
                 </button>
               );})}
             </div>
@@ -2612,7 +3028,7 @@ function CommandCenterScreen({ notes, recordings, assignments, topicMastery, use
         <div>
           <div style={{ fontWeight:800,fontSize:16,color:C.text,margin:"0 0 12px" }}>Quick Actions</div>
           <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10 }}>
-            {QUICK_ACTIONS.map(function(item){ var locked=item[4]&&plan!=="premium"; return(
+            {QUICK_ACTIONS.map(function(item){ var locked=item[4]&&!planAtLeast(plan,item[4]); return(
               <button key={item[1]} onClick={item[3]} style={{ position:"relative",background:C.card,border:"1px solid "+item[2]+"30",borderRadius:14,padding:"14px 8px",cursor:"pointer",textAlign:"center" }}>
                 {locked&&<span style={{ position:"absolute",top:6,right:6,fontSize:9,fontWeight:800,color:C.amber,background:"rgba(245,158,11,0.15)",borderRadius:99,padding:"2px 6px" }}>PRO</span>}
                 <div style={{ width:38,height:38,borderRadius:10,background:item[2]+"20",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 8px",fontSize:20 }}>{item[0]}</div>
@@ -3152,15 +3568,23 @@ function ProgressInsightsScreen({ studySessions, examResults, topicMastery, onBa
 var MATERIAL_TYPE_ICON = { lecture_note:"📝", lecture_slide:"🖼️", handout:"📄", pdf:"📕", document:"📃", image:"🖼️", recording:"🎙️", transcript:"📜", past_question:"❓", assignment:"📋", other:"📦" };
 var MATERIAL_TYPE_LABEL = { lecture_note:"Lecture Note", lecture_slide:"Slide", handout:"Handout", pdf:"PDF", document:"Document", image:"Image", recording:"Recording", transcript:"Transcript", past_question:"Past Question", assignment:"Assignment", other:"Material" };
 
-function CourseOverviewScreen({ course, assignments, topicMastery, materials, onBack, onAITutor, onFlashcards, onExamMode, onOpenTopic }) {
+function CourseOverviewScreen({ course, courses, assignments, topicMastery, materials, onBack, onAITutor, onFlashcards, onExamMode, onOpenTopic }) {
   var [tab, setTab] = useState("overview");
   var [materialSearch, setMaterialSearch] = useState("");
   var [materialTypeFilter, setMaterialTypeFilter] = useState("All");
   var [detailMaterial, setDetailMaterial] = useState(null);
 
+  // Materials may be keyed by the OLD shim (courseId === course NAME, from
+  // before real Course ids existed) or the NEW real Course id
+  // (UploadMaterialScreen, going forward) — match either, so nothing already
+  // saved silently disappears from this screen now that real ids exist.
+  // topicMastery/assignments are UNCHANGED — still name-matched, since that
+  // migration is blocked pending topicMasteryRepository.js/
+  // topicMasteryService.js/recommendationService.js (not available to inspect).
+  var matchingCourseRecord = (courses||[]).find(function(c){ return (c.code||c.title)===course; });
   var myMastery = topicMastery.filter(function(m){ return m.courseId===course; });
   var myAssignments = assignments.filter(function(a){ return a.course===course; });
-  var myMaterials = materials.filter(function(m){ return m.courseId===course; }).slice().sort(function(a,b){ return (b.updatedAt||b.createdAt||0)-(a.updatedAt||a.createdAt||0); });
+  var myMaterials = materials.filter(function(m){ return m.courseId===course || (matchingCourseRecord && m.courseId===matchingCourseRecord.id); }).slice().sort(function(a,b){ return (b.updatedAt||b.createdAt||0)-(a.updatedAt||a.createdAt||0); });
 
   // Recent = the actual most-recently-touched materials, independent of any
   // search/filter below — myMaterials is already sorted newest-first, so this
@@ -3418,11 +3842,19 @@ function CourseOverviewScreen({ course, assignments, topicMastery, materials, on
 // it doesn't. There's no semesters lookup available to resolve an id to a
 // readable name; if one gets wired in elsewhere later, that's the one seam to
 // swap in here.
-function StudyVaultScreen({ notes, recordings, materials, quizzes, flashcardDecks, courses, onBack, onOpenCourse }) {
+function StudyVaultScreen({ notes, recordings, materials, quizzes, flashcardDecks, courses, semesters, onBack, onOpenCourse, onManageSemesters, onManageCourses }) {
+  // Materials may be keyed by the OLD shim (courseId === course NAME) or the
+  // NEW real Course id — this resolves either back to a display name, so a
+  // material never shows up as a bare numeric id in the vault, and existing
+  // materials keep grouping correctly alongside newly-created ones.
+  function materialCourseDisplayName(m){
+    var byId = (courses||[]).find(function(c){ return c.id===m.courseId; });
+    return byId ? (byId.code||byId.title) : m.courseId;
+  }
   var courseNames = Array.from(new Set(
     notes.map(function(n){return n.course;})
       .concat(recordings.map(function(r){return r.course;}))
-      .concat(materials.map(function(m){return m.courseId;}))
+      .concat(materials.map(materialCourseDisplayName))
       .concat(quizzes.map(function(q){return q.course;}))
       .concat(flashcardDecks.map(function(d){return d.course;}))
       .concat(courses.map(function(c){return c.code||c.title;}))
@@ -3443,7 +3875,7 @@ function StudyVaultScreen({ notes, recordings, materials, quizzes, flashcardDeck
     return {
       notes: notes.filter(function(n){return n.course===name;}).length,
       recordings: recordings.filter(function(r){return r.course===name;}).length,
-      materials: materials.filter(function(m){return m.courseId===name;}).length,
+      materials: materials.filter(function(m){return materialCourseDisplayName(m)===name;}).length,
       quizzes: quizzes.filter(function(q){return q.course===name;}).length,
       flashcards: flashcardDecks.filter(function(d){return d.course===name;}).length,
     };
@@ -3462,7 +3894,9 @@ function StudyVaultScreen({ notes, recordings, materials, quizzes, flashcardDeck
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
       <div style={{ background:C.card,padding:"16px 20px",display:"flex",alignItems:"center",gap:12,borderBottom:"1px solid "+C.border }}>
         <button onClick={onBack} style={backBtn}>←</button>
-        <span style={{ fontWeight:800,fontSize:16,color:C.text }}>🗄️ Study Vault</span>
+        <span style={{ fontWeight:800,fontSize:16,color:C.text,flex:1 }}>🗄️ Study Vault</span>
+        <button onClick={onManageCourses} title="Manage Courses" style={{ background:"rgba(255,255,255,0.08)",border:"none",borderRadius:10,width:36,height:36,cursor:"pointer",fontSize:15,marginRight:8 }}>📚</button>
+        <button onClick={onManageSemesters} title="Manage Semesters" style={{ background:"rgba(255,255,255,0.08)",border:"none",borderRadius:10,width:36,height:36,cursor:"pointer",fontSize:15 }}>🗓️</button>
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:20 }}>
         {courseNames.length===0 ? (
@@ -3475,7 +3909,7 @@ function StudyVaultScreen({ notes, recordings, materials, quizzes, flashcardDeck
           var names = groups[semId];
           return (
             <div key={semId} style={{ marginBottom:24 }}>
-              <div style={{ fontSize:11,fontWeight:800,color:C.muted,letterSpacing:1,marginBottom:10,textTransform:"uppercase" }}>{semId==="unsorted" ? "All Courses" : "Semester "+semId}</div>
+              <div style={{ fontSize:11,fontWeight:800,color:C.muted,letterSpacing:1,marginBottom:10,textTransform:"uppercase" }}>{semId==="unsorted" ? "All Courses" : ((semesters||[]).find(function(s){return s.id===semId;})||{}).name || "Semester"}</div>
               <div style={{ background:C.card,borderRadius:16,padding:"0 16px",border:"1px solid "+C.border }}>
                 {names.map(function(name){ return <Row key={name} icon="📚" label={name} sub={summaryLine(countsFor(name))} onPress={function(){onOpenCourse(name);}}/>; })}
               </div>
@@ -3491,10 +3925,13 @@ function StudyVaultScreen({ notes, recordings, materials, quizzes, flashcardDeck
 // Material. Every section below reads straight from the same arrays the rest
 // of the app already loads (notes/recordings/materials/quizzes/flashcardDecks),
 // filtered to this one course; nothing here fetches or computes anything new.
-function StudyVaultCourseScreen({ course, notes, recordings, materials, quizzes, flashcardDecks, onBack, onOpenNote, onOpenRecordings }) {
+function StudyVaultCourseScreen({ course, courses, notes, recordings, materials, quizzes, flashcardDecks, onBack, onOpenNote, onOpenRecordings }) {
+  // Same OLD-shim-or-NEW-real-id dual match as CourseOverviewScreen/
+  // StudyVaultScreen — see those for why.
+  var matchingCourseRecord = (courses||[]).find(function(c){ return (c.code||c.title)===course; });
   var myNotes = notes.filter(function(n){ return n.course===course; });
   var myRecordings = recordings.filter(function(r){ return r.course===course; });
-  var myMaterials = materials.filter(function(m){ return m.courseId===course; });
+  var myMaterials = materials.filter(function(m){ return m.courseId===course || (matchingCourseRecord && m.courseId===matchingCourseRecord.id); });
   var myQuizzes = quizzes.filter(function(q){ return q.course===course; });
   var myDecks = flashcardDecks.filter(function(d){ return d.course===course; });
 
@@ -3559,6 +3996,301 @@ function StudyVaultCourseScreen({ course, notes, recordings, materials, quizzes,
         )}
 
       </div>
+    </div>
+  );
+}
+
+// ── MANAGE SEMESTERS ──────────────────────────────────────────────────────────
+// Real Semester CRUD, reached from Study Vault's header — the same place the
+// dormant "Semester {id}" grouping already lives. semestersRepository already
+// had full create/get/list/update/delete (built earlier, never wired to any
+// UI). This is that wiring, plus the one thing needed to make Study Vault's
+// grouping mean anything: a way to actually put a course IN a semester.
+//
+// COURSE ASSIGNMENT lives here, not on the course-creation screens (Voice Note,
+// Scan Doc, etc.) — those all use the shared CourseChipPicker's quick single-
+// string "+ Add Course" flow, and bolting a semester picker onto that would
+// change a fast inline flow used across seven screens into a multi-step form,
+// which is a real redesign, not a fix. A course created via quick-add simply
+// starts unassigned (semesterId stays unset) until placed into a semester here.
+//
+// Deleting a semester clears semesterId on any course pointed at it (see
+// deleteSemesterRecord in App) rather than leaving a dangling reference —
+// this screen doesn't need to know that happened, it just re-renders once
+// `courses` updates.
+function ManageSemestersScreen({ semesters, courses, onBack, onAdd, onUpdate, onDelete, onUpdateCourse }) {
+  var [showForm, setShowForm] = useState(false);
+  var [editingId, setEditingId] = useState(null);
+  var [fName, setFName] = useState("");
+  var [fYear, setFYear] = useState("");
+  var [fStart, setFStart] = useState("");
+  var [fEnd, setFEnd] = useState("");
+  var [fStatus, setFStatus] = useState("active");
+  var [error, setError] = useState("");
+  var [detailId, setDetailId] = useState(null);
+
+  function openAdd(){ setEditingId(null); setFName(""); setFYear(""); setFStart(""); setFEnd(""); setFStatus("active"); setError(""); setShowForm(true); }
+  function openEdit(s){ setEditingId(s.id); setFName(s.name||""); setFYear(s.academicYear||""); setFStart(s.startDate||""); setFEnd(s.endDate||""); setFStatus(s.status||"active"); setError(""); setShowForm(true); }
+  function submit(){
+    if(!fName.trim()){ setError("Give this semester a name."); return; }
+    var payload = { name:fName.trim(), academicYear:fYear.trim(), startDate:fStart, endDate:fEnd, status:fStatus };
+    if(editingId){ onUpdate(editingId, payload); } else { onAdd(payload); }
+    setShowForm(false);
+  }
+  function confirmDelete(s){ if(window.confirm("Delete \""+s.name+"\"? Courses in it will become unassigned — nothing about them is deleted.")){ onDelete(s.id); setDetailId(null); } }
+
+  var STATUS_META = { upcoming:["Upcoming",C.amber], active:["Active",C.green], completed:["Completed",C.muted] };
+  function fmtRange(s){ if(!s.startDate&&!s.endDate) return null; return (s.startDate||"?")+" → "+(s.endDate||"?"); }
+
+  var detailSemester = detailId!=null ? semesters.find(function(s){return s.id===detailId;}) : null;
+  var detailCourses = detailSemester ? courses.filter(function(c){return c.semesterId===detailSemester.id;}) : [];
+  var unassignedForDetail = detailSemester ? courses.filter(function(c){return c.semesterId!==detailSemester.id;}) : [];
+
+  return(
+    <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column",position:"relative" }}>
+      <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
+        <button onClick={onBack} style={backBtn}>←</button>
+        <span style={{ fontWeight:800,fontSize:16,color:C.text }}>🗓️ Manage Semesters</span>
+        <button onClick={openAdd} style={{ background:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:"#fff",border:"none",borderRadius:10,padding:"8px 14px",fontWeight:800,fontSize:13,cursor:"pointer" }}>+ Add</button>
+      </div>
+      <div style={{ flex:1,overflowY:"auto",padding:20 }}>
+        {semesters.length===0 ? (
+          <div style={{ textAlign:"center",padding:"60px 20px" }}>
+            <div style={{ fontSize:48,marginBottom:12 }}>🗓️</div>
+            <div style={{ fontWeight:800,fontSize:16,color:C.text,marginBottom:6 }}>No semesters yet</div>
+            <div style={{ fontSize:13,color:C.muted,marginBottom:20 }}>Add one, then assign your courses to it — Study Vault will group by it automatically.</div>
+            <button onClick={openAdd} style={{ background:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:"#fff",border:"none",borderRadius:14,padding:"12px 28px",fontWeight:800,fontSize:14,cursor:"pointer" }}>+ Add Semester</button>
+          </div>
+        ) : semesters.map(function(s){
+          var meta = STATUS_META[s.status] || STATUS_META.active;
+          var courseCount = courses.filter(function(c){return c.semesterId===s.id;}).length;
+          var range = fmtRange(s);
+          return(
+            <button key={s.id} onClick={function(){setDetailId(s.id);}} style={{ width:"100%",textAlign:"left",background:C.card,borderRadius:16,padding:16,marginBottom:12,border:"1px solid "+C.border,cursor:"pointer",fontFamily:"inherit" }}>
+              <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10 }}>
+                <div style={{ minWidth:0 }}>
+                  <div style={{ fontWeight:800,fontSize:15,color:C.text }}>{s.name}</div>
+                  {s.academicYear&&<div style={{ fontSize:12,color:C.muted,marginTop:2 }}>{s.academicYear}</div>}
+                  {range&&<div style={{ fontSize:11,color:C.muted,marginTop:2 }}>{range}</div>}
+                </div>
+                <span style={{ fontSize:10,fontWeight:800,color:meta[1],background:meta[1]+"18",borderRadius:99,padding:"3px 10px",flexShrink:0 }}>{meta[0]}</span>
+              </div>
+              <div style={{ fontSize:12,color:C.cyan,fontWeight:700,marginTop:10 }}>{courseCount} course{courseCount===1?"":"s"}</div>
+            </button>
+          );
+        })}
+      </div>
+
+      {showForm&&(
+        <div style={{ position:"absolute",inset:0,background:"rgba(10,15,30,0.85)",display:"flex",alignItems:"flex-end",justifyContent:"center",zIndex:30 }} onClick={function(){setShowForm(false);}}>
+          <div style={{ background:C.card,borderRadius:"20px 20px 0 0",padding:20,width:"100%",maxHeight:"85vh",overflowY:"auto",boxSizing:"border-box" }} onClick={function(e){e.stopPropagation();}}>
+            <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16 }}>
+              <span style={{ fontWeight:800,fontSize:16,color:C.text }}>{editingId?"Edit Semester":"New Semester"}</span>
+              <button onClick={function(){setShowForm(false);}} style={{ background:"none",border:"none",color:C.muted,fontSize:18,cursor:"pointer" }}>✕</button>
+            </div>
+            <input value={fName} onChange={function(e){setFName(e.target.value);}} placeholder="e.g. First Semester" style={{ width:"100%",padding:"13px 16px",borderRadius:12,border:"1px solid "+C.border,fontSize:15,fontWeight:700,background:C.bg,color:C.text,outline:"none",marginBottom:12,boxSizing:"border-box" }}/>
+            <input value={fYear} onChange={function(e){setFYear(e.target.value);}} placeholder="Academic year (e.g. 2025/2026)" style={{ width:"100%",padding:"11px 14px",borderRadius:12,border:"1px solid "+C.border,fontSize:13,background:C.bg,color:C.text,outline:"none",marginBottom:12,boxSizing:"border-box" }}/>
+            <div style={{ display:"flex",gap:10,marginBottom:12 }}>
+              <div style={{ flex:1 }}>
+                <label style={{ fontSize:12,fontWeight:700,color:C.soft,display:"block",marginBottom:6 }}>START DATE</label>
+                <input type="date" value={fStart} onChange={function(e){setFStart(e.target.value);}} style={{ width:"100%",padding:"11px 14px",borderRadius:12,border:"1px solid "+C.border,fontSize:13,background:C.bg,color:C.text,outline:"none",boxSizing:"border-box" }}/>
+              </div>
+              <div style={{ flex:1 }}>
+                <label style={{ fontSize:12,fontWeight:700,color:C.soft,display:"block",marginBottom:6 }}>END DATE</label>
+                <input type="date" value={fEnd} onChange={function(e){setFEnd(e.target.value);}} style={{ width:"100%",padding:"11px 14px",borderRadius:12,border:"1px solid "+C.border,fontSize:13,background:C.bg,color:C.text,outline:"none",boxSizing:"border-box" }}/>
+              </div>
+            </div>
+            <label style={{ fontSize:12,fontWeight:700,color:C.soft,display:"block",marginBottom:6 }}>STATUS</label>
+            <div style={{ display:"flex",gap:8,marginBottom:16 }}>{["upcoming","active","completed"].map(function(st){return<button key={st} onClick={function(){setFStatus(st);}} style={{ flex:1,padding:"9px",borderRadius:10,border:"2px solid",borderColor:fStatus===st?C.cyan:C.border,background:fStatus===st?C.cyan:C.card2,color:fStatus===st?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer",textTransform:"capitalize" }}>{st}</button>;})}</div>
+            {error&&<div style={{ background:"rgba(248,113,113,0.1)",border:"1px solid rgba(248,113,113,0.3)",borderRadius:10,padding:"10px 14px",marginBottom:12,fontSize:13,color:C.red,fontWeight:600 }}>⚠️ {error}</div>}
+            <div style={{ display:"flex",gap:10 }}>
+              {editingId&&<button onClick={function(){var s=semesters.find(function(x){return x.id===editingId;});if(s)confirmDelete(s);setShowForm(false);}} style={{ background:"rgba(248,113,113,0.1)",border:"1px solid "+C.red+"40",borderRadius:14,padding:"13px 16px",color:C.red,fontWeight:700,fontSize:14,cursor:"pointer" }}>🗑</button>}
+              <button onClick={submit} style={{ flex:1,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:"#fff",border:"none",borderRadius:14,padding:"13px",fontWeight:800,fontSize:15,cursor:"pointer" }}>{editingId?"Save Changes":"Add Semester"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {detailSemester&&(
+        <div style={{ position:"absolute",inset:0,background:"rgba(10,15,30,0.85)",display:"flex",alignItems:"flex-end",justifyContent:"center",zIndex:30 }} onClick={function(){setDetailId(null);}}>
+          <div style={{ background:C.card,borderRadius:"20px 20px 0 0",padding:20,width:"100%",maxHeight:"85vh",overflowY:"auto",boxSizing:"border-box" }} onClick={function(e){e.stopPropagation();}}>
+            <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16 }}>
+              <div>
+                <div style={{ fontWeight:800,fontSize:17,color:C.text }}>{detailSemester.name}</div>
+                {detailSemester.academicYear&&<div style={{ fontSize:12,color:C.muted,marginTop:2 }}>{detailSemester.academicYear}</div>}
+              </div>
+              <div style={{ display:"flex",gap:8 }}>
+                <button onClick={function(){openEdit(detailSemester);setDetailId(null);}} style={{ background:C.card2,border:"1px solid "+C.border,borderRadius:8,padding:"6px 12px",color:C.cyan,fontSize:12,fontWeight:700,cursor:"pointer" }}>Edit</button>
+                <button onClick={function(){confirmDelete(detailSemester);}} style={{ background:"rgba(248,113,113,0.12)",border:"none",borderRadius:8,width:32,height:32,cursor:"pointer",fontSize:13 }}>🗑</button>
+              </div>
+            </div>
+            <div style={{ fontWeight:800,fontSize:14,color:C.text,marginBottom:10 }}>Courses in this semester ({detailCourses.length})</div>
+            {detailCourses.length===0 ? (
+              <div style={{ fontSize:13,color:C.muted,marginBottom:16 }}>No courses assigned yet — add one below.</div>
+            ) : (
+              <div style={{ marginBottom:16 }}>{detailCourses.map(function(c){return(
+                <div key={c.id} style={{ display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:"1px solid "+C.border }}>
+                  <span style={{ fontSize:14,fontWeight:600,color:C.text }}>{c.code||c.title}</span>
+                  <button onClick={function(){onUpdateCourse(c.id,{semesterId:null});}} style={{ background:"none",border:"1px solid "+C.border,borderRadius:8,padding:"5px 12px",color:C.muted,fontSize:11,fontWeight:700,cursor:"pointer" }}>Remove</button>
+                </div>
+              );})}</div>
+            )}
+            {unassignedForDetail.length>0 && (
+              <div>
+                <div style={{ fontWeight:800,fontSize:13,color:C.text,marginBottom:10 }}>Add a course</div>
+                <div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{unassignedForDetail.map(function(c){return(
+                  <button key={c.id} onClick={function(){onUpdateCourse(c.id,{semesterId:detailSemester.id});}} style={{ padding:"7px 14px",borderRadius:99,border:"2px solid "+C.border,background:C.card2,color:C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>+ {c.code||c.title}</button>
+                );})}</div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── MANAGE COURSES ────────────────────────────────────────────────────────────
+// Real Course CRUD UI — updateCourseRecord/deleteCourseRecord have existed
+// since Course IDs were introduced but never had a screen. Mirrors
+// ManageSemestersScreen's exact list+form+detail shape directly above.
+//
+// Deleting a course here also cleans up what points at it — materials lose
+// their courseId (set to null, becoming "uncategorized" rather than pointing
+// at nothing), and any study plan's courseIds array has the deleted id
+// removed — see deleteCourseRecord in App for the actual cleanup logic; this
+// screen just triggers it and re-renders once state updates. Assignments,
+// notes, recordings, quizzes, and flashcards are untouched — all still
+// name-based, never migrated, so a deleted course's name simply stops
+// existing as a real option going forward, exactly like any other legacy
+// free-text name always has.
+function ManageCoursesScreen({ courses, semesters, onBack, onAdd, onUpdate, onDelete }) {
+  var [showForm, setShowForm] = useState(false);
+  var [editingId, setEditingId] = useState(null);
+  var [fCode, setFCode] = useState("");
+  var [fTitle, setFTitle] = useState("");
+  var [fDepartment, setFDepartment] = useState("");
+  var [fLevel, setFLevel] = useState("");
+  var [fUnits, setFUnits] = useState("");
+  var [fSemesterId, setFSemesterId] = useState(null);
+  var [fStatus, setFStatus] = useState("active");
+  var [error, setError] = useState("");
+  var [detailId, setDetailId] = useState(null);
+
+  function openAdd(){ setEditingId(null); setFCode(""); setFTitle(""); setFDepartment(""); setFLevel(""); setFUnits(""); setFSemesterId(null); setFStatus("active"); setError(""); setShowForm(true); }
+  function openEdit(c){ setEditingId(c.id); setFCode(c.code||""); setFTitle(c.title||""); setFDepartment(c.department||""); setFLevel(c.level||""); setFUnits(c.units!=null?String(c.units):""); setFSemesterId(c.semesterId!=null?c.semesterId:null); setFStatus(c.status||"active"); setError(""); setShowForm(true); }
+  function submit(){
+    if(!fCode.trim()){ setError("Give this course a code (e.g. PHY 101)."); return; }
+    var payload = {
+      code: fCode.trim().toUpperCase(),
+      title: fTitle.trim(),
+      department: fDepartment.trim(),
+      level: fLevel.trim(),
+      units: fUnits.trim() ? Number(fUnits.trim()) : null,
+      semesterId: fSemesterId,
+      status: fStatus,
+    };
+    if(editingId){ onUpdate(editingId, payload); } else { onAdd(payload); }
+    setShowForm(false);
+  }
+  function confirmDelete(c){ if(window.confirm("Delete \""+(c.code||c.title)+"\"? Materials in it become uncategorized and it's removed from any study plans — nothing about those is deleted, just unlinked.")){ onDelete(c.id); setDetailId(null); } }
+
+  var STATUS_META = { active:["Active",C.green], completed:["Completed",C.muted] };
+  var detailCourse = detailId!=null ? courses.find(function(c){return c.id===detailId;}) : null;
+  function semesterNameFor(semesterId){ var s=(semesters||[]).find(function(x){return x.id===semesterId;}); return s?s.name:null; }
+
+  return(
+    <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column",position:"relative" }}>
+      <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
+        <button onClick={onBack} style={backBtn}>←</button>
+        <span style={{ fontWeight:800,fontSize:16,color:C.text }}>📚 Manage Courses</span>
+        <button onClick={openAdd} style={{ background:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:"#fff",border:"none",borderRadius:10,padding:"8px 14px",fontWeight:800,fontSize:13,cursor:"pointer" }}>+ Add</button>
+      </div>
+      <div style={{ flex:1,overflowY:"auto",padding:20 }}>
+        {courses.length===0 ? (
+          <div style={{ textAlign:"center",padding:"60px 20px" }}>
+            <div style={{ fontSize:48,marginBottom:12 }}>📚</div>
+            <div style={{ fontWeight:800,fontSize:16,color:C.text,marginBottom:6 }}>No courses yet</div>
+            <div style={{ fontSize:13,color:C.muted,marginBottom:20 }}>Add one here, or use "+ Add Course" the first time you save a note.</div>
+            <button onClick={openAdd} style={{ background:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:"#fff",border:"none",borderRadius:14,padding:"12px 28px",fontWeight:800,fontSize:14,cursor:"pointer" }}>+ Add Course</button>
+          </div>
+        ) : courses.map(function(c){
+          var meta = STATUS_META[c.status] || STATUS_META.active;
+          var semName = semesterNameFor(c.semesterId);
+          return(
+            <button key={c.id} onClick={function(){setDetailId(c.id);}} style={{ width:"100%",textAlign:"left",background:C.card,borderRadius:16,padding:16,marginBottom:12,border:"1px solid "+C.border,cursor:"pointer",fontFamily:"inherit" }}>
+              <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10 }}>
+                <div style={{ minWidth:0 }}>
+                  <div style={{ fontWeight:800,fontSize:15,color:C.text }}>{c.code}{c.title&&c.title!==c.code?" — "+c.title:""}</div>
+                  <div style={{ fontSize:12,color:C.muted,marginTop:4,display:"flex",gap:8,flexWrap:"wrap" }}>
+                    {c.department&&<span>{c.department}</span>}
+                    {c.level&&<span>{c.level}</span>}
+                    {c.units!=null&&<span>{c.units} unit{c.units===1?"":"s"}</span>}
+                  </div>
+                  {semName&&<div style={{ fontSize:11,color:C.cyan,fontWeight:700,marginTop:4 }}>{semName}</div>}
+                </div>
+                <span style={{ fontSize:10,fontWeight:800,color:meta[1],background:meta[1]+"18",borderRadius:99,padding:"3px 10px",flexShrink:0 }}>{meta[0]}</span>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+
+      {showForm&&(
+        <div style={{ position:"absolute",inset:0,background:"rgba(10,15,30,0.85)",display:"flex",alignItems:"flex-end",justifyContent:"center",zIndex:30 }} onClick={function(){setShowForm(false);}}>
+          <div style={{ background:C.card,borderRadius:"20px 20px 0 0",padding:20,width:"100%",maxHeight:"85vh",overflowY:"auto",boxSizing:"border-box" }} onClick={function(e){e.stopPropagation();}}>
+            <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16 }}>
+              <span style={{ fontWeight:800,fontSize:16,color:C.text }}>{editingId?"Edit Course":"New Course"}</span>
+              <button onClick={function(){setShowForm(false);}} style={{ background:"none",border:"none",color:C.muted,fontSize:18,cursor:"pointer" }}>✕</button>
+            </div>
+            <input value={fCode} onChange={function(e){setFCode(e.target.value);}} placeholder="Course code (e.g. PHY 101)" style={{ width:"100%",padding:"13px 16px",borderRadius:12,border:"1px solid "+C.border,fontSize:15,fontWeight:700,background:C.bg,color:C.text,outline:"none",marginBottom:12,boxSizing:"border-box" }}/>
+            <input value={fTitle} onChange={function(e){setFTitle(e.target.value);}} placeholder="Title (e.g. General Physics I) — optional" style={{ width:"100%",padding:"11px 14px",borderRadius:12,border:"1px solid "+C.border,fontSize:13,background:C.bg,color:C.text,outline:"none",marginBottom:12,boxSizing:"border-box" }}/>
+            <div style={{ display:"flex",gap:10,marginBottom:12 }}>
+              <input value={fDepartment} onChange={function(e){setFDepartment(e.target.value);}} placeholder="Department" style={{ flex:1,padding:"11px 14px",borderRadius:12,border:"1px solid "+C.border,fontSize:13,background:C.bg,color:C.text,outline:"none",boxSizing:"border-box" }}/>
+              <input value={fLevel} onChange={function(e){setFLevel(e.target.value);}} placeholder="Level (e.g. 200L)" style={{ flex:1,padding:"11px 14px",borderRadius:12,border:"1px solid "+C.border,fontSize:13,background:C.bg,color:C.text,outline:"none",boxSizing:"border-box" }}/>
+              <input value={fUnits} onChange={function(e){setFUnits(e.target.value.replace(/[^0-9]/g,""));}} placeholder="Units" style={{ width:80,padding:"11px 14px",borderRadius:12,border:"1px solid "+C.border,fontSize:13,background:C.bg,color:C.text,outline:"none",boxSizing:"border-box" }}/>
+            </div>
+            {(semesters||[]).length>0 && (
+              <div style={{ marginBottom:12 }}>
+                <label style={{ fontSize:12,fontWeight:700,color:C.soft,display:"block",marginBottom:6 }}>SEMESTER (optional)</label>
+                <div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>
+                  <button onClick={function(){setFSemesterId(null);}} style={{ padding:"7px 14px",borderRadius:99,border:"2px solid",borderColor:fSemesterId==null?C.cyan:C.border,background:fSemesterId==null?C.cyan:C.card2,color:fSemesterId==null?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>None</button>
+                  {semesters.map(function(s){return<button key={s.id} onClick={function(){setFSemesterId(s.id);}} style={{ padding:"7px 14px",borderRadius:99,border:"2px solid",borderColor:fSemesterId===s.id?C.cyan:C.border,background:fSemesterId===s.id?C.cyan:C.card2,color:fSemesterId===s.id?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{s.name}</button>;})}
+                </div>
+              </div>
+            )}
+            <label style={{ fontSize:12,fontWeight:700,color:C.soft,display:"block",marginBottom:6 }}>STATUS</label>
+            <div style={{ display:"flex",gap:8,marginBottom:16 }}>{["active","completed"].map(function(st){return<button key={st} onClick={function(){setFStatus(st);}} style={{ flex:1,padding:"9px",borderRadius:10,border:"2px solid",borderColor:fStatus===st?C.cyan:C.border,background:fStatus===st?C.cyan:C.card2,color:fStatus===st?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer",textTransform:"capitalize" }}>{st}</button>;})}</div>
+            {error&&<div style={{ background:"rgba(248,113,113,0.1)",border:"1px solid rgba(248,113,113,0.3)",borderRadius:10,padding:"10px 14px",marginBottom:12,fontSize:13,color:C.red,fontWeight:600 }}>⚠️ {error}</div>}
+            <div style={{ display:"flex",gap:10 }}>
+              {editingId&&<button onClick={function(){var c=courses.find(function(x){return x.id===editingId;});if(c)confirmDelete(c);setShowForm(false);}} style={{ background:"rgba(248,113,113,0.1)",border:"1px solid "+C.red+"40",borderRadius:14,padding:"13px 16px",color:C.red,fontWeight:700,fontSize:14,cursor:"pointer" }}>🗑</button>}
+              <button onClick={submit} style={{ flex:1,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:"#fff",border:"none",borderRadius:14,padding:"13px",fontWeight:800,fontSize:15,cursor:"pointer" }}>{editingId?"Save Changes":"Add Course"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {detailCourse&&(
+        <div style={{ position:"absolute",inset:0,background:"rgba(10,15,30,0.85)",display:"flex",alignItems:"flex-end",justifyContent:"center",zIndex:30 }} onClick={function(){setDetailId(null);}}>
+          <div style={{ background:C.card,borderRadius:"20px 20px 0 0",padding:20,width:"100%",maxHeight:"80vh",overflowY:"auto",boxSizing:"border-box" }} onClick={function(e){e.stopPropagation();}}>
+            <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16 }}>
+              <div>
+                <div style={{ fontWeight:800,fontSize:17,color:C.text }}>{detailCourse.code}{detailCourse.title&&detailCourse.title!==detailCourse.code?" — "+detailCourse.title:""}</div>
+                {semesterNameFor(detailCourse.semesterId)&&<div style={{ fontSize:12,color:C.cyan,fontWeight:700,marginTop:4 }}>{semesterNameFor(detailCourse.semesterId)}</div>}
+              </div>
+              <div style={{ display:"flex",gap:8 }}>
+                <button onClick={function(){openEdit(detailCourse);setDetailId(null);}} style={{ background:C.card2,border:"1px solid "+C.border,borderRadius:8,padding:"6px 12px",color:C.cyan,fontSize:12,fontWeight:700,cursor:"pointer" }}>Edit</button>
+                <button onClick={function(){confirmDelete(detailCourse);}} style={{ background:"rgba(248,113,113,0.12)",border:"none",borderRadius:8,width:32,height:32,cursor:"pointer",fontSize:13 }}>🗑</button>
+              </div>
+            </div>
+            <div style={{ background:C.card2,borderRadius:14,padding:"0 14px" }}>
+              {detailCourse.department&&<Row icon="🏛️" label="Department" sub={detailCourse.department}/>}
+              {detailCourse.level&&<Row icon="🎓" label="Level" sub={detailCourse.level}/>}
+              {detailCourse.units!=null&&<Row icon="📐" label="Units" sub={String(detailCourse.units)}/>}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -3722,8 +4454,8 @@ function TopicMasteryScreen({ topicId, topicMastery, onBack, onAITutor, onFlashc
 var STUDY_SESSION_STEPS = [
   { key:"notes",      icon:"📝", label:"Review Notes",  description:"Revisit your most recent note to refresh what you've learned." },
   { key:"flashcards", icon:"🗂️", label:"Flashcards",     description:"Practice with flashcards generated from your notes." },
-  { key:"quizzes",    icon:"🎯", label:"Quiz Yourself",  description:"Take a quiz to test what you remember.", premium:true },
-  { key:"tutor",      icon:"🎓", label:"AI Tutor",       description:"Check your understanding with a Socratic tutoring session.", premium:true },
+  { key:"quizzes",    icon:"🎯", label:"Quiz Yourself",  description:"Take a quiz to test what you remember.", requiredPlan:"premium" },
+  { key:"tutor",      icon:"🎓", label:"AI Tutor",       description:"Check your understanding with a Socratic tutoring session.", requiredPlan:"pro" },
 ];
 
 // Mastery for the Quizzes step is handled by the REAL pipeline —
@@ -3737,7 +4469,7 @@ function StudySessionScreen({ session, plan, onStart, onSkip, onAdvance, onFinis
   var attempted = !!session.results[step.key];
   var doneCount = Object.keys(session.results).length;
   var progressPct = Math.round((doneCount/STUDY_SESSION_STEPS.length)*100);
-  var locked = step.premium && plan!=="premium";
+  var locked = step.requiredPlan && !planAtLeast(plan, step.requiredPlan);
 
   return (
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
@@ -3773,7 +4505,7 @@ function StudySessionScreen({ session, plan, onStart, onSkip, onAdvance, onFinis
               <div style={{ fontSize:40,marginBottom:10 }}>{step.icon}</div>
               <div style={{ fontWeight:800,fontSize:20,color:"#fff",marginBottom:8 }}>{step.label}</div>
               <div style={{ fontSize:14,color:"rgba(255,255,255,0.9)",lineHeight:1.6,marginBottom:locked?14:20 }}>{step.description}</div>
-              {locked && <div style={{ background:"rgba(255,255,255,0.15)",borderRadius:10,padding:"8px 12px",fontSize:12,color:"#fff",fontWeight:700,marginBottom:14 }}>🔒 This step needs Premium — you'll see the upgrade screen.</div>}
+              {locked && <div style={{ background:"rgba(255,255,255,0.15)",borderRadius:10,padding:"8px 12px",fontSize:12,color:"#fff",fontWeight:700,marginBottom:14 }}>🔒 This step needs {step.requiredPlan==="premium"?"Premium":"Pro"} — you'll see the upgrade screen.</div>}
               <div style={{ display:"flex",gap:14,alignItems:"center" }}>
                 <button onClick={function(){onStart(step);}} style={{ background:"#fff",color:"#0A0F1E",border:"none",borderRadius:14,padding:"13px 22px",fontWeight:800,fontSize:14,cursor:"pointer" }}>Start →</button>
                 <button onClick={onSkip} style={{ background:"none",border:"none",color:"rgba(255,255,255,0.85)",fontWeight:700,fontSize:13,cursor:"pointer",textDecoration:"underline",padding:0 }}>Skip</button>
@@ -3933,7 +4665,7 @@ function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, onChat,
         <div style={{ position:"absolute",top:-40,right:-40,width:160,height:160,borderRadius:"50%",background:"rgba(6,182,212,0.07)" }}/>
         <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20,position:"relative" }}>
           <div style={{ display:"flex",alignItems:"center",gap:10 }}>
-            <div style={{ width:40,height:40,borderRadius:12,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20 }}>🎵</div>
+            <div style={{ width:40,height:40,borderRadius:12,overflow:"hidden" }}><img src="/jotting-logo.png" alt="Jotting AI" style={{ width:"100%",height:"100%",objectFit:"cover" }}/></div>
             <span style={{ fontWeight:800,fontSize:20,color:C.text }}>Jotting <span style={{ color:C.cyan }}>AI</span></span>
           </div>
           <div style={{ display:"flex",gap:8 }}>
@@ -4246,7 +4978,7 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession,
       <div style={{ background:C.card, padding:"16px 20px", borderBottom:"1px solid "+C.border, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
         <div style={{ display:"flex", alignItems:"center", gap:10 }}>
           <button onClick={onBack} style={backBtn}>←</button>
-          <div style={{ width:40,height:40,borderRadius:12,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20 }}>🤖</div>
+          <div style={{ width:40,height:40,borderRadius:12,overflow:"hidden" }}><img src="/samx-logo.png" alt="SAM-X AI" style={{ width:"100%",height:"100%",objectFit:"cover" }}/></div>
           <div><div style={{ fontWeight:800,fontSize:16,color:C.text }}>SAM-X AI</div><div style={{ fontSize:11,color:C.green,fontWeight:600 }}>AI Study Assistant</div></div>
         </div>
         <div style={{ display:"flex", gap:8 }}>
@@ -4269,7 +5001,7 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession,
           return (
             <div key={i} style={{ display:"flex", flexDirection:"column", alignItems:m.role==="user"?"flex-end":"flex-start", marginBottom:16, animation:"fadeIn 0.25s ease" }}>
               <div style={{ display:"flex", justifyContent:m.role==="user"?"flex-end":"flex-start", width:"100%" }}>
-                {m.role==="ai" && <div style={{ width:32,height:32,borderRadius:10,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,marginRight:8,flexShrink:0,marginTop:2 }}>🤖</div>}
+                {m.role==="ai" && <div style={{ width:32,height:32,borderRadius:10,overflow:"hidden",marginRight:8,flexShrink:0,marginTop:2 }}><img src="/samx-logo.png" alt="SAM-X AI" style={{ width:"100%",height:"100%",objectFit:"cover" }}/></div>}
                 <div style={{ maxWidth:"82%" }}>
                   {isEditing ? (
                     <div style={{ background:C.card2, borderRadius:14, padding:10, border:"1px solid "+C.cyan }}>
@@ -4300,7 +5032,7 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession,
         })}
         {streaming && (
           <div style={{ display:"flex", marginBottom:16 }}>
-            <div style={{ width:32,height:32,borderRadius:10,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,marginRight:8,flexShrink:0,marginTop:2 }}>🤖</div>
+            <div style={{ width:32,height:32,borderRadius:10,overflow:"hidden",marginRight:8,flexShrink:0,marginTop:2 }}><img src="/samx-logo.png" alt="SAM-X AI" style={{ width:"100%",height:"100%",objectFit:"cover" }}/></div>
             <div style={{ maxWidth:"82%", background:C.card2, borderRadius:"18px 18px 18px 4px", padding:"12px 16px", border:"1px solid "+C.border }}>
               {streamingText
                 ? <div className="samx-md" style={{ fontSize:14, color:C.text, lineHeight:1.7 }}><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>{streamingText}</ReactMarkdown></div>
@@ -4424,8 +5156,16 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession,
 // Turns a student's own notes + an exam date into a day-by-day revision schedule.
 // Billed at the cheap "summary" text rate — only short note excerpts go into the
 // prompt, never full transcripts, to keep this affordable even for a big library.
-function StudyPlannerScreen({ notes, onBack, plan, onUpgrade, onSaveNote, onSavePlan }) {
-  var courseList = Array.from(new Set(notes.map(function(n){return n.course;})));
+function StudyPlannerScreen({ notes, onBack, plan, onUpgrade, onSaveNote, onSavePlan, courses, onCreateCourse }) {
+  // Widened to include real Course records; selectedCourses still holds plain
+  // display NAMES (unchanged — the notes filter and the AI prompt text below
+  // both key off note.course, which isn't migrated), so nothing about the
+  // existing generation logic changes. courseIds (below, computed only at
+  // save time) is the new, additive part: whichever selected names happen to
+  // match a real Course get their real id captured too, so studyPlans records
+  // going forward carry a real courseId for CourseOverviewScreen/StudyVaultScreen
+  // to join on, instead of the free-text-name-only shape they had before.
+  var courseList = Array.from(new Set((courses||[]).map(function(c){return c.code||c.title;}).filter(Boolean).concat(notes.map(function(n){return n.course;}))));
   var [selectedCourses, setSelectedCourses] = useState([]);
   var [examDate, setExamDate] = useState("");
   var [hoursPerDay, setHoursPerDay] = useState(2);
@@ -4433,8 +5173,23 @@ function StudyPlannerScreen({ notes, onBack, plan, onUpgrade, onSaveNote, onSave
   var [planText, setPlanText] = useState("");
   var [error, setError] = useState("");
   var [saved, setSaved] = useState(false);
+  var [showAddCourse, setShowAddCourse] = useState(false);
+  var [newCourseDraft, setNewCourseDraft] = useState("");
 
   function toggleCourse(c){ setSelectedCourses(function(s){ return s.includes(c) ? s.filter(function(x){return x!==c;}) : [...s,c]; }); }
+  async function submitNewCourse(){
+    var code = newCourseDraft.trim().toUpperCase();
+    if (!code) return;
+    if (!courseList.includes(code)) await onCreateCourse(code);
+    toggleCourse(code);
+    setNewCourseDraft(""); setShowAddCourse(false);
+  }
+  function courseIdsFor(names){
+    return names.map(function(name){
+      var match = (courses||[]).find(function(c){ return (c.code||c.title)===name; });
+      return match ? match.id : null;
+    }).filter(function(id){ return id!=null; });
+  }
 
   async function generatePlan(){
     if(!examDate){ setError("Pick your exam date first."); return; }
@@ -4454,7 +5209,7 @@ function StudyPlannerScreen({ notes, onBack, plan, onUpgrade, onSaveNote, onSave
         "Create a day-by-day study plan from today until the exam date. For each day, give a short heading with the date and a bullet list of specific topics/notes to review with rough time allocations adding up to about the daily time available. Group revision by course, prioritize weaker/earlier topics first, and build in one light review day right before the exam. Return only the plan in Markdown, no preamble.";
       var res = await callGeminiText(prompt, 2200, "summary");
       setPlanText(res);
-      if (onSavePlan) onSavePlan(res, {courses:selectedCourses, examDate:examDate, hoursPerDay:hoursPerDay});
+      if (onSavePlan) onSavePlan(res, {courses:selectedCourses, courseIds:courseIdsFor(selectedCourses), examDate:examDate, hoursPerDay:hoursPerDay});
     }catch(e){
       if(e.code==="OUT_OF_CREDITS"){ onUpgrade(); } else { setError("Couldn't reach SAM-X — check your connection and try again."); }
     }
@@ -4467,7 +5222,7 @@ function StudyPlannerScreen({ notes, onBack, plan, onUpgrade, onSaveNote, onSave
     setSaved(true);
   }
 
-  if(plan!=="premium"){
+  if(!planAtLeast(plan, "pro")){
     return (
       <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
         <div style={{ background:C.card,padding:"16px 20px",display:"flex",alignItems:"center",gap:12,borderBottom:"1px solid "+C.border }}>
@@ -4476,9 +5231,9 @@ function StudyPlannerScreen({ notes, onBack, plan, onUpgrade, onSaveNote, onSave
         </div>
         <div style={{ flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:32,textAlign:"center" }}>
           <div style={{ fontSize:56,marginBottom:16 }}>🗓️</div>
-          <div style={{ fontWeight:800,fontSize:18,color:C.text,marginBottom:8 }}>Study Planner is a Premium feature</div>
+          <div style={{ fontWeight:800,fontSize:18,color:C.text,marginBottom:8 }}>Study Planner is a Pro feature</div>
           <p style={{ color:C.muted,fontSize:13,lineHeight:1.6,marginBottom:24,maxWidth:280 }}>Turn your notes and exam date into a day-by-day revision timetable, built by SAM-X.</p>
-          <button onClick={onUpgrade} style={{ background:"linear-gradient(135deg,#F59E0B,#EF4444)",color:"#fff",border:"none",borderRadius:14,padding:"14px 32px",fontWeight:800,fontSize:15,cursor:"pointer" }}>🚀 Upgrade to Premium</button>
+          <button onClick={onUpgrade} style={{ background:"linear-gradient(135deg,#F59E0B,#EF4444)",color:"#fff",border:"none",borderRadius:14,padding:"14px 32px",fontWeight:800,fontSize:15,cursor:"pointer" }}>🚀 Upgrade to Pro</button>
         </div>
       </div>
     );
@@ -4494,8 +5249,12 @@ function StudyPlannerScreen({ notes, onBack, plan, onUpgrade, onSaveNote, onSave
       <div style={{ flex:1,overflowY:"auto",padding:20 }}>
         {!planText && (
           <div>
-            <div style={{ fontWeight:800,fontSize:14,color:C.text,marginBottom:8 }}>Which courses are you preparing for?</div>
-            {courseList.length===0 ? <p style={{ color:C.muted,fontSize:13 }}>Save a few notes first so SAM-X has something to plan from.</p> : (
+            <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8 }}>
+              <span style={{ fontWeight:800,fontSize:14,color:C.text }}>Which courses are you preparing for?</span>
+              <button onClick={function(){setShowAddCourse(function(s){return !s;});}} style={{ background:C.amber+"20",border:"1px solid "+C.amber+"40",borderRadius:8,padding:"5px 12px",color:C.amber,fontSize:12,fontWeight:700,cursor:"pointer" }}>+ Add Course</button>
+            </div>
+            {showAddCourse&&(<div style={{ background:C.card2,borderRadius:14,padding:14,marginBottom:14,border:"1px solid "+C.amber+"30" }}><div style={{ display:"flex",gap:8 }}><input value={newCourseDraft} onChange={function(e){setNewCourseDraft(e.target.value);}} onKeyDown={function(e){if(e.key==="Enter")submitNewCourse();}} placeholder="e.g. BIO 201" style={{ flex:1,padding:"10px 14px",borderRadius:10,border:"1px solid "+C.border,background:C.bg,color:C.text,outline:"none",fontSize:14 }}/><button onClick={submitNewCourse} style={{ background:C.amber,border:"none",borderRadius:10,padding:"10px 16px",color:"#0A0F1E",fontWeight:800,cursor:"pointer" }}>Add</button><button onClick={function(){setShowAddCourse(false);}} style={{ background:C.card,border:"1px solid "+C.border,borderRadius:10,padding:"10px 12px",color:C.muted,cursor:"pointer" }}>X</button></div></div>)}
+            {courseList.length===0 ? <p style={{ color:C.muted,fontSize:13 }}>Add a course above, or save a few notes so SAM-X has something to plan from.</p> : (
               <div style={{ display:"flex",gap:8,flexWrap:"wrap",marginBottom:20 }}>
                 {courseList.map(function(c){return<button key={c} onClick={function(){toggleCourse(c);}} style={{ padding:"7px 14px",borderRadius:99,border:"2px solid",borderColor:selectedCourses.includes(c)?C.amber:C.border,background:selectedCourses.includes(c)?C.amber:C.card,color:selectedCourses.includes(c)?"#0A0F1E":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{c}</button>;})}
               </div>
@@ -4562,8 +5321,7 @@ function ExamModeScreen({ notes, onBack, plan, onUpgrade, onRecordResult, onSave
     try{
       var combined = relevantNotes.map(function(n){return n.title+":\n"+n.content;}).join("\n\n").slice(0,9000);
       var raw = await callGeminiText("Create "+numQuestions+" multiple choice exam questions covering these lecture notes for the course \""+course+"\". Mix easy, medium and hard questions. Return ONLY a JSON array: [{\"question\":\"...\",\"options\":[\"A\",\"B\",\"C\",\"D\"],\"answer\":0}] NOTES:\n\n"+combined, 2400, "quiz");
-      var parsed = JSON.parse(raw.split("```json").join("").split("```").join("").trim());
-      if(!parsed.length) throw new Error("empty");
+      var parsed = parseQuizQuestions(raw);
       setQuestions(parsed);
       if (onSaveQuiz) onSaveQuiz(parsed, {course:course, source:"exam"});
       setAnswers(new Array(parsed.length).fill(null));
@@ -4578,7 +5336,7 @@ function ExamModeScreen({ notes, onBack, plan, onUpgrade, onRecordResult, onSave
       }, 1000);
     }catch(e){
       setPhase("setup");
-      if(e.code==="OUT_OF_CREDITS"){ onUpgrade(); } else { setError("Couldn't build the exam — check your connection and try again."); }
+      if(e.code==="OUT_OF_CREDITS"){ onUpgrade(); } else { setError(e.message||"Couldn't build the exam — check your connection and try again."); }
     }
   }
 
@@ -4688,8 +5446,13 @@ function ExamModeScreen({ notes, onBack, plan, onUpgrade, onRecordResult, onSave
 // ── ASSIGNMENTS ───────────────────────────────────────────────────────────────
 // Free-tier feature (no AI cost) — a simple due-date tracker so "Assignment Reminder"
 // in Settings has something real to check against instead of sitting as Coming Soon.
-function AssignmentsScreen({ assignments, notes, onBack, onAdd, onUpdate, onToggle, onDelete, openAssignmentId, openInAddMode }) {
-  var courseList = Array.from(new Set(notes.map(function(n){return n.course;}).concat(assignments.map(function(a){return a.course;})).filter(Boolean)));
+function AssignmentsScreen({ assignments, notes, onBack, onAdd, onUpdate, onToggle, onDelete, openAssignmentId, openInAddMode, courses }) {
+  // Widened to include real Course records alongside the existing note/
+  // assignment-derived names — nothing that already worked disappears, real
+  // courses just become pickable here too. Assignments themselves still store
+  // a plain course name (not a migration target this pass), so this is a
+  // consistency improvement only, not a data-model change.
+  var courseList = Array.from(new Set((courses||[]).map(function(c){return c.code||c.title;}).filter(Boolean).concat(notes.map(function(n){return n.course;})).concat(assignments.map(function(a){return a.course;})).filter(Boolean)));
   var [showForm,setShowForm]=useState(false);
   var [editingId,setEditingId]=useState(null);
   var [fTitle,setFTitle]=useState("");
@@ -4827,26 +5590,36 @@ function FlashcardsScreen({ notes, onBack, onSaveNote, onSaveDeck }) {
   var [flipped, setFlipped] = useState(false);
   var [error, setError] = useState("");
   var [saved, setSaved] = useState(false);
+  // Set only when a generated deck came back smaller than numCards (still a
+  // valid deck, just short of the request) — separate from `error` because
+  // `error` is only rendered on the setup screen, and this needs to be visible
+  // once the student is already in the study view.
+  var [deckNotice, setDeckNotice] = useState("");
 
   var filteredNotes = notes.filter(function(n){ return n.title.toLowerCase().includes(search.toLowerCase())||n.course.toLowerCase().includes(search.toLowerCase()); });
 
   async function generate(){
     if (!selectedNote) { setError("Pick a note first."); return; }
-    setError(""); setPhase("loading"); setSaved(false);
+    setError(""); setDeckNotice(""); setPhase("loading"); setSaved(false);
     try{
       var raw = await callGeminiText(
-        "Create "+numCards+" flashcards from the following lecture note titled \""+selectedNote.title+"\" (course: "+selectedNote.course+"). Each card should test one distinct concept, term, or fact — a short question or term on the front, a concise clear answer or definition on the back (1-2 sentences max). Return ONLY a JSON array, no preamble: [{\"front\":\"...\",\"back\":\"...\"}]\n\nNOTE:\n"+selectedNote.content,
-        1800, "flashcards"
+        "Create EXACTLY "+numCards+" flashcards from the following lecture note titled \""+selectedNote.title+"\" (course: "+selectedNote.course+"). Each card should test one distinct concept, term, or fact — a short question or term on the front, a concise clear answer or definition on the back (1-2 sentences max). You must generate all "+numCards+" cards — do not stop early or summarize instead of completing the full set. Return ONLY a JSON array of exactly "+numCards+" objects, no preamble: [{\"front\":\"...\",\"back\":\"...\"}]\n\nNOTE:\n"+selectedNote.content,
+        flashcardMaxTokens(numCards), "flashcards"
       );
-      var parsed = JSON.parse(raw.split("```json").join("").split("```").join("").trim());
-      if (!parsed || !parsed.length) throw new Error("empty");
+      var parsed = parseFlashcards(raw);
       setDeck(parsed); setQueue(parsed); setResults(new Array(parsed.length).fill(null));
       setIdx(0); setFlipped(false);
       setPhase("study");
       if (onSaveDeck) onSaveDeck(parsed, selectedNote);
+      if (parsed.length < numCards) {
+        // Not a hard error — a smaller-but-fully-valid deck is still usable, so
+        // it's shown rather than discarded. This is now a rare "the model came
+        // up short" case, not the routine outcome the flat 1800-token cap caused.
+        setDeckNotice("Got "+parsed.length+" of the "+numCards+" cards you asked for — you can study this deck or try generating again.");
+      }
     }catch(e){
       setPhase("setup");
-      if (e.code==="OUT_OF_CREDITS") { triggerUpgradeScreen(); } else { setError("Couldn't build the deck — check your connection and try again."); }
+      if (e.code==="OUT_OF_CREDITS") { triggerUpgradeScreen(); } else { setError(e.message || "Couldn't build the deck — check your connection and try again."); }
     }
   }
 
@@ -4865,7 +5638,7 @@ function FlashcardsScreen({ notes, onBack, onSaveNote, onSaveDeck }) {
     setQueue(deck); setResults(new Array(deck.length).fill(null));
     setIdx(0); setFlipped(false); setPhase("study");
   }
-  function startOver(){ setPhase("setup"); setSelectedNote(null); setDeck([]); setQueue([]); setResults([]); setError(""); setSaved(false); }
+  function startOver(){ setPhase("setup"); setSelectedNote(null); setDeck([]); setQueue([]); setResults([]); setError(""); setDeckNotice(""); setSaved(false); }
   function saveDeckAsNote(){
     var content = deck.map(function(c,i){ return "**Q"+(i+1)+":** "+c.front+"\n\n**A:** "+c.back; }).join("\n\n---\n\n");
     onSaveNote({ id:Date.now(), title:"Flashcards - "+selectedNote.title, course:selectedNote.course, color:C.purple, bg:"rgba(167,139,250,0.12)", tag:"Study", words:content.split(" ").length, preview:"🗂️ "+deck.length+" flashcards", content:content });
@@ -4907,7 +5680,7 @@ function FlashcardsScreen({ notes, onBack, onSaveNote, onSaveDeck }) {
             )}
             <div style={{ marginBottom:20 }}>
               <label style={{ fontSize:12,fontWeight:700,color:C.soft,display:"block",marginBottom:6 }}>NUMBER OF CARDS</label>
-              <div style={{ display:"flex",gap:8 }}>{[8,12,16,20].map(function(n){return<button key={n} onClick={function(){setNumCards(n);}} style={{ flex:1,padding:"10px",borderRadius:10,border:"2px solid",borderColor:numCards===n?C.purple:C.border,background:numCards===n?C.purple:C.card,color:numCards===n?"#fff":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{n}</button>;})}</div>
+              <div style={{ display:"flex",gap:8 }}>{[8,12,15,20,30].map(function(n){return<button key={n} onClick={function(){setNumCards(n);}} style={{ flex:1,padding:"10px",borderRadius:10,border:"2px solid",borderColor:numCards===n?C.purple:C.border,background:numCards===n?C.purple:C.card,color:numCards===n?"#fff":C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>{n}</button>;})}</div>
             </div>
             {error && <div style={{ background:"rgba(248,113,113,0.1)",border:"1px solid rgba(248,113,113,0.3)",borderRadius:10,padding:"10px 14px",marginBottom:14,fontSize:13,color:C.red,fontWeight:600 }}>⚠️ {error}</div>}
             <button onClick={generate} disabled={!selectedNote} style={{ width:"100%",background:selectedNote?"linear-gradient(135deg,#A78BFA,#06B6D4)":"#374151",color:"#fff",border:"none",borderRadius:14,padding:"15px",fontWeight:800,fontSize:15,cursor:selectedNote?"pointer":"default" }}>🗂️ Generate Flashcards</button>
@@ -4925,6 +5698,7 @@ function FlashcardsScreen({ notes, onBack, onSaveNote, onSaveDeck }) {
               <span style={{ fontSize:13,color:C.muted }}>{results.filter(function(r){return r!==null;}).length} answered</span>
             </div>
             <div style={{ height:4,background:C.border,borderRadius:2,marginBottom:24 }}><div style={{ height:4,background:C.purple,borderRadius:2,width:((idx+1)/queue.length*100)+"%",transition:"width 0.3s" }}/></div>
+            {deckNotice && idx===0 && !flipped && <div style={{ background:"rgba(245,158,11,0.1)",border:"1px solid rgba(245,158,11,0.3)",borderRadius:10,padding:"10px 14px",marginBottom:16,fontSize:12,color:C.amber,fontWeight:600 }}>⚠️ {deckNotice}</div>}
             <div style={{ flex:1,display:"flex",alignItems:"center",justifyContent:"center",perspective:1000 }} onClick={function(){setFlipped(!flipped);}}>
               <div style={{ width:"100%",maxWidth:340,height:220,position:"relative",cursor:"pointer" }}>
                 <div style={{ position:"relative",width:"100%",height:"100%",transition:"transform 0.5s",transformStyle:"preserve-3d",transform:flipped?"rotateY(180deg)":"rotateY(0deg)" }}>
@@ -5103,7 +5877,7 @@ function AITutorScreen({ notes, onBack, plan, onUpgrade, sessions, onSaveSession
     );
   }
 
-  if (plan!=="premium") {
+  if (!planAtLeast(plan, "pro")) {
     return (
       <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
         <div style={{ background:C.card,padding:"16px 20px",display:"flex",alignItems:"center",gap:12,borderBottom:"1px solid "+C.border }}>
@@ -5112,9 +5886,9 @@ function AITutorScreen({ notes, onBack, plan, onUpgrade, sessions, onSaveSession
         </div>
         <div style={{ flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:32,textAlign:"center" }}>
           <div style={{ fontSize:56,marginBottom:16 }}>🎓</div>
-          <div style={{ fontWeight:800,fontSize:18,color:C.text,marginBottom:8 }}>Advanced AI Tutor is a Premium feature</div>
+          <div style={{ fontWeight:800,fontSize:18,color:C.text,marginBottom:8 }}>Advanced AI Tutor is a Pro feature</div>
           <p style={{ color:C.muted,fontSize:13,lineHeight:1.6,marginBottom:24,maxWidth:280 }}>A Socratic tutor that teaches step by step, walks through problems with hints, or quizzes your real understanding — not just a chatbot that answers.</p>
-          <button onClick={onUpgrade} style={{ background:"linear-gradient(135deg,#F59E0B,#EF4444)",color:"#fff",border:"none",borderRadius:14,padding:"14px 32px",fontWeight:800,fontSize:15,cursor:"pointer" }}>🚀 Upgrade to Premium</button>
+          <button onClick={onUpgrade} style={{ background:"linear-gradient(135deg,#F59E0B,#EF4444)",color:"#fff",border:"none",borderRadius:14,padding:"14px 32px",fontWeight:800,fontSize:15,cursor:"pointer" }}>🚀 Upgrade to Pro</button>
         </div>
       </div>
     );
@@ -5326,17 +6100,18 @@ function UnifiedSearchScreen({ notes, assignments, recordings, onBack, onOpenNot
 // ── PROFILE & ACCOUNT ──────────────────────────────────────────────────────────
 function ProfileScreen({ onBack, user, plan, credits, profile, onSaveProfile, onLogout }) {
   var [school, setSchool] = useState(profile.school||"");
+  var [faculty, setFaculty] = useState(profile.faculty||"");
   var [department, setDepartment] = useState(profile.department||"");
   var [level, setLevel] = useState(profile.level||"");
   var [saving, setSaving] = useState(false);
   var [saved, setSaved] = useState(false);
   var [resetSent, setResetSent] = useState(false);
 
-  var dirty = school!==(profile.school||"") || department!==(profile.department||"") || level!==(profile.level||"");
+  var dirty = school!==(profile.school||"") || faculty!==(profile.faculty||"") || department!==(profile.department||"") || level!==(profile.level||"");
 
   async function save(){
     setSaving(true);
-    await onSaveProfile({ school:school.trim(), department:department.trim(), level:level });
+    await onSaveProfile({ school:school.trim(), faculty:faculty.trim(), department:department.trim(), level:level });
     setSaving(false);
     setSaved(true);
     setTimeout(function(){setSaved(false);}, 2000);
@@ -5368,6 +6143,8 @@ function ProfileScreen({ onBack, user, plan, credits, profile, onSaveProfile, on
           <div style={{ fontWeight:800, fontSize:14, color:C.text, marginBottom:14 }}>Academic Info</div>
           <label style={{ fontSize:12, color:C.muted, fontWeight:600 }}>School</label>
           <input value={school} onChange={function(e){setSchool(e.target.value);}} placeholder="e.g. University of Lagos" style={{ width:"100%", padding:"11px 14px", borderRadius:12, border:"1px solid "+C.border, background:C.bg, color:C.text, fontSize:14, outline:"none", margin:"6px 0 14px", boxSizing:"border-box" }}/>
+          <label style={{ fontSize:12, color:C.muted, fontWeight:600 }}>Faculty</label>
+          <input value={faculty} onChange={function(e){setFaculty(e.target.value);}} placeholder="e.g. Faculty of Science" style={{ width:"100%", padding:"11px 14px", borderRadius:12, border:"1px solid "+C.border, background:C.bg, color:C.text, fontSize:14, outline:"none", margin:"6px 0 14px", boxSizing:"border-box" }}/>
           <label style={{ fontSize:12, color:C.muted, fontWeight:600 }}>Department</label>
           <input value={department} onChange={function(e){setDepartment(e.target.value);}} placeholder="e.g. Computer Science" style={{ width:"100%", padding:"11px 14px", borderRadius:12, border:"1px solid "+C.border, background:C.bg, color:C.text, fontSize:14, outline:"none", margin:"6px 0 14px", boxSizing:"border-box" }}/>
           <label style={{ fontSize:12, color:C.muted, fontWeight:600 }}>Level</label>
@@ -5391,8 +6168,8 @@ function ProfileScreen({ onBack, user, plan, credits, profile, onSaveProfile, on
 }
 
 // ── NOTIFICATION CENTER ────────────────────────────────────────────────────────
-function NotificationScreen({ onBack, notifications, onMarkRead, onMarkAllRead, notifEnabled, setNotifEnabled, user }) {
-  var TYPE_ICON = { study:"📚", ai_complete:"✨", streak:"🔥", app_update:"🚀", assignment:"📋", daily:"🎯", recording:"🎙️" };
+function NotificationScreen({ onBack, notifications, onMarkRead, onMarkAllRead, onNavigate, notifEnabled, setNotifEnabled, user }) {
+  var TYPE_ICON = { study:"📚", ai_complete:"✨", streak:"🔥", app_update:"🚀", assignment:"📋", daily:"🎯", recording:"🎙️", account:"📧" };
   var unreadCount = notifications.filter(function(n){return !n.read;}).length;
   function handleTogglePush(v){
     if (v) {
@@ -5425,7 +6202,7 @@ function NotificationScreen({ onBack, notifications, onMarkRead, onMarkAllRead, 
             <div style={{ fontSize:13, color:C.muted }}>Study reminders, AI completions, and streak milestones will show up here.</div>
           </div>
         ) : notifications.map(function(n){return(
-          <button key={n.id} onClick={function(){ if(!n.read) onMarkRead(n.id); }} style={{ width:"100%", textAlign:"left", display:"flex", gap:12, background:n.read?C.card:C.card2, border:"1px solid "+(n.read?C.border:C.cyan+"40"), borderRadius:14, padding:14, marginBottom:10, cursor:"pointer" }}>
+          <button key={n.id} onClick={function(){ if(!n.read) onMarkRead(n.id); if(n.route) onNavigate(n.route); }} style={{ width:"100%", textAlign:"left", display:"flex", gap:12, background:n.read?C.card:C.card2, border:"1px solid "+(n.read?C.border:C.cyan+"40"), borderRadius:14, padding:14, marginBottom:10, cursor:"pointer" }}>
             <div style={{ width:38,height:38,borderRadius:10,background:C.card2,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0 }}>{TYPE_ICON[n.type]||"🔔"}</div>
             <div style={{ minWidth:0, flex:1 }}>
               <div style={{ display:"flex", justifyContent:"space-between", gap:8 }}>
@@ -5447,6 +6224,7 @@ function PricingScreen({ onBack, plan, credits, user, onPlanUpdated }) {
   var [cycle, setCycle] = useState("monthly");
   var [processingPlan, setProcessingPlan] = useState(null); // plan key currently mid-checkout/downgrade
   var [payError, setPayError] = useState("");
+  var [paySuccess, setPaySuccess] = useState("");
   var planOrder = ["free","pro","premium"];
 
   function priceFor(p){ return cycle==="monthly" ? p.priceMonthly : p.priceYearly; }
@@ -5455,8 +6233,27 @@ function PricingScreen({ onBack, plan, credits, user, onPlanUpdated }) {
   async function verifyAndApply(reference, planKey, billCycle){
     try{
       var result = await callSubscriptionApi({ action:"verify_payment", reference:reference, planId:planKey, cycle:billCycle });
+      // Written ONLY here, directly after the server has genuinely verified
+      // this payment with Paystack (using the secret key server-side) — this
+      // is what makes the unlock survive a refresh/re-login even if the
+      // separate Firestore accounts/{uid} write is ever delayed or fails.
+      // Never written from Paystack's own client-side popup callback alone,
+      // and never from a plain button tap.
+      if (user) persistLocalEntitlement(user.uid, {
+        plan: result.plan,
+        monthlyCredits: (PLANS[result.plan]||PLANS.free).monthlyCredits,
+        verifiedAt: Date.now(),
+        reference: reference,
+      });
       onPlanUpdated(result.plan, result.credits);
+      setPayError("");
+      setPaySuccess("✅ Payment verified — you're now on the "+((PLANS[result.plan]||PLANS.free).name)+" plan.");
+      setTimeout(function(){ setPaySuccess(""); }, 6000);
     }catch(e){
+      // Deliberately does NOT call onPlanUpdated or write a local
+      // entitlement here — an unverified payment must never unlock
+      // anything, even temporarily.
+      setPaySuccess("");
       setPayError("Payment went through, but we couldn't confirm it yet. If your plan doesn't update in a minute, contact support with this reference: "+reference);
     }
     setProcessingPlan(null);
@@ -5465,6 +6262,7 @@ function PricingScreen({ onBack, plan, credits, user, onPlanUpdated }) {
   async function startUpgrade(planKey){
     if(!user || !user.email){ setPayError("You need to be signed in with an email to upgrade."); return; }
     setPayError("");
+    setPaySuccess("");
     setProcessingPlan(planKey);
     try{
       await loadPaystackScript();
@@ -5489,9 +6287,14 @@ function PricingScreen({ onBack, plan, credits, user, onPlanUpdated }) {
   async function startDowngrade(){
     if(!window.confirm("Downgrade to the Free plan? You'll lose Pro/Premium features immediately.")) return;
     setPayError("");
+    setPaySuccess("");
     setProcessingPlan("free");
     try{
       var result = await callSubscriptionApi({ action:"downgrade" });
+      // Symmetric cleanup — without this, a legitimate downgrade would keep
+      // getting silently re-overridden back to the old paid plan on the next
+      // login by the local entitlement resolver above.
+      if (user) clearLocalEntitlement(user.uid);
       onPlanUpdated(result.plan, result.credits);
     }catch(e){
       setPayError("Couldn't downgrade — check your connection and try again.");
@@ -5516,6 +6319,9 @@ function PricingScreen({ onBack, plan, credits, user, onPlanUpdated }) {
         )}
         {payError && (
           <div style={{ background:"rgba(248,113,113,0.1)", border:"1px solid rgba(248,113,113,0.3)", borderRadius:12, padding:"12px 14px", marginBottom:16, fontSize:12, color:C.red, fontWeight:600, lineHeight:1.5 }}>⚠️ {payError}</div>
+        )}
+        {paySuccess && (
+          <div style={{ background:"rgba(52,211,153,0.1)", border:"1px solid rgba(52,211,153,0.3)", borderRadius:12, padding:"12px 14px", marginBottom:16, fontSize:12, color:C.green, fontWeight:600, lineHeight:1.5 }}>{paySuccess}</div>
         )}
         <div style={{ textAlign:"center", marginBottom:20 }}>
           <div style={{ fontWeight:800, fontSize:22, color:C.text, marginBottom:6 }}>Choose your plan</div>
@@ -5570,9 +6376,10 @@ function PricingScreen({ onBack, plan, credits, user, onPlanUpdated }) {
               ["AI Chat, Scan Doc, Quizzes","✓","✓","✓"],
               ["Priority AI responses","—","✓","✓"],
               ["Cloud storage","Standard","More","Maximum"],
-              ["AI Study Planner","—","—","✓"],
+              ["AI Study Planner","—","✓","✓"],
+              ["Advanced AI Tutor","—","✓","✓"],
+              ["Advanced Analytics","—","✓","✓"],
               ["Exam Mode","—","—","✓"],
-              ["Advanced AI Tutor","—","—","✓"],
               ["Priority support","—","✓","✓"],
             ].map(function(row,i){return(
               <div key={i} style={{ display:"grid", gridTemplateColumns:"1.4fr 1fr 1fr 1fr", padding:"10px 12px", fontSize:12, color:C.soft, borderTop:"1px solid "+C.border }}>
@@ -5590,13 +6397,119 @@ function PricingScreen({ onBack, plan, credits, user, onPlanUpdated }) {
   );
 }
 
+// Small, self-contained addition to Settings → Account: resend uses
+// sendEmailVerification directly (a plain module-level import — it doesn't
+// touch React state, so no App-level wiring is needed for it). Rechecking
+// status goes through the onRefresh prop (App's refreshEmailVerification)
+// so the real `user` state gets updated — not just a local copy here — and
+// every other place that happens to read user.emailVerified stays correct
+// too. Never gates anything: this only ever changes what this one row
+// displays, matching the app's "don't block on verification" requirement.
+function EmailVerificationRow({ user, onRefresh }) {
+  var [sending, setSending] = useState(false);
+  var [checking, setChecking] = useState(false);
+  var [message, setMessage] = useState("");
+  var verified = !!(user && user.emailVerified);
+
+  async function resend(){
+    if (!auth.currentUser || sending) return;
+    setSending(true); setMessage("");
+    try{
+      await sendEmailVerification(auth.currentUser);
+      setMessage("Verification email sent — check your inbox.");
+    }catch(e){
+      setMessage(e.code==="auth/too-many-requests" ? "Please wait a bit before requesting another email." : "Couldn't send the email — try again in a moment.");
+    }
+    setSending(false);
+  }
+
+  async function recheck(){
+    if (checking || !onRefresh) return;
+    setChecking(true); setMessage("");
+    try{
+      var nowVerified = await onRefresh();
+      setMessage(nowVerified ? "Your email is verified! 🎉" : "Still not verified — check your inbox for the link.");
+    }catch(e){
+      setMessage("Couldn't check right now — try again in a moment.");
+    }
+    setChecking(false);
+  }
+
+  return (
+    <div>
+      <Row icon="✅" label="Email Verified" sub={verified?"Your email is verified":"Email not verified yet"} right={<span style={{ fontSize:13,fontWeight:800,color:verified?C.green:C.amber }}>{verified?"Verified ✓":"Pending"}</span>}/>
+      {!verified && (
+        <div style={{ display:"flex",gap:8,padding:"4px 0 8px" }}>
+          <button onClick={resend} disabled={sending} style={{ ...actionBtn(C.cyan), flex:1, opacity:sending?0.6:1 }}>{sending?"Sending...":"Resend email"}</button>
+          <button onClick={recheck} disabled={checking} style={{ ...actionBtn(C.green), flex:1, opacity:checking?0.6:1 }}>{checking?"Checking...":"I've verified"}</button>
+        </div>
+      )}
+      {message && <div style={{ fontSize:12,color:C.muted,padding:"0 0 8px",lineHeight:1.5 }}>{message}</div>}
+    </div>
+  );
+}
+
 // ── SETTINGS ──────────────────────────────────────────────────────────────────
-function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings, setRecSettings, plan, credits, onViewPlans, themeName, onSelectTheme, notifPrefs, setNotifPrefs, privacy, onSetPin, onDisablePin, onSetAutoLock, onSetHiddenFolder, aiStyle, setAiStyle, aiLength, setAiLength, aiLanguage, setAiLanguage, isIOS, isStandalone, installPromptEvent, promptInstall }) {
+function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings, setRecSettings, plan, credits, onViewPlans, themeName, onSelectTheme, notifPrefs, setNotifPrefs, privacy, onSetPin, onDisablePin, onSetAutoLock, onSetHiddenFolder, aiStyle, setAiStyle, aiLength, setAiLength, aiLanguage, setAiLanguage, isIOS, isStandalone, installPromptEvent, promptInstall, onRefreshVerification }) {
   var [openSection,setOpenSection]=useState(null);
   var [pinSetupMode,setPinSetupMode]=useState(false);
   var [pinDraft1,setPinDraft1]=useState("");
   var [pinDraft2,setPinDraft2]=useState("");
   var [pinError,setPinError]=useState("");
+  // About section detail sheets — App Version/What's New/Privacy/Terms/Contact
+  // Support previously had no onPress at all (Row renders inert without one).
+  // Content here is assembled only from facts already stated elsewhere in this
+  // app's own UI (recording audio staying device-local, Paystack handling
+  // payment with no card storage, the existing plan/credit system, the exact
+  // "What's New" text the app already shows as a one-time notification, and
+  // the same support email Report a Bug already uses) — not invented copy,
+  // and explicitly labeled as a plain-language summary rather than a real
+  // legal document, since no actual Privacy Policy/Terms text exists in this
+  // app to link to.
+  var [infoSheet,setInfoSheet]=useState(null);
+  var ABOUT_INFO = {
+    version: {
+      icon: "📱", title: "App Version",
+      body: [
+        "Jotting AI v4.0.0 — Login Edition",
+        "Built with love by Samuel.",
+      ],
+    },
+    whatsnew: {
+      icon: "🆕", title: "What's New",
+      body: [
+        "Free, Pro, and Premium plans with AI credits — check Settings → Subscription to see your usage.",
+        "Login, Firebase, and Cloud sync.",
+      ],
+    },
+    privacy: {
+      icon: "🔏", title: "Privacy & Data",
+      body: [
+        "A plain-language summary of how Jotting AI handles your data today — not a substitute for a full legal Privacy Policy.",
+        "Your notes, assignments, and other study data sync to the cloud so they follow you across your devices.",
+        "Lecture recording audio stays on this device only — it's never uploaded, so it won't follow you to a different device or survive clearing browser data.",
+        "Payments are processed securely by Paystack — Jotting AI never sees or stores your card details.",
+        "Questions about your data? Use Contact Support below.",
+      ],
+    },
+    terms: {
+      icon: "📜", title: "Terms of Service",
+      body: [
+        "A plain-language summary of Jotting AI's current terms — not a substitute for a full legal agreement.",
+        "Free, Pro, and Premium plans are available, each with a monthly AI credit allowance.",
+        "Subscriptions can be cancelled anytime from Settings → Subscription.",
+        "Payments are processed securely by Paystack.",
+        "Questions about these terms? Use Contact Support below.",
+      ],
+    },
+    contact: {
+      icon: "💬", title: "Contact Support",
+      body: [
+        "Get help from the Jotting AI team:",
+        "samuel@gmail.com",
+      ],
+    },
+  };
 
   function startPinSetup(){ setPinDraft1("");setPinDraft2("");setPinError("");setPinSetupMode(true); }
   function confirmPinSetup(){
@@ -5612,7 +6525,7 @@ function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings
   }
 
   return(
-    <div style={{ flex:1,overflowY:"auto",background:C.bg }}>
+    <div style={{ flex:1,overflowY:"auto",background:C.bg,position:"relative" }}>
       <div style={{ background:C.card,padding:"16px 20px",borderBottom:"1px solid "+C.border }}><span style={{ fontWeight:800,fontSize:18,color:C.text }}>Settings</span></div>
       <div style={{ padding:"16px 16px 100px" }}>
         {/* User Profile Card */}
@@ -5762,11 +6675,11 @@ function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings
 
         <Section id="about" icon="ℹ️" title="About" color="#06B6D4">
           <div style={{ marginTop:12 }}>
-            <Row icon="📱" label="App Version" sub="v4.0.0 - Login Edition" right={<span style={{ fontSize:13,color:C.muted }}>v4.0</span>}/>
-            <Row icon="🆕" label="What's New" sub="Login, Firebase, Cloud sync!"/>
-            <Row icon="🔏" label="Privacy Policy" sub="How we handle your data"/>
-            <Row icon="📜" label="Terms of Service" sub="Rules and conditions"/>
-            <Row icon="💬" label="Contact Support" sub="Get help from our team"/>
+            <Row icon="📱" label="App Version" sub="v4.0.0 - Login Edition" right={<span style={{ fontSize:13,color:C.muted }}>v4.0</span>} onPress={function(){setInfoSheet("version");}}/>
+            <Row icon="🆕" label="What's New" sub="Login, Firebase, Cloud sync!" onPress={function(){setInfoSheet("whatsnew");}}/>
+            <Row icon="🔏" label="Privacy Policy" sub="How we handle your data" onPress={function(){setInfoSheet("privacy");}}/>
+            <Row icon="📜" label="Terms of Service" sub="Rules and conditions" onPress={function(){setInfoSheet("terms");}}/>
+            <Row icon="💬" label="Contact Support" sub="Get help from our team" onPress={function(){setInfoSheet("contact");}}/>
             <Row icon="⭐" label="Rate the App" onPress={function(){alert("Thank you! Rating coming soon!");}}/>
             <Row icon="📤" label="Share the App" onPress={function(){if(navigator.share){navigator.share({title:"Jotting AI",text:"Check out this AI note-taking app!",url:"https://notewave12.netlify.app"});}else{alert("Link: notewave12.netlify.app");}}}/>
             <Row icon="🐛" label="Report a Bug" onPress={function(){alert("Report bugs to: samuel@gmail.com");}}/>
@@ -5778,13 +6691,25 @@ function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings
           <div style={{ marginTop:12 }}>
             <Row icon="✉️" label="Email" sub={(user&&user.email)||"Not logged in"}/>
             <Row icon="👤" label="Display Name" sub={(user&&user.displayName)||"Not set"}/>
-            <Row icon="✅" label="Email Verified" sub={user&&user.emailVerified?"Your email is verified":"Email not verified yet"} right={<span style={{ fontSize:13,color:user&&user.emailVerified?C.green:C.amber }}>{user&&user.emailVerified?"✓":"Pending"}</span>}/>
+            <EmailVerificationRow user={user} onRefresh={onRefreshVerification}/>
             <div onClick={onLogout} style={{ display:"flex",alignItems:"center",justifyContent:"center",padding:"14px",marginTop:12,background:"rgba(248,113,113,0.1)",borderRadius:12,cursor:"pointer",border:"1px solid "+C.red+"30" }}>
               <span style={{ fontSize:14,fontWeight:700,color:C.red }}>🚪 Logout</span>
             </div>
           </div>
         </Section>
       </div>
+      {infoSheet&&(
+        <div style={{ position:"absolute",inset:0,background:"rgba(10,15,30,0.85)",display:"flex",alignItems:"flex-end",justifyContent:"center",zIndex:30 }} onClick={function(){setInfoSheet(null);}}>
+          <div style={{ background:C.card,borderRadius:"20px 20px 0 0",padding:20,width:"100%",maxHeight:"85vh",overflowY:"auto",boxSizing:"border-box" }} onClick={function(e){e.stopPropagation();}}>
+            <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16 }}>
+              <span style={{ fontWeight:800,fontSize:16,color:C.text }}>{ABOUT_INFO[infoSheet].icon} {ABOUT_INFO[infoSheet].title}</span>
+              <button onClick={function(){setInfoSheet(null);}} style={{ background:"none",border:"none",color:C.muted,fontSize:18,cursor:"pointer" }}>✕</button>
+            </div>
+            {ABOUT_INFO[infoSheet].body.map(function(line,i){return<p key={i} style={{ fontSize:13,color:C.soft,lineHeight:1.6,margin:i===0?"0 0 12px":"0 0 10px" }}>{line}</p>;})}
+            <button onClick={function(){setInfoSheet(null);}} style={{ width:"100%",marginTop:8,background:C.card2,color:C.text,border:"1px solid "+C.border,borderRadius:14,padding:"13px",fontWeight:700,fontSize:14,cursor:"pointer" }}>Close</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -5894,7 +6819,7 @@ export default function App() {
   }
   var [plan, setPlan] = useState("free");
   var [credits, setCredits] = useState(PLANS.free.monthlyCredits);
-  var [profile, setProfile] = useState({ school:"", department:"", level:"", streak:0 });
+  var [profile, setProfile] = useState({ school:"", faculty:"", department:"", level:"", streak:0 });
   var [notifEnabled, setNotifEnabled] = useState(function(){ try{ return localStorage.getItem("jotting_notifEnabled")==="1"; }catch(e){ return false; } });
   useEffect(function(){ try{ localStorage.setItem("jotting_notifEnabled", notifEnabled?"1":"0"); }catch(e){} }, [notifEnabled]);
   var [notifCenter, setNotifCenter] = useState([]);
@@ -5906,6 +6831,7 @@ export default function App() {
   var [studyPlans, setStudyPlans] = useState([]);
   var [materials, setMaterials] = useState([]);
   var [courses, setCourses] = useState([]);
+  var [semesters, setSemesters] = useState([]);
   var [quizzes, setQuizzes] = useState([]);
   var [flashcardDecks, setFlashcardDecks] = useState([]);
   var [studySessions, setStudySessions] = useState([]);
@@ -5918,13 +6844,14 @@ export default function App() {
   });
   useEffect(function(){ try{ localStorage.setItem("jotting_notifPrefs", JSON.stringify(notifPrefs)); }catch(e){} }, [notifPrefs]);
   // profiles/{uid} is already client-writable (see saveProfileFields), so this rides
-  // along with school/department/level/streak — it's what send-reminders.js reads
+  // along with school/faculty/department/level/streak — it's what send-reminders.js reads
   // server-side, since it obviously can't see this device's localStorage.
   useEffect(function(){ if (user) saveProfileFields(user.uid, { notifPrefs:notifPrefs }); }, [notifPrefs, user]);
   // Register the service worker once on load (cheap, doesn't request any permission by
   // itself) — subscribeToPush() later just needs it ready when the student opts in.
   var [swUpdateAvailable, setSwUpdateAvailable] = useState(false);
   var swRegRef = useRef(null);
+  var justSignedUpRef = useRef(false); // set by LoginScreen's onLogin(user,{justSignedUp:true}) — consumed once inside onAuthStateChanged below to queue the "check your email" notification
   useEffect(function(){
     registerServiceWorker(function(reg){ swRegRef.current = reg; setSwUpdateAvailable(true); });
   }, []);
@@ -6000,7 +6927,7 @@ export default function App() {
         var todayCount = s.notes.filter(function(n){ var r=formatRelativeDate(n.id); return r==="Just now"||/m ago$/.test(r)||r==="Today"; }).length;
         if (!localStorage.getItem(k1) && todayCount<3) {
           localStorage.setItem(k1,"1");
-          addNotificationRef.current("daily","🎯 Daily goal reminder","You're at "+todayCount+"/3 notes today — a quick session before bed keeps your streak alive.");
+          addNotificationRef.current("daily","🎯 Daily goal reminder","You're at "+todayCount+"/3 notes today — a quick session before bed keeps your streak alive.", {screen:"home"});
         }
       }
       if (s.notifPrefs.study && hour>=9) {
@@ -6009,7 +6936,7 @@ export default function App() {
         var daysSince = lastNoteTs ? Math.floor((Date.now()-lastNoteTs)/86400000) : 999;
         if (!localStorage.getItem(k2) && daysSince>=2) {
           localStorage.setItem(k2,"1");
-          addNotificationRef.current("study","📚 Haven't studied in a while","It's been "+daysSince+" days since your last note. Jump back in!");
+          addNotificationRef.current("study","📚 Haven't studied in a while","It's been "+daysSince+" days since your last note. Jump back in!", {screen:"home"});
         }
       }
       if (s.notifPrefs.recording && hour>=9) {
@@ -6018,7 +6945,7 @@ export default function App() {
         var daysSinceRec = lastRecTs ? Math.floor((Date.now()-lastRecTs)/86400000) : 999;
         if (!localStorage.getItem(k3) && daysSinceRec>=7) {
           localStorage.setItem(k3,"1");
-          addNotificationRef.current("recording","🎙️ Record your next lecture","It's been a while since you recorded a lecture — don't fall behind on notes.");
+          addNotificationRef.current("recording","🎙️ Record your next lecture","It's been a while since you recorded a lecture — don't fall behind on notes.", {screen:"voice"});
         }
       }
       if (s.notifPrefs.assignment && hour>=9) {
@@ -6030,7 +6957,7 @@ export default function App() {
             var k4 = "jotting_reminded_assignment_"+uid+"_"+a.id+"_"+today;
             if (!localStorage.getItem(k4)) {
               localStorage.setItem(k4,"1");
-              addNotificationRef.current("assignment","📋 Assignment due soon","\""+a.title+"\" ("+a.course+") is due "+(daysLeft===0?"today":daysLeft===1?"tomorrow":"in "+daysLeft+" days")+".");
+              addNotificationRef.current("assignment","📋 Assignment due soon","\""+a.title+"\" ("+a.course+") is due "+(daysLeft===0?"today":daysLeft===1?"tomorrow":"in "+daysLeft+" days")+".", {screen:"assignment", assignmentId:a.id});
             }
           }
         });
@@ -6041,9 +6968,13 @@ export default function App() {
     return function(){ clearInterval(iv); };
   }, []);
 
-  function addNotification(type, title, message){
+  // `route` is optional and additive — existing/legacy notifications (already
+  // persisted in localStorage before this) simply have no `route` field, and
+  // are handled gracefully as "no specific destination" (see
+  // navigateFromNotification below). No migration needed, no data reshaped.
+  function addNotification(type, title, message, route){
     setNotifCenter(function(list){
-      var updated = [makeNotif(type,title,message), ...list].slice(0,50);
+      var updated = [makeNotif(type,title,message,route), ...list].slice(0,50);
       if (user) persistNotifsLocal(user.uid, updated);
       return updated;
     });
@@ -6065,9 +6996,56 @@ export default function App() {
       return updated;
     });
   }
+  // Routes a tapped notification to its relevant destination, reusing the
+  // exact same navigation primitives every other "jump to X" entry point in
+  // this app already uses (go(), setActiveNote, setPendingAssignmentId,
+  // setActiveCourse, setResumeRecording) — no new navigation mechanism.
+  // `route` is optional; a notification without one (including every
+  // notification that existed before this change) just does nothing here —
+  // NotificationScreen still marks it read on tap, same as always.
+  function navigateFromNotification(route){
+    if (!route) return;
+    if (route.screen==="note" && route.noteId!=null) {
+      var n = notes.find(function(x){ return x.id===route.noteId; });
+      // The note may have since been deleted — fall back to Library rather
+      // than silently doing nothing or opening a stale/missing note.
+      if (n) { setActiveNote(n); go("detail", tab); } else { go("library","library"); }
+      return;
+    }
+    if (route.screen==="assignment" && route.assignmentId!=null) {
+      setPendingAssignmentId(route.assignmentId);
+      go("assignments", tab);
+      return;
+    }
+    if (route.screen==="course" && route.courseName) {
+      setActiveCourse(route.courseName);
+      go("course", tab);
+      return;
+    }
+    if (route.screen==="voice") { setResumeRecording(null); go("voice","new"); return; }
+    if (route.screen==="profile") { go("profile", tab); return; }
+    if (route.screen==="pricing") { go("pricing", tab); return; }
+    if (route.screen==="dashboard") { go("dashboard","dashboard"); return; }
+    if (route.screen==="home") { go("home","home"); return; }
+  }
   async function saveProfile(fields){
     setProfile(function(p){ return {...p, ...fields}; });
     if (user) await saveProfileFields(user.uid, fields);
+  }
+
+  // Re-fetches the current user's record from Firebase (the only way to pick
+  // up a verification click that happened outside this session) and forces a
+  // re-render with the fresh emailVerified value — Firebase mutates the same
+  // User instance in place on reload(), so just passing it back through
+  // setUser() wouldn't trigger anything, since React sees the same reference.
+  // Returns the up-to-date verified boolean so the caller can show its own
+  // "still not verified" / "verified!" feedback without duplicating this logic.
+  async function refreshEmailVerification(){
+    if (!auth.currentUser) return false;
+    await auth.currentUser.reload();
+    var fresh = auth.currentUser;
+    setUser(function(prev){ return fresh ? {...fresh} : prev; });
+    return !!(fresh && fresh.emailVerified);
   }
 
   // Let any AI helper function (defined outside this component) update the credit
@@ -6133,6 +7111,11 @@ export default function App() {
           .catch(function(e){ console.error("Loading assignments from local database failed:", e); return []; })
           .then(function(cachedAssignments){
             if (cachedAssignments && cachedAssignments.length > 0) setAssignments(cachedAssignments);
+            // Snapshot of what was ALREADY locally cached before the Firestore
+            // fetch below runs — see syncAssignmentsToRepository's own comment
+            // for why this matters: only ids present here can ever be purged.
+            var baselineIds = {};
+            (cachedAssignments||[]).forEach(function(a){ baselineIds[a.id] = true; });
             loadAssignmentsFromCloud(firebaseUser.uid).then(function(cloudAssignments){
               setAssignments(function(prev){
                 var unsynced = prev.filter(function(a){ return !a.firestoreId; });
@@ -6140,9 +7123,17 @@ export default function App() {
                 unsynced.concat(cloudAssignments).forEach(function(a){ byId[a.id] = a; });
                 var merged = Object.values(byId);
                 merged.sort(function(a,b){ return (a.dueDate||"").localeCompare(b.dueDate||""); });
-                syncAssignmentsToRepository(firebaseUser.uid, merged).catch(function(e){ console.error("Assignment repository sync failed:", e); });
+                syncAssignmentsToRepository(firebaseUser.uid, merged, baselineIds).catch(function(e){ console.error("Assignment repository sync failed:", e); });
                 return merged;
               });
+            }).catch(function(e){
+              // The cloud fetch itself failed (offline, network error, etc.) —
+              // there's no reliable picture of what's currently in Firestore,
+              // so the local reconcile is skipped entirely rather than purging
+              // anything based on an incomplete result. The student keeps
+              // seeing what was already cached above; this simply runs again
+              // next time the app opens or connectivity returns.
+              console.error("Loading assignments from cloud failed — local cache left untouched:", e);
             });
           });
         var cachedExamResults = loadExamResultsLocal(firebaseUser.uid);
@@ -6166,49 +7157,72 @@ export default function App() {
           .catch(function(e){ console.error("Loading recording metadata from local database failed:", e); return []; })
           .then(function(cachedRecordings){
             if (cachedRecordings && cachedRecordings.length > 0) setRecordings(cachedRecordings);
+            // Snapshot of what was ALREADY locally cached before the Firestore
+            // fetch below runs — see syncRecordingsToRepository's own comment
+            // for why this matters: only ids present here can ever be purged.
+            var recordingBaselineIds = {};
+            (cachedRecordings||[]).forEach(function(r){ recordingBaselineIds[r.id] = true; });
             loadRecordingsFromCloud(firebaseUser.uid).then(function(cloudRecordings){
               setRecordings(function(prev){
                 var byId = {};
                 prev.concat(cloudRecordings).forEach(function(r){ byId[r.id] = r; });
                 var merged = Object.values(byId);
                 merged.sort(function(a,b){ return (b.createdAt||0) - (a.createdAt||0); });
-                syncRecordingsToRepository(firebaseUser.uid, merged).catch(function(e){ console.error("Recording metadata repository sync failed:", e); });
+                syncRecordingsToRepository(firebaseUser.uid, merged, recordingBaselineIds).catch(function(e){ console.error("Recording metadata repository sync failed:", e); });
                 return merged;
               });
+            }).catch(function(e){
+              // Cloud fetch failed (offline, network error, etc.) — skip the
+              // local reconcile entirely rather than purge anything based on
+              // an incomplete result. The student keeps seeing what was
+              // already cached above; this simply runs again next time the
+              // app opens or connectivity returns.
+              console.error("Loading recordings from cloud failed — local cache left untouched:", e);
             });
           });
         topicMasteryRepository.list(firebaseUser.uid).then(function(records){ setTopicMastery(records); }).catch(function(e){ console.error("Loading topic mastery failed:", e); });
         studyPlansRepository.list(firebaseUser.uid).then(function(plans){ setStudyPlans(plans); }).catch(function(e){ console.error("Loading study plans failed:", e); });
         materialsRepository.list(firebaseUser.uid).then(function(records){ setMaterials(records); }).catch(function(e){ console.error("Loading materials failed:", e); });
         coursesRepository.listCourses(firebaseUser.uid).then(function(records){ setCourses(records); }).catch(function(e){ console.error("Loading courses failed:", e); });
+        semestersRepository.list(firebaseUser.uid).then(function(records){ setSemesters(records); }).catch(function(e){ console.error("Loading semesters failed:", e); });
         quizzesRepository.list(firebaseUser.uid).then(function(records){ setQuizzes(records); }).catch(function(e){ console.error("Loading quizzes failed:", e); });
         flashcardsRepository.list(firebaseUser.uid).then(function(records){ setFlashcardDecks(records); }).catch(function(e){ console.error("Loading flashcard decks failed:", e); });
         studySessionsRepository.list(firebaseUser.uid).then(function(records){ setStudySessions(records); }).catch(function(e){ console.error("Loading study sessions failed:", e); });
         loadOrInitAccount(firebaseUser.uid).then(function(account){
-          var monthKey = currentMonthKey();
-          // This is a display-only estimate — the real refill happens securely on the
-          // server (in the Netlify function) the next time an AI request is made this
-          // month. The client is never allowed to write its own credit balance directly.
-          var displayCredits = account.creditsMonthKey !== monthKey
-            ? (PLANS[account.plan]||PLANS.free).monthlyCredits
-            : (typeof account.credits==="number" ? account.credits : PLANS.free.monthlyCredits);
-          setPlan(account.plan||"free");
-          setCredits(displayCredits);
+          // resolveAccountWithLocalEntitlement handles the "display-only
+          // estimate" comment's caveat exactly as before (the real refill
+          // still only ever happens server-side), and additionally trusts a
+          // locally-verified paid entitlement over a Firestore result that
+          // would otherwise incorrectly show this account as Free — see that
+          // function's own comment for why.
+          var resolved = resolveAccountWithLocalEntitlement(firebaseUser.uid, account);
+          setPlan(resolved.plan);
+          setCredits(resolved.credits);
         });
         var cachedNotifs = loadNotifsLocal(firebaseUser.uid);
         if (cachedNotifs.length > 0) setNotifCenter(cachedNotifs);
+        // Fires once, right after a brand-new email/password signup (never
+        // for login or Google sign-in, and never again on later sessions —
+        // the ref is one-shot, reset the moment it's consumed). Deliberately
+        // a notification, not a blocking screen: the student is already past
+        // onLogin and into the app by this point, exactly as before — this
+        // is purely informational, matching "don't block normal app testing."
+        if (justSignedUpRef.current) {
+          justSignedUpRef.current = false;
+          addNotificationRef.current("account", "📧 Verify your email", "We sent a link to "+(firebaseUser.email||"your email address")+". Check your inbox (and spam folder) to confirm your account.", {screen:"profile"});
+        }
         // App update announcements: bump this version string whenever you ship something
         // worth telling students about, and each user sees the update notice once.
         var APP_UPDATE_VERSION = "2026-07-subscriptions";
         if (localStorage.getItem("jotting_lastUpdateSeen_"+firebaseUser.uid) !== APP_UPDATE_VERSION) {
-          addNotificationRef.current("app_update", "🚀 New: Plans & AI Credits", "Jotting AI now has Free, Pro, and Premium plans — check Settings to see your usage.");
+          addNotificationRef.current("app_update", "🚀 New: Plans & AI Credits", "Jotting AI now has Free, Pro, and Premium plans — check Settings to see your usage.", {screen:"pricing"});
           localStorage.setItem("jotting_lastUpdateSeen_"+firebaseUser.uid, APP_UPDATE_VERSION);
         }
         loadOrInitProfile(firebaseUser.uid).then(function(prof){
           setProfile(prof);
           var milestones = [3,7,14,30,60,100];
           if (milestones.indexOf(prof.streak)!==-1) {
-            addNotificationRef.current("streak", "🔥 "+prof.streak+"-day streak!", "You've used Jotting AI "+prof.streak+" days in a row. Keep it going!");
+            addNotificationRef.current("streak", "🔥 "+prof.streak+"-day streak!", "You've used Jotting AI "+prof.streak+" days in a row. Keep it going!", {screen:"dashboard"});
           }
         });
         var isNew = !localStorage.getItem("jotting_seen_"+firebaseUser.uid);
@@ -6226,14 +7240,19 @@ export default function App() {
         setStudyPlans([]);
         setMaterials([]);
         setCourses([]);
+        setSemesters([]);
         setQuizzes([]);
         setFlashcardDecks([]);
         setStudySessions([]);
         setStudySession(null);
         setResumeRecording(null);
+        setAssignmentAddMode(false);
+        setAiChatSeed(null);
+        setPendingSyncCount(0);
+        setLastSyncFailed(false);
         setPlan("free");
         setCredits(PLANS.free.monthlyCredits);
-        setProfile({ school:"", department:"", level:"", streak:0 });
+        setProfile({ school:"", faculty:"", department:"", level:"", streak:0 });
         setNotifCenter([]);
         setPrivacyState({ pinEnabled:false, pinHash:"", autoLock:true, hiddenFolder:false });
         setLocked(false);
@@ -6387,7 +7406,7 @@ export default function App() {
       if (user) notesRepository.create(newNote).catch(function(e){ console.error("Local note save failed:", e); });
       return updated;
     });
-    addNotification("ai_complete", "✨ Note ready", "\""+newNote.title+"\" has been generated and saved to your Library.");
+    addNotification("ai_complete", "✨ Note ready", "\""+newNote.title+"\" has been generated and saved to your Library.", {screen:"note", noteId:newNote.id});
     // Land straight on the new note (instead of Home) so the student can rename
     // or tweak it right away while it's fresh, instead of hunting for it in the Library.
     setActiveNote(newNote);
@@ -6459,7 +7478,12 @@ export default function App() {
 
   // ── Assignments ────────────────────────────────────────────────────────────────
   function addAssignment(payload) {
-    var newA = { id:Date.now(), completed:false, ...payload };
+    // userId is required here — assignmentsRepository.list(uid) (called on every
+    // login/reload) queries IndexedDB's "by_userId" index, so a record missing
+    // this field is invisible to that query no matter how correctly it was
+    // otherwise saved. Same root cause and same fix as saveRecordingFromSession's
+    // recording-metadata bug — see that function's comment for the full trace.
+    var newA = { id:Date.now(), userId:user&&user.uid, completed:false, ...payload };
     setAssignments(function(a){
       var updated = [newA, ...a];
       if (user) assignmentsRepository.create(newA).catch(function(e){ console.error("Local assignment save failed:", e); });
@@ -6494,8 +7518,125 @@ export default function App() {
       if (user) materialsRepository.create(newM).catch(function(e){ console.error("Local material save failed:", e); });
       return updated;
     });
-    addNotification("study", "📚 Material saved", "\""+newM.title+"\" added to "+newM.courseId+".");
+    // newM.courseId is now the real Course id (see Course CRUD below), not a
+    // display string, so the notification uses courseName (the course's actual
+    // code/title, passed alongside courseId by whatever screen called this) —
+    // never the raw id, which would show as a meaningless number to the student.
+    addNotification("study", "📚 Material saved", "\""+newM.title+"\" added to "+(newM.courseName||"your course")+".", newM.courseName ? {screen:"course", courseName:newM.courseName} : null);
     go("home","home");
+  }
+  // Added alongside Manage Courses — needed so deleting a real Course can clear
+  // courseId on any material that pointed to it (see deleteCourseRecord below)
+  // instead of leaving a dangling reference. materialsRepository.update already
+  // existed (confirmed generic, no field-specific logic) — this is its first
+  // caller.
+  function updateMaterialRecord(id, fields) {
+    setMaterials(function(list){
+      var updated = list.map(function(m){ return m.id===id ? {...m, ...fields} : m; });
+      if (user) materialsRepository.update(id, fields).catch(function(e){ console.error("Local material update failed:", e); });
+      return updated;
+    });
+  }
+
+  // ── Courses (real Course CRUD — Course IDs) ──────────────────────────────────
+  // coursesRepository already had full create/get/list/update/delete (built
+  // earlier this session, never wired to any UI). This is that wiring — same
+  // local-optimistic-update shape every other repository-backed handler in this
+  // file already uses. IndexedDB-only, like materials/studyPlans — no Firestore
+  // sync step, same reasoning as those.
+  //
+  // SCOPE, stated plainly: this pass gives materials and study plans a REAL
+  // courseId to join on (see UploadMaterialScreen/StudyPlannerScreen and their
+  // consumers in CourseOverviewScreen/StudyVaultScreen/CommandCenterScreen).
+  // topicMastery is NOT touched here — updateTopicMasteryFromQuizAttempt and its
+  // matching logic (topicMasteryService.js/topicMasteryRepository.js) haven't
+  // been inspected, and existing topic mastery records are keyed by course NAME
+  // today. Flipping that join blind risks silently orphaning every existing
+  // mastery record (old ones under the name, new ones under a real id that
+  // never matches). ExamModeScreen's course picker below is still widened to
+  // show real courses for consistency, but the value it sends to
+  // recordExamResult (and from there into topic mastery) is untouched — still
+  // the course display name, exactly as it worked before this change.
+  function addCourse(payload) {
+    var createdAt = Date.now();
+    // Every "+ Add Course" call site (CourseChipPicker, DrawScreen's course
+    // select, StudyPlannerScreen, UploadMaterialScreen) calls this with a
+    // plain typed string, not an object — normalize that shorthand here so
+    // {...payload} never spreads a string's characters into numeric keys
+    // (which would silently create a course with no real code/title field,
+    // breaking every c.code||c.title lookup everywhere else in the app).
+    var fields = typeof payload==="string" ? { code:payload, title:payload } : payload;
+    var newC = { id:createdAt, createdAt:createdAt, userId:user&&user.uid, ...fields };
+    return new Promise(function(resolve){
+      setCourses(function(list){
+        var updated = [newC, ...list];
+        if (user) coursesRepository.createCourse(newC).catch(function(e){ console.error("Local course save failed:", e); });
+        return updated;
+      });
+      resolve(newC);
+    });
+  }
+  function updateCourseRecord(id, fields) {
+    setCourses(function(list){
+      var updated = list.map(function(c){ return c.id===id ? {...c, ...fields} : c; });
+      if (user) coursesRepository.updateCourse(id, fields).catch(function(e){ console.error("Local course update failed:", e); });
+      return updated;
+    });
+  }
+  function deleteCourseRecord(id) {
+    // Same "no orphaned references" reasoning as deleteSemesterRecord: a real
+    // Course id can now live in two other places (materials.courseId,
+    // studyPlans.courseIds), and both get cleaned up here rather than left
+    // dangling. Assignments/notes/recordings/quizzes/flashcards are all still
+    // name-based (never migrated), so they're completely unaffected — a
+    // deleted course's name simply stops appearing as a real Course option,
+    // exactly like any other legacy free-text name.
+    materials.filter(function(m){ return m.courseId===id; }).forEach(function(m){ updateMaterialRecord(m.id, {courseId:null, courseName:m.courseName}); });
+    studyPlans.filter(function(p){ return (p.courseIds||[]).includes(id); }).forEach(function(p){ updateStudyPlanRecord(p.id, {courseIds:(p.courseIds||[]).filter(function(cid){return cid!==id;})}); });
+    setCourses(function(list){
+      var updated = list.filter(function(c){ return c.id!==id; });
+      if (user) coursesRepository.deleteCourse(id).catch(function(e){ console.error("Local course delete failed:", e); });
+      return updated;
+    });
+  }
+
+  // ── Semesters (real Semester CRUD) ───────────────────────────────────────────
+  // semestersRepository already had full create/get/list/update/delete (built
+  // earlier, never wired to any UI or referenced by App_login.js at all until
+  // now). Same shape as the Course handlers directly above. IndexedDB-only,
+  // same reasoning as courses/materials/studyPlans — no Firestore sync step.
+  function addSemester(payload) {
+    var createdAt = Date.now();
+    var fields = typeof payload==="string" ? { name:payload } : payload;
+    var newS = { id:createdAt, createdAt:createdAt, userId:user&&user.uid, ...fields };
+    return new Promise(function(resolve){
+      setSemesters(function(list){
+        var updated = [newS, ...list];
+        if (user) semestersRepository.create(newS).catch(function(e){ console.error("Local semester save failed:", e); });
+        return updated;
+      });
+      resolve(newS);
+    });
+  }
+  function updateSemesterRecord(id, fields) {
+    setSemesters(function(list){
+      var updated = list.map(function(s){ return s.id===id ? {...s, ...fields} : s; });
+      if (user) semestersRepository.update(id, fields).catch(function(e){ console.error("Local semester update failed:", e); });
+      return updated;
+    });
+  }
+  // Deleting a semester must not leave courses pointing at a semesterId that no
+  // longer exists — every course currently assigned to this semester gets its
+  // semesterId cleared (via the existing updateCourseRecord, not a new code
+  // path) rather than silently left dangling. Same "no orphaned references"
+  // reasoning as everywhere else in this codebase that cleans up on delete.
+  function deleteSemesterRecord(id) {
+    courses.filter(function(c){ return c.semesterId===id; }).forEach(function(c){ updateCourseRecord(c.id, {semesterId:null}); });
+    setSemesters(function(list){
+      var updated = list.filter(function(s){ return s.id!==id; });
+      if (user) semestersRepository.delete(id).catch(function(e){ console.error("Local semester delete failed:", e); });
+      return updated;
+    });
   }
   function updateAssignment(id, fields) {
     setAssignments(function(a){
@@ -6577,13 +7718,40 @@ export default function App() {
   // structured local copy of the generated plan the moment it's produced.
   function saveStudyPlanLocally(planText, meta){
     if (!user || !planText || !planText.trim()) return;
-    studyPlansRepository.create({
+    // Previously fire-and-forget into studyPlansRepository only — the in-memory
+    // `studyPlans` state never got the new plan, so it went stale the instant a
+    // plan was created (only fixed by a full reload). That staleness would have
+    // let a study plan silently escape the courseId-cleanup below whenever a
+    // course was deleted right after a plan referencing it was generated —
+    // fixing it here since Manage Courses' delete now depends on this state
+    // actually being accurate, not just eventually-correct-after-reload.
+    var createdAt = Date.now();
+    var newPlan = {
+      id: createdAt,
       userId: user.uid,
       courses: (meta && meta.courses) || [],
+      courseIds: (meta && meta.courseIds) || [],
       examDate: (meta && meta.examDate) || null,
       hoursPerDay: (meta && meta.hoursPerDay) || null,
       planText: planText,
-    }).catch(function(e){ console.error("Local study plan save failed:", e); });
+      createdAt: createdAt,
+    };
+    setStudyPlans(function(list){
+      var updated = [newPlan, ...list];
+      studyPlansRepository.create(newPlan).catch(function(e){ console.error("Local study plan save failed:", e); });
+      return updated;
+    });
+  }
+  // Added alongside Manage Courses — lets deleteCourseRecord (below) remove a
+  // deleted course's id from any study plan's courseIds array, instead of
+  // leaving a dangling reference. studyPlansRepository.update already existed
+  // (confirmed generic) — this is its first caller.
+  function updateStudyPlanRecord(id, fields) {
+    setStudyPlans(function(list){
+      var updated = list.map(function(p){ return p.id===id ? {...p, ...fields} : p; });
+      if (user) studyPlansRepository.update(id, fields).catch(function(e){ console.error("Local study plan update failed:", e); });
+      return updated;
+    });
   }
 
   // ── Lecture Recordings library ────────────────────────────────────────────────
@@ -6591,15 +7759,35 @@ export default function App() {
   // (device-local, no Firebase Storage/Blaze plan needed) and tracks metadata in
   // Firestore so the recording is there even if the app is closed before the student
   // decides whether/when to turn it into notes.
+  // Returns a Promise that resolves only once BOTH the metadata write
+  // (recordingsRepository.create) and the audio blob write (saveAudioBlobLocal)
+  // have genuinely completed — not just been started. Previously this function
+  // returned nothing, so VoiceNoteScreen's stopRecording() had no way to know
+  // when (or whether) either write actually finished, and moved straight to
+  // the "✅ Your recording has been saved" modal — which also offers immediate
+  // navigation away — the instant this function was merely CALLED. If the
+  // student tapped away while these async IndexedDB writes were still in
+  // flight, closing the tab could abort them before they committed, silently
+  // losing the recording despite the confirmation the student had just seen.
+  // See stopRecording() for the other half of this fix — it now awaits this
+  // promise before ever showing that modal.
   function saveRecordingFromSession(id, blob, mimeType, meta) {
-    if (!user) return;
-    var placeholder = { id:id, title:meta.title, course:meta.course, createdAt:Date.now(), durationSeconds:meta.durationSeconds||0, sizeBytes:blob.size, mimeType:mimeType, transcribed:false, noteId:null, audioReady:false };
-    setRecordings(function(r){
-      var updated = [placeholder, ...r];
-      recordingsRepository.create(placeholder).catch(function(e){ console.error("Local recording metadata save failed:", e); });
-      return updated;
-    });
-    saveAudioBlobLocal(id, blob, mimeType).then(function(){
+    if (!user) return Promise.reject(new Error("Not signed in."));
+    // userId is required here — recordingsRepository.list(uid) (called on every
+    // login/reload) queries IndexedDB's "by_userId" index, so a record missing
+    // this field is invisible to that query no matter how correctly it was
+    // otherwise saved. It would "self-heal" on a later reload ONLY once the
+    // Firestore fetch below succeeds and syncRecordingsToRepository re-creates
+    // the local copy from the cloud version (saveRecordingMeta does stamp
+    // userId on that one) — meaning any reload while offline or slow, which is
+    // exactly the condition this app is built around, left the recording
+    // invisible with no recovery for that whole session, even though the audio
+    // blob itself was always intact in the separate jotting_audio_db.
+    var placeholder = { id:id, userId:user.uid, title:meta.title, course:meta.course, createdAt:Date.now(), durationSeconds:meta.durationSeconds||0, sizeBytes:blob.size, mimeType:mimeType, transcribed:false, noteId:null, audioReady:false };
+    setRecordings(function(r){ return [placeholder, ...r]; });
+    var metaSave = recordingsRepository.create(placeholder);
+    var audioSave = saveAudioBlobLocal(id, blob, mimeType);
+    return Promise.all([metaSave, audioSave]).then(function(){
       var final = {...placeholder, audioReady:true};
       setRecordings(function(r){
         var updated = r.map(function(x){ return x.id===id ? final : x; });
@@ -6607,13 +7795,15 @@ export default function App() {
         return updated;
       });
       saveRecordingMeta(user.uid, final);
+      return final;
     }).catch(function(e){
-      console.error("Local audio save failed:", e);
+      console.error("Recording save failed (metadata and/or audio):", e);
       setRecordings(function(r){
         var updated = r.map(function(x){ return x.id===id ? {...x, uploadFailed:true} : x; });
-        if (user) recordingsRepository.update(id, {uploadFailed:true}).catch(function(e){ console.error("Local recording metadata update failed:", e); });
+        if (user) recordingsRepository.update(id, {uploadFailed:true}).catch(function(e2){ console.error("Local recording metadata update failed:", e2); });
         return updated;
       });
+      throw e;
     });
   }
 
@@ -6676,7 +7866,7 @@ export default function App() {
   if (authLoading) {
     return (
       <div style={{ minHeight:"100vh",background:"#06081A",display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:16 }}>
-        <div style={{ width:70,height:70,borderRadius:20,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:34 }}>🎵</div>
+        <div style={{ width:70,height:70,borderRadius:20,overflow:"hidden" }}><img src="/jotting-logo.png" alt="Jotting AI" style={{ width:"100%",height:"100%",objectFit:"cover" }}/></div>
         <div style={{ width:36,height:36,borderRadius:"50%",border:"3px solid rgba(6,182,212,0.3)",borderTop:"3px solid #06B6D4",animation:"spin 1s linear infinite" }}/>
         <p style={{ color:C.muted,fontSize:14,fontFamily:"sans-serif" }}>Loading Jotting AI...</p>
         <style>{"@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}"}</style>
@@ -6702,7 +7892,7 @@ export default function App() {
       <div style={{ height:"100dvh",background:"#06081A",display:"flex",justifyContent:"center",alignItems:"center",overflow:"hidden" }}>
         <style>{"@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');*{box-sizing:border-box;font-family:'DM Sans',sans-serif;}body{margin:0;background:#06081A;}button,textarea,input{font-family:'DM Sans',sans-serif;}::-webkit-scrollbar{width:0;}input::placeholder{color:#4B5563;}@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}"}</style>
         <div style={{ width:"100%",maxWidth:400,height:"100dvh",background:C.bg,overflow:"hidden",display:"flex",flexDirection:"column",boxShadow:"0 24px 80px rgba(6,182,212,0.12)" }}>
-          <LoginScreen onLogin={function(u){setUser(u);}}/>
+          <LoginScreen onLogin={function(u, meta){ if (meta && meta.justSignedUp) justSignedUpRef.current = true; setUser(u); }}/>
         </div>
       </div>
     );
@@ -6722,10 +7912,12 @@ export default function App() {
         {swUpdateAvailable&&<div style={{ background:"rgba(167,139,250,0.15)",padding:"10px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",gap:10 }}><span style={{ fontSize:12,color:C.purple,fontWeight:600 }}>🔄 A new version of Jotting AI is ready</span><button onClick={applyAppUpdate} style={{ background:C.purple,border:"none",borderRadius:8,padding:"5px 12px",color:"#fff",fontSize:11,fontWeight:800,cursor:"pointer",flexShrink:0 }}>Refresh</button></div>}
         {cloudLoading&&<div style={{ background:"rgba(6,182,212,0.1)",padding:"10px",textAlign:"center",fontSize:12,color:C.cyan,fontWeight:600 }}>☁️ Syncing your notes...</div>}
         <div style={{ flex:1,display:"flex",flexDirection:"column",overflowY:"auto",minHeight:0 }}>
-          {screen==="home"&&<CommandCenterScreen notes={visibleNotes} recordings={recordings} assignments={assignments} topicMastery={topicMastery} user={user} plan={plan} onVoice={function(){setResumeRecording(null);go("voice","new");}} onDraw={function(){go("draw");}} onAIWrite={function(){go("aiwrite");}} onScan={function(){go("scan");}} onChat={function(seed){setAiChatSeed(seed||null);go("ai");}} onRecordings={function(){setScreen("recordings");}} onStudyPlanner={function(){go("studyplanner","home");}} onExamMode={function(){go("exammode","home");}} onAssignments={function(){go("assignments","home");}} onFlashcards={function(){go("flashcards","home");}} onAITutor={function(){go("aitutor","home");}} onSearch={function(){setPendingAssignmentId(null);setScreen("search");}} onNotifications={function(){setScreen("notifications");}} onProfile={function(){setScreen("profile");}} unreadCount={notifCenter.filter(function(n){return !n.read;}).length} onOpenMission={function(){go("mission","home");}} onOpenCourse={function(c){setActiveCourse(c);go("course");}} onOpenTopic={function(m){setActiveTopicId(m.id);go("topic");}} onStartStudySession={startStudySession} onOpenVault={function(){go("vault","home");}} onOpenUpcoming={function(){go("upcoming","home");}} onOpenProgress={function(){go("progress","dashboard");}} onCreateNote={function(){go("createnote","home");}} onUploadMaterial={function(){go("uploadmaterial","home");}} onAddAssignmentDirect={function(){setAssignmentAddMode(true);go("assignments","home");}}/>}
-          {screen==="course"&&activeCourse&&<CourseOverviewScreen course={activeCourse} assignments={assignments} topicMastery={topicMastery} materials={materials} onBack={function(){go(tab,tab);}} onAITutor={function(){go("aitutor","home");}} onFlashcards={function(){go("flashcards","home");}} onExamMode={function(){go("exammode","home");}} onOpenTopic={function(m){setActiveTopicId(m.id);go("topic");}}/>}
-          {screen==="vault"&&<StudyVaultScreen notes={visibleNotes} recordings={recordings} materials={materials} quizzes={quizzes} flashcardDecks={flashcardDecks} courses={courses} onBack={function(){go(tab,tab);}} onOpenCourse={function(c){setActiveVaultCourse(c);go("vaultcourse");}}/>}
-          {screen==="vaultcourse"&&activeVaultCourse&&<StudyVaultCourseScreen course={activeVaultCourse} notes={visibleNotes} recordings={recordings} materials={materials} quizzes={quizzes} flashcardDecks={flashcardDecks} onBack={function(){go("vault",tab);}} onOpenNote={function(n){setActiveNote(n);go("detail");}} onOpenRecordings={function(){go("recordings",tab);}}/>}
+          {screen==="home"&&<CommandCenterScreen notes={visibleNotes} recordings={recordings} assignments={assignments} topicMastery={topicMastery} courses={courses} user={user} plan={plan} onVoice={function(){setResumeRecording(null);go("voice","new");}} onDraw={function(){go("draw");}} onAIWrite={function(){go("aiwrite");}} onScan={function(){go("scan");}} onChat={function(seed){setAiChatSeed(seed||null);go("ai");}} onRecordings={function(){setScreen("recordings");}} onStudyPlanner={function(){go("studyplanner","home");}} onExamMode={function(){go("exammode","home");}} onAssignments={function(){go("assignments","home");}} onFlashcards={function(){go("flashcards","home");}} onAITutor={function(){go("aitutor","home");}} onSearch={function(){setPendingAssignmentId(null);setScreen("search");}} onNotifications={function(){setScreen("notifications");}} onProfile={function(){setScreen("profile");}} unreadCount={notifCenter.filter(function(n){return !n.read;}).length} onOpenMission={function(){go("mission","home");}} onOpenCourse={function(c){setActiveCourse(c);go("course");}} onOpenTopic={function(m){setActiveTopicId(m.id);go("topic");}} onStartStudySession={startStudySession} onOpenVault={function(){go("vault","home");}} onOpenUpcoming={function(){go("upcoming","home");}} onOpenProgress={function(){go("progress","dashboard");}} onCreateNote={function(){go("createnote","home");}} onUploadMaterial={function(){go("uploadmaterial","home");}} onAddAssignmentDirect={function(){setAssignmentAddMode(true);go("assignments","home");}}/>}
+          {screen==="course"&&activeCourse&&<CourseOverviewScreen course={activeCourse} courses={courses} assignments={assignments} topicMastery={topicMastery} materials={materials} onBack={function(){go(tab,tab);}} onAITutor={function(){go("aitutor","home");}} onFlashcards={function(){go("flashcards","home");}} onExamMode={function(){go("exammode","home");}} onOpenTopic={function(m){setActiveTopicId(m.id);go("topic");}}/>}
+          {screen==="vault"&&<StudyVaultScreen notes={visibleNotes} recordings={recordings} materials={materials} quizzes={quizzes} flashcardDecks={flashcardDecks} courses={courses} semesters={semesters} onBack={function(){go(tab,tab);}} onOpenCourse={function(c){setActiveVaultCourse(c);go("vaultcourse");}} onManageSemesters={function(){go("managesemesters",tab);}} onManageCourses={function(){go("managecourses",tab);}}/>}
+          {screen==="managesemesters"&&<ManageSemestersScreen semesters={semesters} courses={courses} onBack={function(){go("vault",tab);}} onAdd={addSemester} onUpdate={updateSemesterRecord} onDelete={deleteSemesterRecord} onUpdateCourse={updateCourseRecord}/>}
+          {screen==="managecourses"&&<ManageCoursesScreen courses={courses} semesters={semesters} onBack={function(){go("vault",tab);}} onAdd={addCourse} onUpdate={updateCourseRecord} onDelete={deleteCourseRecord}/>}
+          {screen==="vaultcourse"&&activeVaultCourse&&<StudyVaultCourseScreen course={activeVaultCourse} courses={courses} notes={visibleNotes} recordings={recordings} materials={materials} quizzes={quizzes} flashcardDecks={flashcardDecks} onBack={function(){go("vault",tab);}} onOpenNote={function(n){setActiveNote(n);go("detail");}} onOpenRecordings={function(){go("recordings",tab);}}/>}
           {screen==="topic"&&activeTopicId!=null&&<TopicMasteryScreen topicId={activeTopicId} topicMastery={topicMastery} onBack={function(){go(tab,tab);}} onAITutor={function(){go("aitutor","home");}} onFlashcards={function(){go("flashcards","home");}}/>}
           {screen==="mission"&&<TodaysMissionScreen onBack={function(){go(tab,tab);}} notes={visibleNotes} recordings={recordings} assignments={assignments} topicMastery={topicMastery} studyPlans={studyPlans} onAssignments={function(){go("assignments","home");}} onAITutor={function(){go("aitutor","home");}} onExamMode={function(){go("exammode","home");}} onVoice={function(){setResumeRecording(null);go("voice","new");}} onStudyPlanner={function(){go("studyplanner","home");}}/>}
           {screen==="upcoming"&&<UpcomingScreen assignments={assignments} studyPlans={studyPlans} onBack={function(){go(tab,tab);}} onOpenAssignment={function(id){setPendingAssignmentId(id);go("assignments",tab);}}/>}
@@ -6734,25 +7926,25 @@ export default function App() {
           {screen==="analytics"&&<AdvancedAnalyticsScreen notes={notes} assignments={assignments} examResults={examResults} plan={plan} onBack={function(){go(tab,tab);}} onUpgrade={function(){setScreen("pricing");}}/>}
           {screen==="progress"&&<ProgressInsightsScreen studySessions={studySessions} examResults={examResults} topicMastery={topicMastery} onBack={function(){go(tab,tab);}} onOpenTopic={function(m){setActiveTopicId(m.id);go("topic");}}/>}
           {screen==="detail"&&activeNote&&<NoteDetail note={activeNote} onBack={function(){ if(studySession){studyStepReturn();}else{go(tab==="library"?"library":"home",tab);} }} onDelete={deleteNote} onUpdate={updateNote} onSaveQuiz={saveQuizLocally}/>}
-          {screen==="voice"&&<VoiceNoteScreen onBack={function(){setResumeRecording(null);go("home","home");}} onSave={saveNote} recQuality={recQuality} recSettings={recSettings} onSaveRecording={saveRecordingFromSession} onDeleteRecording={deleteRecording} onMarkTranscribed={markRecordingTranscribed} onOpenRecordings={function(){setScreen("recordings");}} resumeAudio={resumeRecording}/>}
-          {screen==="draw"&&<DrawScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
-          {screen==="aiwrite"&&<AIWriteScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
-          {screen==="scan"&&<ScanDocScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
+          {screen==="voice"&&<VoiceNoteScreen onBack={function(){setResumeRecording(null);go("home","home");}} onSave={saveNote} recQuality={recQuality} recSettings={recSettings} onSaveRecording={saveRecordingFromSession} onDeleteRecording={deleteRecording} onMarkTranscribed={markRecordingTranscribed} onOpenRecordings={function(){setScreen("recordings");}} resumeAudio={resumeRecording} courses={courses} onCreateCourse={addCourse}/>}
+          {screen==="draw"&&<DrawScreen onBack={function(){go("home","home");}} onSave={saveNote} courses={courses} onCreateCourse={addCourse}/>}
+          {screen==="aiwrite"&&<AIWriteScreen onBack={function(){go("home","home");}} onSave={saveNote} courses={courses} onCreateCourse={addCourse}/>}
+          {screen==="scan"&&<ScanDocScreen onBack={function(){go("home","home");}} onSave={saveNote} courses={courses} onCreateCourse={addCourse}/>}
           {screen==="ai"&&<AIScreen notes={notes} onBack={function(){setAiChatSeed(null);go("home","home");}} chatSessions={chatSessions} onSaveSession={saveChatSession} onDeleteSession={deleteChatSession} initialPrefill={aiChatSeed&&aiChatSeed.initialPrefill} initialSend={aiChatSeed&&aiChatSeed.initialSend} initialPicker={aiChatSeed&&aiChatSeed.initialPicker}/>}
           {screen==="recordings"&&<RecordingsScreen recordings={recordings} onBack={function(){go(tab,tab);}} onRename={renameRecording} onDelete={deleteRecording} onTranscribe={openRecordingForTranscription}/>}
-          {screen==="studyplanner"&&<StudyPlannerScreen notes={notes} onBack={function(){go(tab,tab);}} plan={plan} onUpgrade={function(){setScreen("pricing");}} onSaveNote={saveNote} onSavePlan={saveStudyPlanLocally}/>}
+          {screen==="studyplanner"&&<StudyPlannerScreen notes={notes} onBack={function(){go(tab,tab);}} plan={plan} onUpgrade={function(){setScreen("pricing");}} onSaveNote={saveNote} onSavePlan={saveStudyPlanLocally} courses={courses} onCreateCourse={addCourse}/>}
           {screen==="exammode"&&<ExamModeScreen notes={notes} onBack={function(){ if(studySession){studyStepReturn();}else{go(tab,tab);} }} plan={plan} onUpgrade={function(){setScreen("pricing");}} onRecordResult={recordExamResult} onSaveQuiz={saveQuizLocally}/>}
-          {screen==="assignments"&&<AssignmentsScreen assignments={assignments} notes={notes} onBack={function(){ setAssignmentAddMode(false); go(tab,tab); }} onAdd={addAssignment} onUpdate={updateAssignment} onToggle={toggleAssignment} onDelete={deleteAssignment} openAssignmentId={pendingAssignmentId} openInAddMode={assignmentAddMode}/>}
+          {screen==="assignments"&&<AssignmentsScreen assignments={assignments} notes={notes} courses={courses} onBack={function(){ setAssignmentAddMode(false); go(tab,tab); }} onAdd={addAssignment} onUpdate={updateAssignment} onToggle={toggleAssignment} onDelete={deleteAssignment} openAssignmentId={pendingAssignmentId} openInAddMode={assignmentAddMode}/>}
           {screen==="search"&&<UnifiedSearchScreen notes={notes} assignments={assignments} recordings={recordings} onBack={function(){go(tab,tab);}} onOpenNote={function(n){setActiveNote(n);go("detail");}} onOpenAssignment={function(id){setPendingAssignmentId(id);go("assignments",tab);}} onOpenRecordings={function(){go("recordings",tab);}}/>}
           {screen==="flashcards"&&<FlashcardsScreen notes={notes} onBack={function(){ if(studySession){studyStepReturn();}else{go(tab,tab);} }} onSaveNote={saveNote} onSaveDeck={saveFlashcardDeckLocally}/>}
-          {screen==="createnote"&&<CreateNoteScreen onBack={function(){go("home","home");}} onSave={saveNote}/>}
-          {screen==="uploadmaterial"&&<UploadMaterialScreen onBack={function(){go("home","home");}} onSave={addMaterial}/>}
+          {screen==="createnote"&&<CreateNoteScreen onBack={function(){go("home","home");}} onSave={saveNote} courses={courses} onCreateCourse={addCourse}/>}
+          {screen==="uploadmaterial"&&<UploadMaterialScreen onBack={function(){go("home","home");}} onSave={addMaterial} courses={courses} onCreateCourse={addCourse}/>}
           {screen==="studysession"&&studySession&&<StudySessionScreen session={studySession} plan={plan} onStart={startStudyStep} onSkip={studySessionSkip} onAdvance={studySessionAdvance} onFinish={finishStudySession} onEnd={endStudySession}/>}
           {screen==="studysessioncomplete"&&studySession&&<StudySessionCompleteScreen session={studySession} notes={visibleNotes} recordings={recordings} assignments={assignments} topicMastery={topicMastery} onDone={endStudySession} onAssignments={function(){go("assignments","home");}} onAITutor={function(){go("aitutor","home");}} onExamMode={function(){go("exammode","home");}} onVoice={function(){setResumeRecording(null);go("voice","new");}} onStudyPlanner={function(){go("studyplanner","home");}}/>}
           {screen==="aitutor"&&<AITutorScreen notes={notes} onBack={function(){ if(studySession){studyStepReturn();}else{go(tab,tab);} }} plan={plan} onUpgrade={function(){setScreen("pricing");}} sessions={chatSessions} onSaveSession={saveChatSession} onDeleteSession={deleteChatSession}/>}
-          {screen==="settings"&&<SettingsScreen user={user} onLogout={handleLogout} recQuality={recQuality} setRecQuality={setRecQuality} recSettings={recSettings} setRecSettings={setRecSettings} plan={plan} credits={credits} onViewPlans={function(){setScreen("pricing");}} themeName={themeName} onSelectTheme={selectTheme} notifPrefs={notifPrefs} setNotifPrefs={setNotifPrefs} privacy={privacy} onSetPin={setPinCode} onDisablePin={disablePin} onSetAutoLock={setAutoLock} onSetHiddenFolder={setHiddenFolder} aiStyle={aiStyle} setAiStyle={setAiStyle} aiLength={aiLength} setAiLength={setAiLength} aiLanguage={aiLanguage} setAiLanguage={setAiLanguage} isIOS={isIOS} isStandalone={isStandalone} installPromptEvent={installPromptEvent} promptInstall={promptInstall}/>}
-          {screen==="pricing"&&<PricingScreen onBack={function(){go("settings","settings");}} plan={plan} credits={credits} user={user} onPlanUpdated={function(newPlan,newCredits){ setPlan(newPlan); setCredits(newCredits); addNotificationRef.current("app_update","🎉 Plan updated","You're now on the "+((PLANS[newPlan]||PLANS.free).name)+" plan."); }}/>}
-          {screen==="notifications"&&<NotificationScreen onBack={function(){go(tab,tab);}} notifications={notifCenter} onMarkRead={markNotifRead} onMarkAllRead={markAllNotifsRead} notifEnabled={notifEnabled} setNotifEnabled={setNotifEnabled} user={user}/>}
+          {screen==="settings"&&<SettingsScreen user={user} onLogout={handleLogout} recQuality={recQuality} setRecQuality={setRecQuality} recSettings={recSettings} setRecSettings={setRecSettings} plan={plan} credits={credits} onViewPlans={function(){setScreen("pricing");}} themeName={themeName} onSelectTheme={selectTheme} notifPrefs={notifPrefs} setNotifPrefs={setNotifPrefs} privacy={privacy} onSetPin={setPinCode} onDisablePin={disablePin} onSetAutoLock={setAutoLock} onSetHiddenFolder={setHiddenFolder} aiStyle={aiStyle} setAiStyle={setAiStyle} aiLength={aiLength} setAiLength={setAiLength} aiLanguage={aiLanguage} setAiLanguage={setAiLanguage} isIOS={isIOS} isStandalone={isStandalone} installPromptEvent={installPromptEvent} promptInstall={promptInstall} onRefreshVerification={refreshEmailVerification}/>}
+          {screen==="pricing"&&<PricingScreen onBack={function(){go("settings","settings");}} plan={plan} credits={credits} user={user} onPlanUpdated={function(newPlan,newCredits){ setPlan(newPlan); setCredits(newCredits); addNotificationRef.current("app_update","🎉 Plan updated","You're now on the "+((PLANS[newPlan]||PLANS.free).name)+" plan.", {screen:"pricing"}); }}/>}
+          {screen==="notifications"&&<NotificationScreen onBack={function(){go(tab,tab);}} notifications={notifCenter} onMarkRead={markNotifRead} onMarkAllRead={markAllNotifsRead} onNavigate={navigateFromNotification} notifEnabled={notifEnabled} setNotifEnabled={setNotifEnabled} user={user}/>}
           {screen==="profile"&&<ProfileScreen onBack={function(){go(tab,tab);}} user={user} plan={plan} credits={credits} profile={profile} onSaveProfile={saveProfile} onLogout={handleLogout}/>}
         </div>
         <div style={{ background:C.card2,borderTop:"1px solid "+C.border,padding:"10px 10px 16px",display:"flex",justifyContent:"space-around",alignItems:"center",flexShrink:0 }}>
