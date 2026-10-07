@@ -1,24 +1,25 @@
+# Netlify config for Jotting AI
+# firebase-admin is heavy and breaks under esbuild partial-bundling.
+# Use the NFT bundler (default) so node_modules are resolved normally.
+# If you switch back to esbuild, you MUST keep:
+#   external_node_modules = ["firebase-admin"]
+
 [build]
-command = "npm run build"
-publish = "build"
-functions = "netlify/functions"
-node_bundler = "esbuild"
-external_node_modules = ["firebase-admin"]
+  # Adjust publish folder if your site builds to a different directory
+  # publish = "dist"
+  # command = "npm run build"
 
-[build.environment]
-CI = "false"
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "nft"
 
+# SPA fallback + API route
 [[redirects]]
-  from = "/api/generate"
-  to = "/.netlify/functions/generate"
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
   status = 200
 
 [[redirects]]
-  from = "/api/manage-subscription"
-  to = "/.netlify/functions/manage-subscription"
+  from = "/*"
+  to = "/index.html"
   status = 200
-
-
-
-[functions."send-reminders"]
-schedule ="@hourly"
