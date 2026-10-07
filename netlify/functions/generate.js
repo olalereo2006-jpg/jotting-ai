@@ -6,20 +6,24 @@
 
 // firebase-admin must be in package.json dependencies for Netlify Functions.
 // It must also stay external to esbuild (see netlify.toml external_node_modules).
-var admin = null;
-try {
-  admin = require("firebase-admin");
-  // ESM/CJS interop: some installs expose the real API under .default
-  if (admin && admin.default && !admin.credential) {
-    admin = admin.default;
-  }
-} catch (e) {
-  console.error("require(firebase-admin) failed:", e && e.message ? e.message : e);
-}
-
+//
+// Use modular entry points — they survive Netlify/esbuild better than the old
+// monolithic require("firebase-admin"), which often arrives with
+// admin.credential === undefined (PACKAGE_BROKEN).
+var adminApp = null; // firebase-admin/app
+var adminAuth = null; // firebase-admin/auth
+var adminFirestore = null; // firebase-admin/firestore
+var admin = null; // thin shim so existing admin.auth() calls still work
 var db = null;
-// Set during init so the handler can tell the client WHAT failed (missing vs bad JSON vs init).
 var firebaseInitError = null;
+
+try {
+  adminApp = require("firebase-admin/app");
+  adminAuth = require("firebase-admin/auth");
+  adminFirestore = require("firebase-admin/firestore");
+} catch (e) {
+  console.error("require(firebase-admin/*) failed:", e && e.message ? e.message : e);
+}
 
 function parseServiceAccountEnv() {
   // Prefer base64 — safest on Netlify (no broken newlines / quoting).
@@ -69,30 +73,34 @@ function parseServiceAccountEnv() {
 }
 
 try {
-  if (!admin) {
+  if (!adminApp || !adminAuth || !adminFirestore) {
     throw new Error(
-      "PACKAGE_MISSING: firebase-admin is not installed. Add \"firebase-admin\" to package.json dependencies and redeploy."
+      "PACKAGE_MISSING: firebase-admin modular packages failed to load. " +
+        "Add \"firebase-admin\" to package.json dependencies, keep it in " +
+        "netlify.toml external_node_modules, then Clear cache and deploy site."
     );
   }
 
-  // Detect broken / partially-bundled installs (common with esbuild if not externalised)
-  if (!admin.credential || typeof admin.credential.cert !== "function") {
+  var initializeApp = adminApp.initializeApp;
+  var certFn = adminApp.cert;
+  var getApps = adminApp.getApps;
+  var getAuth = adminAuth.getAuth;
+  var getFirestore = adminFirestore.getFirestore;
+
+  if (typeof initializeApp !== "function" || typeof certFn !== "function") {
     throw new Error(
-      "PACKAGE_BROKEN: firebase-admin loaded but admin.credential.cert is missing. " +
-        "Ensure firebase-admin is in package.json dependencies AND listed in netlify.toml " +
-        "external_node_modules so esbuild does not bundle it. Then clear cache and redeploy."
+      "PACKAGE_BROKEN: firebase-admin/app loaded but initializeApp/cert is missing. " +
+        "Keep firebase-admin external to esbuild (netlify.toml external_node_modules)."
     );
   }
-  if (typeof admin.initializeApp !== "function") {
+  if (typeof getAuth !== "function" || typeof getFirestore !== "function") {
     throw new Error(
-      "PACKAGE_BROKEN: firebase-admin.initializeApp is missing. Same fix as above — keep it external to esbuild."
+      "PACKAGE_BROKEN: firebase-admin/auth or /firestore missing getAuth/getFirestore."
     );
   }
 
-  // Defensive: some broken installs leave admin.apps undefined
-  var existingApps = admin.apps;
   var alreadyInitialized =
-    existingApps && typeof existingApps.length === "number" && existingApps.length > 0;
+    typeof getApps === "function" && Array.isArray(getApps()) && getApps().length > 0;
 
   if (!alreadyInitialized) {
     var serviceAccount = parseServiceAccountEnv();
@@ -113,15 +121,25 @@ try {
         serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
       }
     }
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
+    initializeApp({
+      credential: certFn(serviceAccount),
     });
   }
 
-  db = admin.firestore();
+  // Thin shim so the rest of this file can keep using admin.auth()
+  admin = {
+    auth: function () {
+      return getAuth();
+    },
+    firestore: function () {
+      return getFirestore();
+    },
+  };
+  db = getFirestore();
 } catch (e) {
   firebaseInitError = e && e.message ? e.message : String(e);
   console.error("Firebase Admin init failed:", firebaseInitError);
+  admin = null;
   db = null;
 }
 
