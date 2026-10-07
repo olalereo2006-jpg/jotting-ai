@@ -4,26 +4,18 @@
 // Required env: FIREBASE_SERVICE_ACCOUNT_JSON, GEMINI_SERVER_KEY
 // Optional: PAYSTACK_SECRET_KEY (for verify_payment)
 
-// firebase-admin must be in package.json dependencies for Netlify Functions.
-// It must also stay external to esbuild (see netlify.toml external_node_modules).
+// firebase-admin must be in the ROOT package.json under "dependencies"
+// (not only in netlify/functions). Netlify installs from the repo root.
 //
-// Use modular entry points — they survive Netlify/esbuild better than the old
-// monolithic require("firebase-admin"), which often arrives with
-// admin.credential === undefined (PACKAGE_BROKEN).
-var adminApp = null; // firebase-admin/app
-var adminAuth = null; // firebase-admin/auth
-var adminFirestore = null; // firebase-admin/firestore
-var admin = null; // thin shim so existing admin.auth() calls still work
+// Loading strategy:
+//  1) Try classic require("firebase-admin")
+//  2) Fall back to modular firebase-admin/app + /auth + /firestore
+// Either path must succeed; if both fail the package is not installed on the server.
+var admin = null;
 var db = null;
 var firebaseInitError = null;
-
-try {
-  adminApp = require("firebase-admin/app");
-  adminAuth = require("firebase-admin/auth");
-  adminFirestore = require("firebase-admin/firestore");
-} catch (e) {
-  console.error("require(firebase-admin/*) failed:", e && e.message ? e.message : e);
-}
+var firebaseLoadPath = null; // "classic" | "modular" — for health diagnostics
+var firebaseRequireError = null;
 
 function parseServiceAccountEnv() {
   // Prefer base64 — safest on Netlify (no broken newlines / quoting).
@@ -72,70 +64,115 @@ function parseServiceAccountEnv() {
   }
 }
 
-try {
-  if (!adminApp || !adminAuth || !adminFirestore) {
+function normalizeServiceAccount(serviceAccount) {
+  if (!serviceAccount || typeof serviceAccount !== "object") {
+    throw new Error("INVALID_JSON: Parsed service account is not an object.");
+  }
+  if (!serviceAccount.client_email || !serviceAccount.private_key) {
     throw new Error(
-      "PACKAGE_MISSING: firebase-admin modular packages failed to load. " +
-        "Add \"firebase-admin\" to package.json dependencies, keep it in " +
-        "netlify.toml external_node_modules, then Clear cache and deploy site."
+      "INVALID_JSON: Service account JSON is missing client_email or private_key. Make sure you pasted the FULL file."
     );
   }
-
-  var initializeApp = adminApp.initializeApp;
-  var certFn = adminApp.cert;
-  var getApps = adminApp.getApps;
-  var getAuth = adminAuth.getAuth;
-  var getFirestore = adminFirestore.getFirestore;
-
-  if (typeof initializeApp !== "function" || typeof certFn !== "function") {
-    throw new Error(
-      "PACKAGE_BROKEN: firebase-admin/app loaded but initializeApp/cert is missing. " +
-        "Keep firebase-admin external to esbuild (netlify.toml external_node_modules)."
-    );
-  }
-  if (typeof getAuth !== "function" || typeof getFirestore !== "function") {
-    throw new Error(
-      "PACKAGE_BROKEN: firebase-admin/auth or /firestore missing getAuth/getFirestore."
-    );
-  }
-
-  var alreadyInitialized =
-    typeof getApps === "function" && Array.isArray(getApps()) && getApps().length > 0;
-
-  if (!alreadyInitialized) {
-    var serviceAccount = parseServiceAccountEnv();
-    if (!serviceAccount || typeof serviceAccount !== "object") {
-      throw new Error("INVALID_JSON: Parsed service account is not an object.");
+  // private_key must have real newlines for cert()
+  if (typeof serviceAccount.private_key === "string") {
+    if (
+      serviceAccount.private_key.indexOf("\\n") !== -1 &&
+      serviceAccount.private_key.indexOf("\n") === -1
+    ) {
+      serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
     }
-    if (!serviceAccount.client_email || !serviceAccount.private_key) {
+  }
+  return serviceAccount;
+}
+
+try {
+  // --- Path 1: classic monolithic require ---
+  var classic = null;
+  var classicErr = null;
+  try {
+    classic = require("firebase-admin");
+    if (classic && classic.default && !classic.credential) {
+      classic = classic.default;
+    }
+  } catch (e) {
+    classicErr = e && e.message ? e.message : String(e);
+  }
+
+  if (
+    classic &&
+    classic.credential &&
+    typeof classic.credential.cert === "function" &&
+    typeof classic.initializeApp === "function"
+  ) {
+    firebaseLoadPath = "classic";
+    var existingApps = classic.apps;
+    var alreadyInitialized =
+      existingApps && typeof existingApps.length === "number" && existingApps.length > 0;
+    if (!alreadyInitialized) {
+      classic.initializeApp({
+        credential: classic.credential.cert(normalizeServiceAccount(parseServiceAccountEnv())),
+      });
+    }
+    admin = classic;
+    db = classic.firestore();
+  } else {
+    // --- Path 2: modular entry points ---
+    var adminApp = null;
+    var adminAuth = null;
+    var adminFirestore = null;
+    var modularErr = null;
+    try {
+      adminApp = require("firebase-admin/app");
+      adminAuth = require("firebase-admin/auth");
+      adminFirestore = require("firebase-admin/firestore");
+    } catch (e) {
+      modularErr = e && e.message ? e.message : String(e);
+    }
+
+    if (
+      adminApp &&
+      adminAuth &&
+      adminFirestore &&
+      typeof adminApp.initializeApp === "function" &&
+      typeof adminApp.cert === "function" &&
+      typeof adminAuth.getAuth === "function" &&
+      typeof adminFirestore.getFirestore === "function"
+    ) {
+      firebaseLoadPath = "modular";
+      var getApps = adminApp.getApps;
+      var already =
+        typeof getApps === "function" && Array.isArray(getApps()) && getApps().length > 0;
+      if (!already) {
+        adminApp.initializeApp({
+          credential: adminApp.cert(normalizeServiceAccount(parseServiceAccountEnv())),
+        });
+      }
+      admin = {
+        auth: function () {
+          return adminAuth.getAuth();
+        },
+        firestore: function () {
+          return adminFirestore.getFirestore();
+        },
+      };
+      db = adminFirestore.getFirestore();
+    } else {
+      firebaseRequireError =
+        "classic: " +
+        (classicErr ||
+          (classic
+            ? "loaded but credential.cert/initializeApp missing"
+            : "null")) +
+        " | modular: " +
+        (modularErr || "incomplete exports");
       throw new Error(
-        "INVALID_JSON: Service account JSON is missing client_email or private_key. Make sure you pasted the FULL file."
+        "PACKAGE_MISSING: firebase-admin is not available on the server. " +
+          "Add \"firebase-admin\" to the ROOT package.json dependencies (not only in a subfolder), " +
+          "commit, then Clear cache and deploy site. Require details: " +
+          firebaseRequireError
       );
     }
-    // private_key must have real newlines for cert()
-    if (typeof serviceAccount.private_key === "string") {
-      if (
-        serviceAccount.private_key.indexOf("\\n") !== -1 &&
-        serviceAccount.private_key.indexOf("\n") === -1
-      ) {
-        serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
-      }
-    }
-    initializeApp({
-      credential: certFn(serviceAccount),
-    });
   }
-
-  // Thin shim so the rest of this file can keep using admin.auth()
-  admin = {
-    auth: function () {
-      return getAuth();
-    },
-    firestore: function () {
-      return getFirestore();
-    },
-  };
-  db = getFirestore();
 } catch (e) {
   firebaseInitError = e && e.message ? e.message : String(e);
   console.error("Firebase Admin init failed:", firebaseInitError);
@@ -503,6 +540,8 @@ exports.handler = async function (event) {
         firebaseAdminLoaded: !!admin,
         firebaseDbReady: !!db,
         firebaseInitError: firebaseInitError || null,
+        firebaseLoadPath: firebaseLoadPath || null,
+        firebaseRequireError: firebaseRequireError || null,
         hasServiceAccountJson: !!(
           process.env.FIREBASE_SERVICE_ACCOUNT_JSON &&
           String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON).trim()
@@ -544,6 +583,8 @@ exports.handler = async function (event) {
         firebaseAdminLoaded: !!admin,
         firebaseDbReady: !!db,
         firebaseInitError: firebaseInitError || null,
+        firebaseLoadPath: firebaseLoadPath || null,
+        firebaseRequireError: firebaseRequireError || null,
         hasServiceAccountJson: !!(
           process.env.FIREBASE_SERVICE_ACCOUNT_JSON &&
           String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON).trim()
