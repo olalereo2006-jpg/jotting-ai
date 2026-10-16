@@ -47,8 +47,7 @@ const googleProvider = new GoogleAuthProvider();
 // popup, never move money or touch account data on its own. Get this from your
 // Paystack dashboard (Settings → API Keys) and swap in your live key when ready.
 // The matching SECRET key belongs only on the server — see netlify/functions/manage-subscription.js.
-//const PAYSTACK_PUBLIC_KEY = "pk_test_REPLACE_WITH_YOUR_PAYSTACK_PUBLIC_KEY";
-const PAYSTACK_PUBLIC_KEY = "pk_live_35f814871b22cf97cf0fdf9007d2be2e82300aca";
+const PAYSTACK_PUBLIC_KEY = "pk_test_REPLACE_WITH_YOUR_PAYSTACK_PUBLIC_KEY";
 
 // Web Push VAPID public key — identifies your server to browsers' push services so a
 // push subscription can only be used by you, not anyone who happens to see the endpoint
@@ -56,8 +55,7 @@ const PAYSTACK_PUBLIC_KEY = "pk_live_35f814871b22cf97cf0fdf9007d2be2e82300aca";
 // This one was freshly generated for you — pair it with the matching VAPID_PRIVATE_KEY
 // set as a Netlify env var for netlify/functions/send-reminders.js. Regenerate anytime
 // with `npx web-push generate-vapid-keys` if you'd rather use your own.
-//const VAPID_PUBLIC_KEY = "BCewO3bPQScLntwHiEpsHOCfNSPtl5I7CaqnbkE_dQk12bh9bbuyVsyYxAFkoNgifT1eD9wXTFyDfDksrvE1SsY";
-const VAPID_PUBLIC_KEY = "BFedshU80TzJPnPEB0FQHUMpQ3CMxuA9ObT84auybyoLBwix2g8zvwf02j-tFlffG6OGA3Z-T7WxrcOx5l7pOwU";
+const VAPID_PUBLIC_KEY = "BCewO3bPQScLntwHiEpsHOCfNSPtl5I7CaqnbkE_dQk12bh9bbuyVsyYxAFkoNgifT1eD9wXTFyDfDksrvE1SsY";
 
 // ── Theme system ────────────────────────────────────────────────────────────
 // `C` is read all over the app as plain property access (C.bg, C.text, ...) at
@@ -130,15 +128,60 @@ function loadPaystackScript(){
 // accounts/{uid}" rule the AI credit system already follows, so a payment can't be faked
 // by editing anything in the browser.
 async function callSubscriptionApi(payload){
+  // Uses the working /api/generate function (same Netlify function as SAM-X)
+  // with action verify_payment or downgrade — avoids the broken manage-subscription 502.
   var idToken = await getIdToken();
-  var res = await fetch("/api/manage-subscription", {
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({ idToken:idToken, ...payload })
-  });
-  var data = await res.json();
-  if (!res.ok) throw new Error((data&&data.error)||"Something went wrong");
-  return data;
+  if (!idToken) throw new Error("Please sign in again, then retry verification.");
+
+  var lastErr = null;
+  // One automatic retry on transient 502/503 (Netlify cold start / brief outage).
+  for (var attempt = 0; attempt < 2; attempt++) {
+    try {
+      var res = await fetch("/api/generate", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ idToken:idToken, ...payload })
+      });
+      var data = null;
+      try { data = await res.json(); } catch(e) { data = null; }
+      if (res.ok) return data || {};
+      var msg = (data && data.error) || ("Request failed ("+res.status+")");
+      // Retry only on gateway / server blips
+      if ((res.status===502 || res.status===503 || res.status===504) && attempt===0) {
+        lastErr = new Error(msg);
+        await new Promise(function(r){ setTimeout(r, 1200); });
+        continue;
+      }
+      throw new Error(msg);
+    } catch(e) {
+      lastErr = e;
+      if (attempt===0 && e && !e.message) {
+        await new Promise(function(r){ setTimeout(r, 1200); });
+        continue;
+      }
+      if (attempt===0 && e && /failed to fetch|network|502|503/i.test(e.message||"")) {
+        await new Promise(function(r){ setTimeout(r, 1200); });
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr || new Error("Something went wrong verifying payment");
+}
+
+// Pending Paystack checkout — survives a closed popup / failed verify so the
+// student can tap "Retry verification" without paying again.
+function savePendingPayment(userId, pending){
+  try{ localStorage.setItem("jotting_pending_pay_"+userId, JSON.stringify(pending)); }catch(e){}
+}
+function loadPendingPayment(userId){
+  try{
+    var raw = localStorage.getItem("jotting_pending_pay_"+userId);
+    return raw ? JSON.parse(raw) : null;
+  }catch(e){ return null; }
+}
+function clearPendingPayment(userId){
+  try{ localStorage.removeItem("jotting_pending_pay_"+userId); }catch(e){}
 }
 
 // ── Background push notifications ────────────────────────────────────────────
@@ -226,8 +269,9 @@ async function fetchWithRetry(url, options, retries) {
   retries = retries==null ? 2 : retries;
   for (let attempt=0; attempt<=retries; attempt++) {
     var res = await fetch(url, options);
-    if (res.status !== 503 || attempt===retries) return res;
-    await new Promise(function(r){ setTimeout(r, 800*(attempt+1)); });
+    // 503 = overloaded, 429 = rate limit (common on free Gemini keys)
+    if ((res.status !== 503 && res.status !== 429) || attempt===retries) return res;
+    await new Promise(function(r){ setTimeout(r, 1000*(attempt+1)); });
   }
 }
 
@@ -235,18 +279,87 @@ async function fetchWithRetry(url, options, retries) {
 // directly — the real API key lives only on the server (netlify/functions/generate.js),
 // which also checks and deducts the student's AI credits before answering.
 async function callProxy(action, payload, onCreditsUpdate) {
+  // Client pre-check (server still enforces — never trust this alone)
+  if (auth.currentUser && auth.currentUser.emailVerified === false) {
+    throw new Error(
+      "Please verify your email before using SAM-X. Check your inbox, then open Settings → Email Verified and tap “I’ve verified”."
+    );
+  }
   var idToken = await getIdToken();
+  if (!idToken) throw new Error("Please log in again, then try SAM-X.");
   var res = await fetchWithRetry("/api/generate", {
     method:"POST",
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({ idToken:idToken, action:action, ...payload })
   });
-  var data = await res.json();
+  var data = null;
+  try { data = await res.json(); } catch(e) { data = null; }
   if (res.status===402 || (data&&data.error==="OUT_OF_CREDITS")) throw OutOfCreditsError(data&&data.remaining);
-  if (!res.ok) throw new Error((data&&data.error)||"Something went wrong reaching SAM-X");
+  // Server-enforced plan gate (Exam Mode / AI Tutor). Do not trust UI alone.
+  if (data&&data.error==="PLAN_REQUIRED") {
+    throw OutOfCreditsError(data&&data.remaining); // reuses upgrade screen path
+  }
+  if (data&&data.error==="EMAIL_NOT_VERIFIED") {
+    throw new Error(
+      (data&&data.message) ||
+      "Please verify your email before using SAM-X. Check your inbox, then open Settings → Email Verified."
+    );
+  }
+  if (data&&data.error==="ACCOUNT_DISABLED") {
+    throw new Error(
+      (data&&data.message) ||
+      "This account has been suspended. Contact support if you think this is a mistake."
+    );
+  }
+  if (res.status===413 || (data&&data.error==="PAYLOAD_TOO_LARGE")) {
+    throw new Error(
+      (data&&data.message) ||
+      "That request is too large for SAM-X. Try a shorter note or a smaller file."
+    );
+  }
+  if (!res.ok) {
+    var raw = (data && data.error) || "";
+    var lower = (raw||"").toLowerCase();
+    // Student-friendly only — never dump env-var names or stack traces into the UI.
+    if (lower.indexOf("package_missing")!==-1 || lower.indexOf("package_broken")!==-1) {
+      throw new Error("SAM-X is temporarily offline on the server. Please try again in a few minutes.");
+    }
+    if (lower.indexOf("firebase_service_account_json is missing")!==-1 || lower.indexOf("server auth is not configured")!==-1 || (lower.indexOf("missing")!==-1 && lower.indexOf("firebase")!==-1)) {
+      throw new Error("SAM-X can't verify your account right now. Please try again shortly.");
+    }
+    if (lower.indexOf("invalid_json")!==-1 || lower.indexOf("not valid json")!==-1 || lower.indexOf("not valid base64")!==-1) {
+      throw new Error("SAM-X is misconfigured on the server. Please try again later.");
+    }
+    if (lower.indexOf("firebase admin failed")!==-1) {
+      throw new Error("SAM-X is restarting on the server. Wait about a minute, then retry.");
+    }
+    if (lower.indexOf("gemini server key")!==-1 || (lower.indexOf("not configured")!==-1 && lower.indexOf("gemini")!==-1)) {
+      throw new Error("SAM-X isn't fully set up yet. Please try again later.");
+    }
+    if (lower.indexOf("high demand")!==-1 || lower.indexOf("resource exhausted")!==-1 || lower.indexOf("quota")!==-1 || res.status===429 || res.status===503) {
+      throw new Error("SAM-X is busy right now (high demand). Please wait about 30–60 seconds and try again.");
+    }
+    if (res.status===401 || lower.indexOf("session expired")!==-1 || lower.indexOf("log in")!==-1) {
+      throw new Error("Your session expired — please log in again, then retry.");
+    }
+    if (res.status>=500) {
+      throw new Error("Couldn't reach SAM-X — check your connection and try again.");
+    }
+    var clean = raw.replace(/^PACKAGE_[A-Z_]+:\s*/i, "").replace(/^INVALID_JSON:\s*/i, "");
+    if (clean.length > 140) clean = "Something went wrong reaching SAM-X. Please try again.";
+    throw new Error(clean || "Something went wrong reaching SAM-X");
+  }
   if (onCreditsUpdate && data && typeof data.creditsRemaining==="number") onCreditsUpdate(data.creditsRemaining);
-  var text = data&&data.candidates&&data.candidates[0]&&data.candidates[0].content&&data.candidates[0].content.parts&&data.candidates[0].content.parts[0]&&data.candidates[0].content.parts[0].text;
-  if (!text) throw new Error("No response from SAM-X");
+  // Robust extract: join all text parts (server also normalizes this path).
+  var parts = data&&data.candidates&&data.candidates[0]&&data.candidates[0].content&&data.candidates[0].content.parts;
+  var text = "";
+  if (parts && parts.length) {
+    for (var i=0;i<parts.length;i++){
+      if (parts[i] && typeof parts[i].text==="string") text += parts[i].text;
+    }
+  }
+  text = (text||"").trim();
+  if (!text) throw new Error("No response from SAM-X — try again in a moment.");
   return text;
 }
 
@@ -333,6 +446,9 @@ var updateGlobalCredits = function(){};
 // Same pattern: lets any screen jump straight to the upgrade page the moment a
 // student runs out of credits, instead of every screen needing its own navigation logic.
 var triggerUpgradeScreen = function(){};
+// Lightweight global toast — preferred over alert() for student-facing feedback.
+// Wired in App; safe no-op until then.
+var showAppToast = function(message, kind){ /* kind: "info" | "error" | "success" */ };
 
 // ── Firestore helpers ─────────────────────────────────────────────────────────
 async function saveNoteToCloud(userId, note) {
@@ -344,14 +460,19 @@ async function saveNoteToCloud(userId, note) {
   } catch(e) { console.error("Save error:", e); return null; }
 }
 
+// Returns { ok: true, notes } on success, or { ok: false, notes: [] } on failure.
+// Callers MUST treat ok:false as "cloud unavailable — keep local data, do not wipe".
 async function loadNotesFromCloud(userId) {
   try {
     var q = query(collection(db, "notes"), where("userId","==",userId));
     var snap = await getDocs(q);
     var list = snap.docs.map(function(d){ return {...d.data(), firestoreId:d.id}; });
     list.sort(function(a,b){ return (b.createdAt||0) - (a.createdAt||0); });
-    return list;
-  } catch(e) { console.error("Load error:", e); return []; }
+    return { ok: true, notes: list };
+  } catch(e) {
+    console.error("Load error:", e);
+    return { ok: false, notes: [] };
+  }
 }
 
 async function deleteNoteFromCloud(firestoreId) {
@@ -663,7 +784,7 @@ function ExportPicker({ onExportPDF, onExportWord, label, compact }) {
   var [busy, setBusy] = useState(false);
   async function run(fn){
     setBusy(true); setOpen(false);
-    try{ await fn(); }catch(e){ console.error("Export failed:", e); alert("Couldn't export — make sure jspdf/docx are installed, then try again."); }
+    try{ await fn(); }catch(e){ console.error("Export failed:", e); showAppToast("Couldn't export — make sure jspdf/docx are installed, then try again.", "error"); }
     setBusy(false);
   }
   var triggerStyle = compact
@@ -729,16 +850,19 @@ async function migrateNotesFromLocalStorage(uid){
   try{ localStorage.setItem(NOTES_MIGRATION_FLAG_PREFIX+uid, "1"); }catch(e){}
 }
 
-// Reconciles the repository with a freshly computed "merged" notes list (unsynced
-// local notes ∪ Firestore notes) — the same full-replace job persistNotesLocal used
-// to do against localStorage: anything no longer in the merged list is removed
-// locally too (e.g. deleted from another device), everything else is written/updated.
-async function syncNotesToRepository(uid, notesList){
+// Reconciles the repository with a freshly computed merged notes list.
+// When allowDelete is true (only after a successful cloud load), notes that are
+// no longer in the merged list are removed locally (e.g. deleted on another device).
+// When allowDelete is false (cloud failed / offline), we only upsert — never wipe.
+async function syncNotesToRepository(uid, notesList, allowDelete){
   var existing = await notesRepository.list(uid);
-  var keepIds = {};
-  notesList.forEach(function(n){ keepIds[n.id] = true; });
-  var stale = existing.filter(function(n){ return !keepIds[n.id]; });
-  await Promise.all(stale.map(function(n){ return notesRepository.delete(n.id); }));
+  if (allowDelete) {
+    var keepIds = {};
+    notesList.forEach(function(n){ keepIds[n.id] = true; });
+    var stale = existing.filter(function(n){ return !keepIds[n.id]; });
+    await Promise.all(stale.map(function(n){ return notesRepository.delete(n.id); }));
+  }
+  // Upsert every note in the merged list (put overwrites by id).
   await Promise.all(notesList.map(function(n){ return notesRepository.create(n); }));
 }
 
@@ -1680,8 +1804,8 @@ function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings, onSaveRecord
     if(!file) return;
     var ext = (file.name.split(".").pop()||"").toLowerCase();
     var looksLikeAudio = ["mp3","m4a","wav"].indexOf(ext)!==-1 || /audio\/(mpeg|mp4|wav|x-m4a)/.test(file.type||"");
-    if(!looksLikeAudio){ alert("Please choose an MP3, M4A, or WAV audio file."); return; }
-    if(file.size > MAX_AUDIO_BYTES){ alert("That file is too large to process (max ~18MB). Try a shorter clip or a lower-quality export."); return; }
+    if(!looksLikeAudio){ showAppToast("Please choose an MP3, M4A, or WAV audio file.", "error"); return; }
+    if(file.size > MAX_AUDIO_BYTES){ showAppToast("That file is too large to process (max ~18MB). Try a shorter clip or a lower-quality export.", "error"); return; }
     partsRef.current = [file];
     mimeTypeRef.current = file.type || guessAudioMime(file.name) || "audio/mpeg";
     if(!title) setTitle(file.name.replace(/\.[^/.]+$/,""));
@@ -1769,14 +1893,14 @@ function VoiceNoteScreen({ onBack, onSave, recQuality, recSettings, onSaveRecord
 
   function saveNote(overrideContent){
     var content = overrideContent!=null ? overrideContent : (activeTab?outputs[activeTab]:"");
-    if(!content || !content.trim()){ alert("Nothing to save yet!"); return; }
+    if(!content || !content.trim()){ showAppToast("Nothing to save yet — finish the note first.", "error"); return; }
     setSaving(true);
     try{
       var newId = Date.now();
       onSave({id:newId,title:title||("Voice Note - "+new Date().toLocaleDateString()),course,color:"#06B6D4",bg:"rgba(6,182,212,0.12)",tag:"Lecture",words:content.split(" ").length,preview:content.slice(0,100),content:content});
       var linkedRecordingId = (resumeAudio && resumeAudio.recordingId) || savedRecordingIdRef.current;
       if(linkedRecordingId && onMarkTranscribed) onMarkTranscribed(linkedRecordingId, newId);
-    }catch(e){ alert("Couldn't save the note — check your connection and try again."); }
+    }catch(e){ showAppToast("Couldn't save the note — check your connection and try again.", "error"); }
     setSaving(false);
   }
 
@@ -2087,7 +2211,7 @@ function ScanDocScreen({ onBack, onSave, courses, onCreateCourse }) {
     setExtracting(false);
   }
 
-  function saveNote(){if(!extracted.trim()){alert("Extract text first!");return;}onSave({id:Date.now(),title:title||("Scanned Note - "+new Date().toLocaleDateString()),course,color:"#06B6D4",bg:"rgba(6,182,212,0.12)",tag:"Lecture",words:extracted.split(" ").length,preview:extracted.slice(0,100),content:extracted});}
+  function saveNote(){if(!extracted.trim()){showAppToast("Extract text first, then save the note.", "error");return;}onSave({id:Date.now(),title:title||("Scanned Note - "+new Date().toLocaleDateString()),course,color:"#06B6D4",bg:"rgba(6,182,212,0.12)",tag:"Lecture",words:extracted.split(" ").length,preview:extracted.slice(0,100),content:extracted});}
 
   var hasSource = image || pdfFile;
 
@@ -2174,7 +2298,7 @@ function DrawScreen({ onBack, onSave, courses, onCreateCourse }) {
   function startDraw(e){e.preventDefault();var c=canvasRef.current;var ctx=c.getContext("2d");var p=getPos(e,c);ctx.beginPath();ctx.moveTo(p.x,p.y);setDrawing(true);setHasContent(true);}
   function draw(e){e.preventDefault();if(!drawing)return;var c=canvasRef.current;var ctx=c.getContext("2d");var p=getPos(e,c);ctx.globalCompositeOperation=tool==="eraser"?"destination-out":"source-over";ctx.strokeStyle=color;ctx.lineWidth=tool==="eraser"?28:size;ctx.lineCap="round";ctx.lineJoin="round";ctx.lineTo(p.x,p.y);ctx.stroke();}
   function saveDrawing(){
-    if(!hasContent){ alert("Draw something first!"); return; }
+    if(!hasContent){ showAppToast("Draw something first, then save.", "error"); return; }
     var c=canvasRef.current;
     var dataUrl=c.toDataURL("image/png");
     onSave({ id:Date.now(), title:title||("Drawing - "+new Date().toLocaleDateString()), course, color:"#06B6D4", bg:"rgba(6,182,212,0.12)", tag:"Study", type:"drawing", words:0, preview:"🎨 Drawing", content:dataUrl });
@@ -2211,22 +2335,76 @@ function DrawScreen({ onBack, onSave, courses, onCreateCourse }) {
 // same local+cloud persistence, same landing on NoteDetail afterward. Nothing
 // about how a note gets saved is reimplemented here.
 function CreateNoteScreen({ onBack, onSave, courses, onCreateCourse }) {
-  var [title,setTitle]=useState("");var [content,setContent]=useState("");var [course,setCourse]=useState("General");
+  var [title,setTitle]=useState("");
+  var [content,setContent]=useState("");
+  var [course,setCourse]=useState("General");
+  var [tag,setTag]=useState("Study");
+  var [saveHint,setSaveHint]=useState("");
+  var tags = [
+    { name:"Lecture", color:"#A78BFA", bg:"rgba(167,139,250,0.15)" },
+    { name:"Study", color:"#06B6D4", bg:"rgba(6,182,212,0.15)" },
+    { name:"Business", color:"#34D399", bg:"rgba(52,211,153,0.15)" },
+    { name:"Personal", color:"#F59E0B", bg:"rgba(245,158,11,0.15)" },
+  ];
+  var activeTag = tags.find(function(t){ return t.name===tag; }) || tags[1];
+  var wordCount = content.trim() ? content.trim().split(/\s+/).filter(Boolean).length : 0;
   function save(){
-    if(!content.trim()){ alert("Write something first!"); return; }
-    onSave({ id:Date.now(), title:title||("Note - "+new Date().toLocaleDateString()), course, color:"#06B6D4", bg:"rgba(6,182,212,0.12)", tag:"Study", words:content.split(" ").length, preview:content.slice(0,100), content:content });
+    if(!content.trim()){ setSaveHint("Write something first — then tap Save."); return; }
+    setSaveHint("");
+    onSave({
+      id: Date.now(),
+      title: title.trim() || ("Note - "+new Date().toLocaleDateString()),
+      course: course,
+      color: activeTag.color,
+      bg: activeTag.bg,
+      tag: tag,
+      words: wordCount,
+      preview: content.trim().slice(0,120).replace(/\n/g," "),
+      content: content,
+    });
   }
   return(
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
-      <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
+      <div style={{ background:C.card,padding:"14px 16px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border,gap:10 }}>
         <button onClick={onBack} style={backBtn}>←</button>
-        <span style={{ fontWeight:800,fontSize:16,color:C.text }}>Create Note</span>
-        <button onClick={save} style={{ background:"linear-gradient(135deg,#06B6D4,#A78BFA)",color:"#fff",border:"none",borderRadius:10,padding:"8px 16px",fontWeight:800,fontSize:13,cursor:"pointer" }}>Save</button>
+        <div style={{ flex:1,minWidth:0 }}>
+          <div style={{ fontWeight:800,fontSize:15,color:C.text }}>New note</div>
+          <div style={{ fontSize:11,color:C.muted }}>{wordCount} word{wordCount===1?"":"s"}{course&&course!=="General"?" · "+course:""}</div>
+        </div>
+        <button onClick={save} disabled={!content.trim()} style={{ background:content.trim()?"linear-gradient(135deg,#06B6D4,#A78BFA)":C.card2,color:content.trim()?"#fff":C.muted,border:"none",borderRadius:10,padding:"9px 16px",fontWeight:800,fontSize:13,cursor:content.trim()?"pointer":"default" }}>Save</button>
       </div>
-      <div style={{ flex:1,overflowY:"auto",padding:20 }}>
-        <input value={title} onChange={function(e){setTitle(e.target.value);}} placeholder="Note title (optional)..." style={{ width:"100%",padding:"13px 16px",borderRadius:12,border:"1px solid "+C.border,fontSize:15,fontWeight:700,background:C.card,color:C.text,outline:"none",marginBottom:14,boxSizing:"border-box" }}/>
-        <div style={{ marginBottom:16 }}><CourseChipPicker realCourses={courses} value={course} onSelect={setCourse} onCreateCourse={onCreateCourse} color={C.cyan}/></div>
-        <textarea value={content} onChange={function(e){setContent(e.target.value);}} placeholder="Start typing your note..." style={{ width:"100%",minHeight:320,padding:16,borderRadius:16,border:"1px solid "+C.border,background:C.card,color:C.text,fontSize:14,lineHeight:1.9,outline:"none",resize:"none",fontFamily:"inherit",boxSizing:"border-box" }}/>
+      <div style={{ flex:1,overflowY:"auto",padding:16 }}>
+        {/* Paper surface */}
+        <div style={{ background:C.card,borderRadius:18,border:"1px solid "+C.border,padding:18,boxShadow:"0 8px 28px rgba(0,0,0,0.18)" }}>
+          <input
+            value={title}
+            onChange={function(e){setTitle(e.target.value);}}
+            placeholder="Title (optional)"
+            style={{ width:"100%",padding:"4px 0 12px",border:"none",borderBottom:"1px solid "+C.border,fontSize:20,fontWeight:800,background:"transparent",color:C.text,outline:"none",marginBottom:14,boxSizing:"border-box" }}
+          />
+          <div style={{ marginBottom:12 }}><CourseChipPicker realCourses={courses} value={course} onSelect={setCourse} onCreateCourse={onCreateCourse} color={C.cyan}/></div>
+          <div style={{ fontSize:11,fontWeight:700,color:C.muted,letterSpacing:0.3,marginBottom:8,textTransform:"uppercase" }}>Tag</div>
+          <div style={{ display:"flex",gap:6,flexWrap:"wrap",marginBottom:14 }}>
+            {tags.map(function(t){
+              var on = tag===t.name;
+              return <button key={t.name} type="button" onClick={function(){setTag(t.name);setSaveHint("");}} style={{ padding:"6px 12px",borderRadius:99,border:"1px solid "+(on?t.color:C.border),background:on?t.bg:"transparent",color:on?t.color:C.muted,fontSize:11,fontWeight:700,cursor:"pointer" }}>{t.name}</button>;
+            })}
+          </div>
+          <textarea
+            value={content}
+            onChange={function(e){setContent(e.target.value); if(saveHint) setSaveHint("");}}
+            placeholder={"Start writing…\n\nTip: use # Heading, ## Subheading, - bullets, **bold**"}
+            style={{ width:"100%",minHeight:360,padding:0,border:"none",background:"transparent",color:C.text,fontSize:15,lineHeight:1.85,outline:"none",resize:"vertical",fontFamily:"inherit",boxSizing:"border-box" }}
+          />
+        </div>
+        {saveHint && (
+          <div style={{ marginTop:12, background:"rgba(248,113,113,0.1)", border:"1px solid rgba(248,113,113,0.3)", borderRadius:10, padding:"10px 14px", fontSize:13, color:C.red, fontWeight:600 }}>
+            ⚠️ {saveHint}
+          </div>
+        )}
+        <div style={{ marginTop:10,fontSize:11,color:C.muted,lineHeight:1.5,textAlign:"center" }}>
+          Markdown supported · headings, lists, bold, and math render when you open the note
+        </div>
       </div>
     </div>
   );
@@ -2397,12 +2575,64 @@ function NoteDetail({ note, onBack, onDelete, onUpdate, onSaveQuiz }) {
   var [view,setView]=useState("note");var [summary,setSummary]=useState(null);var [quiz,setQuiz]=useState([]);var [quizIdx,setQuizIdx]=useState(0);var [selected,setSelected]=useState(null);var [score,setScore]=useState(0);var [quizDone,setQuizDone]=useState(false);var [loading,setLoading]=useState(false);var [quizError,setQuizError]=useState(null);
   var [displayTitle,setDisplayTitle]=useState(note.title);
   var [displayContent,setDisplayContent]=useState(note.content);
+  var [displayTag,setDisplayTag]=useState(note.tag||"Study");
   var [renaming,setRenaming]=useState(false);var [titleDraft,setTitleDraft]=useState(note.title);
   var [editingContent,setEditingContent]=useState(false);var [contentDraft,setContentDraft]=useState(note.content);
   var [displayHidden,setDisplayHidden]=useState(!!note.hidden);
+  var [shareHint,setShareHint]=useState("");
+  var NOTE_TAGS = [
+    { name:"Lecture", color:"#A78BFA", bg:"rgba(167,139,250,0.15)" },
+    { name:"Study", color:"#06B6D4", bg:"rgba(6,182,212,0.15)" },
+    { name:"Business", color:"#34D399", bg:"rgba(52,211,153,0.15)" },
+    { name:"Personal", color:"#F59E0B", bg:"rgba(245,158,11,0.15)" },
+  ];
+  // Keep local display state in sync when the student opens a different note.
+  useEffect(function(){
+    setDisplayTitle(note.title);
+    setDisplayContent(note.content);
+    setDisplayTag(note.tag||"Study");
+    setTitleDraft(note.title);
+    setContentDraft(note.content);
+    setDisplayHidden(!!note.hidden);
+    setEditingContent(false);
+    setRenaming(false);
+    setShareHint("");
+    setView("note");
+    setSummary(null);
+    setQuiz([]);
+    setQuizError(null);
+  }, [note && note.id]);
   function toggleHidden(){ var next=!displayHidden; setDisplayHidden(next); onUpdate&&onUpdate(note.id,{hidden:next}); }
   function saveRename(){ var t=titleDraft.trim()||displayTitle; setDisplayTitle(t); setRenaming(false); onUpdate&&onUpdate(note.id,{title:t}); }
-  function saveContentEdit(){ var c=contentDraft; if(!c||!c.trim()){setEditingContent(false);return;} setDisplayContent(c); setEditingContent(false); onUpdate&&onUpdate(note.id,{content:c,words:c.split(" ").length,preview:c.slice(0,100)}); }
+  function setTag(nextTag){
+    var meta = NOTE_TAGS.find(function(t){ return t.name===nextTag; });
+    setDisplayTag(nextTag);
+    var patch = { tag: nextTag };
+    if (meta) { patch.color = meta.color; patch.bg = meta.bg; }
+    onUpdate&&onUpdate(note.id, patch);
+  }
+  function shareOrCopy(){
+    if (navigator.share) {
+      navigator.share({ title:displayTitle, text:displayContent }).catch(function(){});
+      return;
+    }
+    var plain = (displayContent||"").replace(/\*\*/g,"");
+    var done = function(){ setShareHint("Copied to clipboard"); setTimeout(function(){ setShareHint(""); }, 2000); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(plain).then(done).catch(function(){ setShareHint("Couldn't copy"); setTimeout(function(){ setShareHint(""); }, 2000); });
+    } else {
+      setShareHint("Couldn't copy"); setTimeout(function(){ setShareHint(""); }, 2000);
+    }
+  }
+  function saveContentEdit(){
+    var c = contentDraft;
+    if(!c||!c.trim()){ setEditingContent(false); return; }
+    var words = c.trim().split(/\s+/).filter(Boolean).length;
+    var preview = c.trim().slice(0,120).replace(/\n/g," ");
+    setDisplayContent(c);
+    setEditingContent(false);
+    onUpdate&&onUpdate(note.id,{ content:c, words:words, preview:preview });
+  }
   async function generateSummary(){setLoading(true);setView("summary");try{var raw=await callGeminiText("Summarize these notes. Return ONLY JSON: {\"summary\":\"...\",\"keyPoints\":[\"...\"],\"tags\":[\"...\"]} NOTES: "+displayContent,800,"summary");setSummary(JSON.parse(raw.split("```json").join("").split("```").join("").trim()));}catch(e){if(e.code==="OUT_OF_CREDITS"){triggerUpgradeScreen();}else{setSummary({summary:"This covers "+displayTitle+".",keyPoints:["Review definitions","Practice problems"],tags:[note.course,note.tag]});}}setLoading(false);}
   async function generateQuiz(){
     // Guard against generating a quiz from a note that doesn't have enough
@@ -2448,28 +2678,89 @@ function NoteDetail({ note, onBack, onDelete, onUpdate, onSaveQuiz }) {
             <span style={{ fontSize:12,color:C.muted,flexShrink:0 }}>✏️</span>
           </button>
         )}
-        <div style={{ display:"flex",gap:6,flexShrink:0 }}><button onClick={toggleHidden} title={displayHidden?"Unhide note":"Hide from Library & Home"} style={{ background:displayHidden?"rgba(245,158,11,0.15)":C.card2,border:"none",borderRadius:8,width:32,height:32,cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",justifyContent:"center" }}>{displayHidden?"🙈":"👁️"}</button><ExportPicker compact={true} label="⬇️" onExportPDF={function(){return exportNotesToPDF([{...note,title:displayTitle,content:displayContent}], displayTitle);}} onExportWord={function(){return exportNotesToDocx([{...note,title:displayTitle,content:displayContent}], displayTitle);}}/><button onClick={function(){if(navigator.share)navigator.share({title:displayTitle,text:displayContent});else{navigator.clipboard&&navigator.clipboard.writeText(displayContent);alert("Copied!");}}} style={{ background:C.card2,border:"none",borderRadius:8,width:32,height:32,cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",justifyContent:"center" }}>📤</button><button onClick={function(){onDelete(note.id);}} style={{ background:"rgba(248,113,113,0.12)",border:"none",borderRadius:8,width:32,height:32,cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",justifyContent:"center" }}>🗑</button></div>
+        <div style={{ display:"flex",gap:6,flexShrink:0 }}><button onClick={toggleHidden} title={displayHidden?"Unhide note":"Hide from Library & Home"} style={{ background:displayHidden?"rgba(245,158,11,0.15)":C.card2,border:"none",borderRadius:8,width:32,height:32,cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",justifyContent:"center" }}>{displayHidden?"🙈":"👁️"}</button><ExportPicker compact={true} label="⬇️" onExportPDF={function(){return exportNotesToPDF([{...note,title:displayTitle,content:displayContent}], displayTitle);}} onExportWord={function(){return exportNotesToDocx([{...note,title:displayTitle,content:displayContent}], displayTitle);}}/><button onClick={shareOrCopy} title="Share or copy" style={{ background:shareHint? "rgba(52,211,153,0.15)":C.card2,border:"none",borderRadius:8,width:32,height:32,cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",justifyContent:"center" }}>{shareHint?"✓":"📤"}</button><button onClick={function(){onDelete(note.id);}} style={{ background:"rgba(248,113,113,0.12)",border:"none",borderRadius:8,width:32,height:32,cursor:"pointer",fontSize:14,display:"flex",alignItems:"center",justifyContent:"center" }}>🗑</button></div>
       </div>
+      {shareHint&&<div style={{ background:"rgba(52,211,153,0.1)",borderBottom:"1px solid rgba(52,211,153,0.25)",padding:"8px 20px",fontSize:12,color:C.green,fontWeight:600 }}>✓ {shareHint}</div>}
       {displayHidden&&<div style={{ background:"rgba(245,158,11,0.1)",borderBottom:"1px solid rgba(245,158,11,0.2)",padding:"8px 20px",fontSize:12,color:C.amber,fontWeight:600 }}>🙈 This note is hidden from Library & Home (Settings → Privacy and Security).</div>}
       <div style={{ background:C.card,padding:"0 20px 12px",display:"flex",gap:6,borderBottom:"1px solid "+C.border }}>
-        {[["📝","note","Note"],["📋","summary","Summary"],["🧠","quiz","Quiz"]].map(function(item){return<button key={item[1]} onClick={function(){setView(item[1]);if(item[1]==="summary"&&!summary)generateSummary();if(item[1]==="quiz"&&quiz.length===0)generateQuiz();}} style={{ padding:"7px 16px",borderRadius:99,border:"none",background:view===item[1]?note.color:C.card2,color:view===item[1]?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer",marginTop:12 }}>{item[0]+" "+item[2]}</button>;})}
+        {[["📝","note","Note"],["📋","summary","Summary"],["🧠","quiz","Quiz"]].map(function(item){return<button key={item[1]} onClick={function(){setView(item[1]);if(item[1]==="summary"&&!summary)generateSummary();if(item[1]==="quiz"&&quiz.length===0)generateQuiz();}} style={{ padding:"7px 16px",borderRadius:99,border:"none",background:view===item[1]?(note.color||C.cyan):C.card2,color:view===item[1]?"#0A0F1E":C.muted,fontSize:13,fontWeight:700,cursor:"pointer",marginTop:12 }}>{item[0]+" "+item[2]}</button>;})}
       </div>
-      <div style={{ flex:1,overflowY:"auto",padding:20 }}>
-        {view==="note"&&(<div><div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16 }}><div style={{ display:"flex",alignItems:"center",gap:8 }}><span style={{ fontSize:11,fontWeight:700,color:note.color,background:note.bg,borderRadius:99,padding:"3px 12px" }}>{note.course}</span><span style={{ fontSize:11,color:C.muted }}>{formatRelativeDate(note.id)}</span></div>{note.type!=="drawing"&&!editingContent&&<button onClick={function(){setContentDraft(displayContent);setEditingContent(true);}} style={{ background:"none",border:"1px solid "+C.border,borderRadius:8,padding:"5px 12px",color:C.cyan,fontSize:12,fontWeight:700,cursor:"pointer" }}>✏️ Edit</button>}</div>
-          <div style={{ background:C.card,borderRadius:18,padding:note.type==="drawing"?12:20,border:"1px solid "+C.border,marginBottom:16 }}>
-            {note.type==="drawing"
-              ?<img src={note.content} alt={displayTitle} style={{ width:"100%",borderRadius:12,display:"block" }}/>
-              :editingContent
-                ?(<div>
-                    <textarea value={contentDraft} onChange={function(e){setContentDraft(e.target.value);}} style={{ width:"100%",minHeight:280,background:"transparent",border:"none",color:C.text,fontSize:14,lineHeight:1.9,outline:"none",resize:"none",fontFamily:"inherit",boxSizing:"border-box" }}/>
-                    <div style={{ display:"flex",gap:8,justifyContent:"flex-end",marginTop:10,paddingTop:10,borderTop:"1px solid "+C.border }}>
-                      <button onClick={function(){setEditingContent(false);}} style={{ background:"none",border:"1px solid "+C.border,borderRadius:10,padding:"8px 16px",color:C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>Cancel</button>
-                      <button onClick={saveContentEdit} style={{ background:C.cyan,border:"none",borderRadius:10,padding:"8px 16px",color:"#0A0F1E",fontSize:13,fontWeight:800,cursor:"pointer" }}>Save Changes</button>
-                    </div>
-                  </div>)
-                :<div className="samx-md" style={{ fontSize:14,color:"#CBD5E1",lineHeight:1.9 }}><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>{displayContent}</ReactMarkdown></div>}
+      <div style={{ flex:1,overflowY:"auto",padding:16 }}>
+        {view==="note"&&(<div>
+          {/* Meta row: course · tag · date · words · edit */}
+          <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10,gap:8,flexWrap:"wrap" }}>
+            <div style={{ display:"flex",alignItems:"center",gap:8,flexWrap:"wrap" }}>
+              <span style={{ fontSize:11,fontWeight:700,color:note.color||C.cyan,background:note.bg||"rgba(6,182,212,0.12)",borderRadius:99,padding:"3px 12px" }}>{note.course||"General"}</span>
+              <span style={{ fontSize:11,color:C.muted }}>{formatRelativeDate(note.id||note.createdAt)}</span>
+              {note.type!=="drawing"&&(
+                <span style={{ fontSize:11,color:C.muted }}>
+                  · {(displayContent||"").trim() ? (displayContent.trim().split(/\s+/).filter(Boolean).length) : 0} words
+                </span>
+              )}
+            </div>
+            {note.type!=="drawing"&&!editingContent&&(
+              <button onClick={function(){setContentDraft(displayContent);setEditingContent(true);}} style={{ background:"none",border:"1px solid "+C.border,borderRadius:8,padding:"5px 12px",color:C.cyan,fontSize:12,fontWeight:700,cursor:"pointer" }}>✏️ Edit</button>
+            )}
           </div>
-          {note.type!=="drawing"&&!editingContent&&<div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:10 }}><button onClick={function(){setView("summary");if(!summary)generateSummary();}} style={actionBtn(note.color)}>📋 AI Summary</button><button onClick={function(){setView("quiz");if(quiz.length===0)generateQuiz();}} style={actionBtn(C.purple)}>🧠 Quiz Me</button></div>}
+          {note.type!=="drawing"&&!editingContent&&(
+            <div style={{ display:"flex",gap:6,flexWrap:"wrap",marginBottom:12 }}>
+              {NOTE_TAGS.map(function(t){
+                var on = displayTag===t.name;
+                return (
+                  <button key={t.name} type="button" onClick={function(){setTag(t.name);}} style={{ padding:"4px 10px",borderRadius:99,border:"1px solid "+(on?t.color:C.border),background:on?t.bg:"transparent",color:on?t.color:C.muted,fontSize:11,fontWeight:700,cursor:"pointer" }}>{t.name}</button>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Paper surface — feels like opening a real note */}
+          <div style={{
+            background: C.card,
+            borderRadius: 18,
+            padding: note.type==="drawing" ? 12 : 22,
+            border: "1px solid "+C.border,
+            marginBottom: 16,
+            boxShadow: "0 10px 32px rgba(0,0,0,0.22)",
+            minHeight: note.type==="drawing" ? undefined : 280,
+          }}>
+            {note.type==="drawing"
+              ? <img src={note.content} alt={displayTitle} style={{ width:"100%",borderRadius:12,display:"block" }}/>
+              : editingContent
+                ? (
+                  <div>
+                    <div style={{ fontSize:11,color:C.muted,marginBottom:10,lineHeight:1.5 }}>
+                      Editing · Markdown supported (# heading, - list, **bold**)
+                    </div>
+                    <textarea
+                      autoFocus
+                      value={contentDraft}
+                      onChange={function(e){setContentDraft(e.target.value);}}
+                      style={{ width:"100%",minHeight:320,background:"transparent",border:"none",color:C.text,fontSize:15,lineHeight:1.85,outline:"none",resize:"vertical",fontFamily:"inherit",boxSizing:"border-box" }}
+                    />
+                    <div style={{ display:"flex",gap:8,justifyContent:"flex-end",alignItems:"center",marginTop:12,paddingTop:12,borderTop:"1px solid "+C.border }}>
+                      <span style={{ fontSize:11,color:C.muted,marginRight:"auto" }}>
+                        {(contentDraft||"").trim() ? contentDraft.trim().split(/\s+/).filter(Boolean).length : 0} words
+                      </span>
+                      <button onClick={function(){setEditingContent(false);setContentDraft(displayContent);}} style={{ background:"none",border:"1px solid "+C.border,borderRadius:10,padding:"8px 16px",color:C.muted,fontSize:13,fontWeight:700,cursor:"pointer" }}>Cancel</button>
+                      <button onClick={saveContentEdit} style={{ background:C.cyan,border:"none",borderRadius:10,padding:"8px 16px",color:"#0A0F1E",fontSize:13,fontWeight:800,cursor:"pointer" }}>Save changes</button>
+                    </div>
+                  </div>
+                )
+                : (
+                  <div className="note-md samx-md" style={{ fontSize:15,color:C.soft,lineHeight:1.85 }}>
+                    <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
+                      {displayContent||"_Empty note — tap Edit to start writing._"}
+                    </ReactMarkdown>
+                  </div>
+                )}
+          </div>
+
+          {note.type!=="drawing"&&!editingContent&&(
+            <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:10 }}>
+              <button onClick={function(){setView("summary");if(!summary)generateSummary();}} style={actionBtn(note.color)}>📋 AI Summary</button>
+              <button onClick={function(){setView("quiz");if(quiz.length===0)generateQuiz();}} style={actionBtn(C.purple)}>🧠 Quiz Me</button>
+            </div>
+          )}
         </div>)}
         {view==="summary"&&(loading?<div style={{ textAlign:"center",padding:"60px 20px" }}><div style={{ fontSize:48,animation:"spin 2s linear infinite" }}>✨</div><p style={{ color:C.muted,marginTop:16 }}>Generating...</p></div>:summary?(<div><div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+C.border,marginBottom:14 }}><div style={{ fontSize:11,fontWeight:700,color:C.green,letterSpacing:1,marginBottom:10 }}>OVERVIEW</div><p style={{ margin:0,fontSize:14,color:"#CBD5E1",lineHeight:1.8 }}>{summary.summary}</p></div><div style={{ background:C.card,borderRadius:16,padding:20,border:"1px solid "+C.border,marginBottom:14 }}><div style={{ fontSize:11,fontWeight:700,color:C.amber,letterSpacing:1,marginBottom:12 }}>KEY POINTS</div>{summary.keyPoints&&summary.keyPoints.map(function(p,i){return<div key={i} style={{ display:"flex",gap:10,marginBottom:10 }}><div style={{ width:6,height:6,borderRadius:3,background:C.amber,marginTop:7,flexShrink:0 }}/><p style={{ margin:0,fontSize:14,color:"#CBD5E1",lineHeight:1.7 }}>{p}</p></div>;})}</div><div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>{summary.tags&&summary.tags.map(function(t){return<span key={t} style={{ background:C.card2,color:C.cyan,borderRadius:99,padding:"4px 14px",fontSize:12,fontWeight:700 }}>{t}</span>;})}</div></div>):null)}
         {view==="quiz"&&(loading?<div style={{ textAlign:"center",padding:"60px 20px" }}><div style={{ fontSize:48,animation:"spin 2s linear infinite" }}>🧠</div><p style={{ color:C.muted,marginTop:16 }}>Generating quiz...</p></div>:quizError?(<div style={{ textAlign:"center",padding:"40px 20px" }}><div style={{ fontSize:48,marginBottom:12 }}>⚠️</div><div style={{ fontWeight:800,fontSize:15,color:C.text,marginBottom:8 }}>Couldn't generate a quiz</div><p style={{ color:C.muted,fontSize:13,marginBottom:20 }}>{quizError}</p><button onClick={generateQuiz} style={{ background:"linear-gradient(135deg,"+note.color+",#A78BFA)",color:"#fff",border:"none",borderRadius:14,padding:"12px 28px",fontWeight:800,fontSize:14,cursor:"pointer" }}>Try Again</button></div>):quizDone?(<div style={{ textAlign:"center",padding:"40px 20px" }}><div style={{ fontSize:64,marginBottom:16 }}>{score===quiz.length?"🏆":"📖"}</div><div style={{ fontSize:40,fontWeight:800,color:C.text }}>{score}/{quiz.length}</div><p style={{ color:C.muted,marginTop:8 }}>{score===quiz.length?"Perfect! 🔥":"Keep studying! 💪"}</p><button onClick={function(){setQuizIdx(0);setSelected(null);setScore(0);setQuizDone(false);}} style={{ marginTop:20,background:"linear-gradient(135deg,"+note.color+",#A78BFA)",color:"#fff",border:"none",borderRadius:14,padding:"13px 32px",fontWeight:800,fontSize:15,cursor:"pointer" }}>Try Again</button></div>):quiz.length>0?(<div><div style={{ display:"flex",justifyContent:"space-between",marginBottom:8 }}><span style={{ fontSize:13,color:C.muted }}>Question {quizIdx+1}/{quiz.length}</span><span style={{ fontSize:13,fontWeight:700,color:C.text }}>Score: {score}</span></div><div style={{ height:4,background:C.border,borderRadius:2,marginBottom:20 }}><div style={{ height:4,background:note.color,borderRadius:2,width:(quizIdx/quiz.length*100)+"%",transition:"width 0.3s" }}/></div><div style={{ background:C.card,borderRadius:16,padding:20,marginBottom:16,border:"1px solid "+C.border }}><p style={{ margin:0,fontSize:16,fontWeight:600,color:C.text,lineHeight:1.6 }}>{quiz[quizIdx].question}</p></div>{quiz[quizIdx].options.map(function(opt,i){var bg=C.card,border=C.border,color=C.text;if(selected!==null){if(i===quiz[quizIdx].answer){bg="rgba(52,211,153,0.15)";border="#34D399";color="#34D399";}else if(i===selected){bg="rgba(248,113,113,0.15)";border="#F87171";color="#F87171";}}return<button key={i} onClick={function(){pick(i);}} disabled={selected!==null} style={{ width:"100%",textAlign:"left",background:bg,border:"2px solid "+border,borderRadius:12,padding:"13px 16px",marginBottom:10,fontSize:14,color:color,cursor:selected!==null?"default":"pointer",fontWeight:500,display:"flex",gap:10,fontFamily:"inherit" }}><span style={{opacity:0.5}}>{String.fromCharCode(65+i)}.</span>{opt}</button>;})}</div>):null)}
@@ -2489,7 +2780,7 @@ function LibraryScreen({ notes, hiddenNotes, hiddenFolderEnabled, pinEnabled, ve
     if(pinEnabled){
       var entered = window.prompt("Enter your 4-digit PIN to view hidden notes:");
       if(entered==null) return;
-      if(!verifyPin(entered)){ alert("Incorrect PIN."); return; }
+      if(!verifyPin(entered)){ showAppToast("Incorrect PIN — try again.", "error"); return; }
     }
     setShowHidden(true);
   }
@@ -2522,9 +2813,17 @@ function LibraryScreen({ notes, hiddenNotes, hiddenFolderEnabled, pinEnabled, ve
       </div>
       <div style={{ flex:1,overflowY:"auto",padding:16 }}>
         {filtered.length===0?(notes.length===0?(
-          <div style={{ textAlign:"center",padding:"60px 20px" }}><div style={{ fontSize:52,marginBottom:12 }}>📝</div><div style={{ fontWeight:800,fontSize:18,color:C.text,marginBottom:6 }}>No notes yet</div><div style={{ fontSize:13,color:C.muted }}>Record a lecture, scan a page, or write one — it'll show up here.</div></div>
+          <div style={{ textAlign:"center",padding:"48px 20px",margin:"8px 0",background:C.card2,borderRadius:18,border:"1px dashed "+C.border }}>
+            <div style={{ fontSize:48,marginBottom:12 }}>📚</div>
+            <div style={{ fontWeight:800,fontSize:17,color:C.text,marginBottom:6 }}>Your library is empty</div>
+            <div style={{ fontSize:13,color:C.muted,lineHeight:1.55,maxWidth:280,margin:"0 auto" }}>Record a lecture, scan a page, or write a note — everything you save shows up here.</div>
+          </div>
         ):(
-          <div style={{ textAlign:"center",padding:"60px 20px" }}><div style={{ fontSize:52,marginBottom:12 }}>🔍</div><div style={{ fontWeight:800,fontSize:18,color:C.text,marginBottom:6 }}>No matches</div><div style={{ fontSize:13,color:C.muted }}>Try a different search term or clear your filters.</div></div>
+          <div style={{ textAlign:"center",padding:"48px 20px",margin:"8px 0",background:C.card2,borderRadius:18,border:"1px dashed "+C.border }}>
+            <div style={{ fontSize:48,marginBottom:12 }}>🔍</div>
+            <div style={{ fontWeight:800,fontSize:17,color:C.text,marginBottom:6 }}>No matches</div>
+            <div style={{ fontSize:13,color:C.muted,lineHeight:1.55 }}>Try a different search term or clear your filters.</div>
+          </div>
         ))
         :view==="grid"?(<div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:10 }}>{filtered.map(function(note){var isSelected=selected.includes(note.id);return<div key={note.id} style={{ background:C.card,border:"2px solid "+(isSelected?C.cyan:note.color+"22"),borderRadius:16,padding:14,cursor:"pointer",position:"relative" }} onClick={function(){onNote(note);}}><div onClick={function(e){e.stopPropagation();toggleSelect(note.id);}} style={{ position:"absolute",top:10,right:10,width:20,height:20,borderRadius:"50%",border:"2px solid "+(isSelected?C.cyan:C.border),background:isSelected?C.cyan:"transparent",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11 }}>{isSelected?"✓":""}</div><div style={{ width:36,height:36,borderRadius:10,background:note.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,marginBottom:10 }}>{note.type==="drawing"?"🎨":note.tag==="Lecture"?"📚":note.tag==="Study"?"💡":note.tag==="Business"?"💼":"📝"}</div><div style={{ fontWeight:700,fontSize:13,color:C.text,marginBottom:4 }}>{note.title}</div><div style={{ fontSize:10,color:note.color,fontWeight:700,background:note.bg,borderRadius:99,padding:"2px 8px",display:"inline-block",marginBottom:6 }}>{note.course}</div><div style={{ fontSize:11,color:C.muted }}>{formatRelativeDate(note.id)}</div></div>;})}</div>)
         :(filtered.map(function(note){var isSelected=selected.includes(note.id);return<div key={note.id} style={{ background:C.card,border:"2px solid "+(isSelected?C.cyan:note.color+"22"),borderRadius:16,padding:16,marginBottom:10,cursor:"pointer",display:"flex",gap:12,alignItems:"flex-start" }} onClick={function(){onNote(note);}}><div onClick={function(e){e.stopPropagation();toggleSelect(note.id);}} style={{ width:22,height:22,borderRadius:"50%",border:"2px solid "+(isSelected?C.cyan:C.border),background:isSelected?C.cyan:"transparent",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,flexShrink:0,marginTop:2 }}>{isSelected?"✓":""}</div><div style={{ width:42,height:42,borderRadius:12,background:note.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0 }}>{note.type==="drawing"?"🎨":note.tag==="Lecture"?"📚":note.tag==="Study"?"💡":note.tag==="Business"?"💼":"📝"}</div><div style={{ flex:1 }}><div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:4 }}><div style={{ fontWeight:800,fontSize:14,color:C.text }}>{note.title}</div><div style={{ fontSize:11,color:C.muted,flexShrink:0,marginLeft:8 }}>{formatRelativeDate(note.id)}</div></div><div style={{ display:"flex",gap:6,marginBottom:6 }}><span style={{ fontSize:10,color:note.color,fontWeight:700,background:note.bg,borderRadius:99,padding:"2px 8px" }}>{note.course}</span><span style={{ fontSize:10,color:C.muted,background:"rgba(255,255,255,0.04)",borderRadius:99,padding:"2px 8px" }}>{note.tag}</span></div><div style={{ fontSize:12,color:C.muted,lineHeight:1.5,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden" }}>{note.preview}</div><div style={{ display:"flex",gap:12,marginTop:8 }}><span style={{ fontSize:11,color:C.soft }}>{note.type==="drawing"?"🎨 Drawing":"💬 "+(note.words||note.content.split(" ").length)+" words"}</span><span style={{ fontSize:11,color:note.color,marginLeft:"auto" }}>Open →</span></div></div></div>;}))}
@@ -2806,7 +3105,7 @@ function missionCtaFor(type){
   })[type] || { label:"Open" };
 }
 
-function CommandCenterScreen({ notes, recordings, assignments, topicMastery, courses, user, plan, onVoice, onDraw, onAIWrite, onScan, onChat, onRecordings, onStudyPlanner, onExamMode, onAssignments, onFlashcards, onAITutor, onSearch, onNotifications, onProfile, unreadCount, onOpenMission, onOpenCourse, onOpenTopic, onStartStudySession, onOpenVault, onOpenUpcoming, onOpenProgress, onCreateNote, onUploadMaterial, onAddAssignmentDirect }) {
+function CommandCenterScreen({ notes, recordings, assignments, topicMastery, courses, user, plan, onVoice, onDraw, onAIWrite, onScan, onChat, onRecordings, onStudyPlanner, onExamMode, onAssignments, onFlashcards, onAITutor, onSearch, onNotifications, onProfile, unreadCount, onOpenMission, onOpenCourse, onOpenTopic, onStartStudySession, onOpenVault, onOpenUpcoming, onOpenProgress, onOpenStats, onCreateNote, onUploadMaterial, onAddAssignmentDirect }) {
   var [showAddMenu, setShowAddMenu] = useState(false);
   var [showAskMenu, setShowAskMenu] = useState(false);
   var [askMenuPhase, setAskMenuPhase] = useState("options"); // "options" | "course" — course sub-step only shown for "Ask about this course" when there's more than one course
@@ -2856,7 +3155,8 @@ function CommandCenterScreen({ notes, recordings, assignments, topicMastery, cou
   // 5th element is the required plan tier for a locked action: false = no gate,
   // "pro" = Pro-and-above (Study Planner, AI Tutor), "premium" = Premium-only
   // (Exam Mode) — checked against planAtLeast() below, not a plain "premium" string.
-  var QUICK_ACTIONS = [["🎤","Record\nLecture",C.cyan,onVoice,false],["✨","AI\nWrite",C.purple,onAIWrite,false],["💬","Ask\nJotting",C.cyan,function(){setShowAskMenu(true);},false],["📷","Scan\nDoc",C.amber,onScan,false],["🖊️","Draw",C.green,onDraw,false],["📁","My\nRecordings",C.purple,onRecordings,false],["🗓️","Study\nPlanner",C.amber,onStudyPlanner,"pro"],["🎯","Exam\nMode",C.red,onExamMode,"premium"],["📋","Assignments",C.green,onAssignments,false],["🗂️","Flashcards",C.purple,onFlashcards,false],["🎓","AI\nTutor",C.amber,onAITutor,"pro"],["🧭","Study\nSession",C.cyan,onStartStudySession,false],["🗄️","Study\nVault",C.cyan,onOpenVault,false],["📅","Upcoming",C.purple,onOpenUpcoming,false],["📈","Progress",C.cyan,onOpenProgress,false]];
+  // Ask Jotting moved to the bottom nav; Stats sits here in its place on Home.
+  var QUICK_ACTIONS = [["🎤","Record\nLecture",C.cyan,onVoice,false],["✨","AI\nWrite",C.purple,onAIWrite,false],["📊","Stats",C.cyan,onOpenStats||onOpenProgress,false],["📷","Scan\nDoc",C.amber,onScan,false],["🖊️","Draw",C.green,onDraw,false],["📁","My\nRecordings",C.purple,onRecordings,false],["🗓️","Study\nPlanner",C.amber,onStudyPlanner,"pro"],["🎯","Exam\nMode",C.red,onExamMode,"premium"],["📋","Assignments",C.green,onAssignments,false],["🗂️","Flashcards",C.purple,onFlashcards,false],["🎓","AI\nTutor",C.amber,onAITutor,"pro"],["🧭","Study\nSession",C.cyan,onStartStudySession,false],["🗄️","Study\nVault",C.cyan,onOpenVault,false],["📅","Upcoming",C.purple,onOpenUpcoming,false],["📈","Progress",C.cyan,onOpenProgress,false]];
 
   // Every option here funnels into the SAME AIScreen instance via onChat(seed)
   // — this is a launcher for different ways to start talking to SAM-X, not a
@@ -2918,6 +3218,32 @@ function CommandCenterScreen({ notes, recordings, assignments, topicMastery, cou
 
       <div style={{ padding:"20px 20px 100px" }}>
 
+        {/* First-run path — empty library gets a clear 3-step start */}
+        {notes.length===0 && (
+          <div style={{ background:C.card, border:"1px solid "+C.border, borderRadius:18, padding:18, marginBottom:20, boxShadow:"0 8px 24px rgba(0,0,0,0.15)" }}>
+            <div style={{ fontWeight:800, fontSize:16, color:C.text, marginBottom:4 }}>Start studying in 3 steps</div>
+            <div style={{ fontSize:12, color:C.muted, marginBottom:14, lineHeight:1.45 }}>Jotting works best once SAM-X has something of yours to learn from.</div>
+            <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+              {[
+                { n:"1", title:"Capture a note", desc:"Write, voice-record, or scan a lecture page", onPress:onCreateNote },
+                { n:"2", title:"Ask SAM-X", desc:"Explain, quiz, or summarise what you saved", onPress:function(){ onChat && onChat(); } },
+                { n:"3", title:"Practice", desc:"Turn notes into flashcards when you're ready", onPress:onFlashcards },
+              ].map(function(step){
+                return (
+                  <button key={step.n} type="button" onClick={step.onPress} style={{ display:"flex", alignItems:"center", gap:12, textAlign:"left", background:C.card2, border:"1px solid "+C.border, borderRadius:14, padding:"12px 14px", cursor:"pointer", color:C.text }}>
+                    <span style={{ width:28, height:28, borderRadius:99, background:"linear-gradient(135deg,#06B6D4,#A78BFA)", color:"#fff", fontWeight:800, fontSize:13, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>{step.n}</span>
+                    <span style={{ flex:1, minWidth:0 }}>
+                      <span style={{ display:"block", fontWeight:800, fontSize:13 }}>{step.title}</span>
+                      <span style={{ display:"block", fontSize:11, color:C.muted, marginTop:2 }}>{step.desc}</span>
+                    </span>
+                    <span style={{ color:C.cyan, fontWeight:800, fontSize:14 }}>→</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         {/* Attention summary */}
         <div style={{ background:recommendations.length?C.card:"rgba(52,211,153,0.1)",border:"1px solid "+(recommendations.length?C.border:"rgba(52,211,153,0.3)"),borderRadius:16,padding:"14px 16px",marginBottom:20,display:"flex",alignItems:"center",gap:12 }}>
           <span style={{ fontSize:26 }}>{recommendations.length?"⚠️":"🎉"}</span>
@@ -2932,7 +3258,7 @@ function CommandCenterScreen({ notes, recordings, assignments, topicMastery, cou
                 </div>
               </div>
             ) : (
-              <div style={{ fontWeight:800,fontSize:14,color:C.green }}>You're all caught up — nothing urgent today.</div>
+              <div style={{ fontWeight:800,fontSize:14,color:C.green }}>{notes.length===0 ? "Add your first note to get personalised missions." : "You're all caught up — nothing urgent today."}</div>
             )}
           </div>
         </div>
@@ -4727,7 +5053,7 @@ function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, onChat,
           <p style={{ fontWeight:800,fontSize:16,color:C.text,margin:0 }}>Recent Notes</p>
           <span style={{ fontSize:12,color:C.muted,fontWeight:600 }}>{filtered.length} notes</span>
         </div>
-        {filtered.length===0?<div style={{ textAlign:"center",padding:"40px 20px" }}><div style={{ fontSize:48,marginBottom:12 }}>📝</div><p style={{ color:C.muted,fontSize:15 }}>No notes yet. Tap Voice Note to start!</p></div>
+        {filtered.length===0?<div style={{ textAlign:"center",padding:"36px 16px",background:C.card2,borderRadius:16,border:"1px dashed "+C.border }}><div style={{ fontSize:40,marginBottom:10 }}>📝</div><div style={{ fontWeight:800,fontSize:15,color:C.text,marginBottom:6 }}>No notes yet</div><p style={{ color:C.muted,fontSize:13,margin:0,lineHeight:1.5 }}>Tap Voice Note or New Note to capture your first lecture.</p></div>
         :filtered.slice(0,5).map(function(note){return<button key={note.id} onClick={function(){onNote(note);}} style={{ width:"100%",background:C.card,border:"1px solid "+note.color+"22",borderRadius:18,padding:16,marginBottom:12,cursor:"pointer",textAlign:"left" }}><div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10 }}><div style={{ display:"flex",alignItems:"center",gap:10 }}><div style={{ width:42,height:42,borderRadius:12,background:note.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,border:"1px solid "+note.color+"30",flexShrink:0 }}>{note.type==="drawing"?"🎨":note.tag==="Lecture"?"📚":note.tag==="Study"?"💡":note.tag==="Business"?"💼":"📝"}</div><div><div style={{ fontWeight:800,fontSize:14,color:C.text,marginBottom:3 }}>{note.title}</div><span style={{ fontSize:11,fontWeight:700,color:note.color,background:note.bg,borderRadius:99,padding:"2px 8px" }}>{note.course}</span></div></div><div style={{ textAlign:"right" }}><div style={{ fontSize:11,color:C.muted,marginBottom:4 }}>{formatRelativeDate(note.id)}</div><span style={{ background:note.bg,borderRadius:99,padding:"2px 8px",fontSize:10,fontWeight:700,color:note.color }}>{note.tag}</span></div></div><p style={{ margin:"0 0 10px",fontSize:13,color:C.muted,lineHeight:1.6,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden" }}>{note.preview}</p><div style={{ display:"flex",alignItems:"center",paddingTop:10,borderTop:"1px solid "+C.border }}><span style={{ fontSize:11,color:C.muted }}>✨ AI features available</span><span style={{ fontSize:11,color:note.color,marginLeft:"auto",fontWeight:700 }}>Open →</span></div></button>;})}
       </div>
     </div>
@@ -4735,8 +5061,8 @@ function HomeScreen({ notes, onNote, onVoice, onDraw, onAIWrite, onScan, onChat,
 }
 
 // ── AI CHAT ───────────────────────────────────────────────────────────────────
-function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession, initialPrefill, initialSend, initialPicker }) {
-  var greeting = {role:"ai", text:"Hi! 👋 I'm SAM-X, your AI study assistant. Ask me anything, attach a note to discuss it, or upload a file (image, PDF, TXT, or DOCX) and I'll read it with you."};
+function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession, initialPrefill, initialSend, initialPicker, credits, plan, onUpgrade }) {
+  var greeting = {role:"ai", text:"Hi! 👋 I'm **SAM-X**, your study companion.\n\nAsk me anything about your courses, pick a note to explain or quiz you on, or attach a file (image, PDF, TXT, DOCX) and we'll work through it together."};
   var [activeId, setActiveId] = useState(null);
   var [messages, setMessages] = useState([greeting]);
   var [input, setInput] = useState("");
@@ -4839,7 +5165,7 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession,
         setStreamingText("");
         triggerUpgradeScreen();
       } else {
-        setErrorRetry({ history: history });
+        setErrorRetry({ history: history, message: (e && e.message) || "Couldn't reach SAM-X." });
       }
     }
     setStreaming(false);
@@ -4883,7 +5209,27 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession,
     askGemini(truncated, false);
   }
 
-  function copyMessage(i, text){ navigator.clipboard && navigator.clipboard.writeText(text); setCopiedIndex(i); setTimeout(function(){setCopiedIndex(null);}, 1500); }
+  function copyMessage(i, text){
+    var done = function(){ setCopiedIndex(i); setTimeout(function(){ setCopiedIndex(null); }, 2200); };
+    var plain = (text || "").replace(/\*\*/g, "").replace(/`/g, "");
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(plain).then(done).catch(function(){
+        try {
+          var ta = document.createElement("textarea");
+          ta.value = plain; ta.style.position = "fixed"; ta.style.left = "-9999px";
+          document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta);
+          done();
+        } catch (err) { /* silent — student can still select text manually */ }
+      });
+    } else {
+      try {
+        var ta2 = document.createElement("textarea");
+        ta2.value = plain; ta2.style.position = "fixed"; ta2.style.left = "-9999px";
+        document.body.appendChild(ta2); ta2.select(); document.execCommand("copy"); document.body.removeChild(ta2);
+        done();
+      } catch (err2) {}
+    }
+  }
 
   function blobToBase64(blob){
     return new Promise(function(resolve,reject){
@@ -4912,14 +5258,14 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession,
         var text = await file.text();
         msg = { role:"user", text:"📎 Attached: "+file.name, apiText:"Here is the content of a file named \""+file.name+"\":\n\n"+text+"\n\nPlease help me with it." };
       } else {
-        alert("That file type isn't supported yet. Try an image, PDF, TXT, or DOCX file.");
+        showAppToast("That file type isn't supported yet. Try an image, PDF, TXT, or DOCX file.", "error");
         return;
       }
       var updated = messages.concat([msg]);
       setMessages(updated);
       askGemini(updated, true, msg.attachment ? "pdf_analysis" : "chat");
     }catch(err){
-      alert("Couldn't read that file — try a different one.");
+      showAppToast("Couldn't read that file — try a different one.", "error");
     }
   }
 
@@ -4973,27 +5319,94 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession,
   var grouped = groupSessions(visibleSessions);
   var GROUP_LABELS = [["pinned","📌 Pinned"],["today","Today"],["yesterday","Yesterday"],["last7","Previous 7 Days"],["last30","Previous 30 Days"],["older","Older"]];
 
+  var creditsLeft = typeof credits === "number" ? credits : null;
+  var creditsLow = creditsLeft != null && creditsLeft <= 10;
+  var planLabel = (PLANS[plan] || PLANS.free).name;
+
   return(
     <div style={{ flex:1, display:"flex", flexDirection:"column", background:C.bg, position:"relative" }}>
-      <div style={{ background:C.card, padding:"16px 20px", borderBottom:"1px solid "+C.border, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+      <div style={{ background:C.card, padding:"16px 20px", borderBottom:"1px solid "+C.border, display:"flex", justifyContent:"space-between", alignItems:"center", gap:8 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10, minWidth:0 }}>
           <button onClick={onBack} style={backBtn}>←</button>
-          <div style={{ width:40,height:40,borderRadius:12,overflow:"hidden" }}><img src="/samx-logo.png" alt="SAM-X AI" style={{ width:"100%",height:"100%",objectFit:"cover" }}/></div>
-          <div><div style={{ fontWeight:800,fontSize:16,color:C.text }}>SAM-X AI</div><div style={{ fontSize:11,color:C.green,fontWeight:600 }}>AI Study Assistant</div></div>
+          <div style={{ width:40,height:40,borderRadius:12,overflow:"hidden",flexShrink:0 }}><img src="/samx-logo.png" alt="SAM-X AI" style={{ width:"100%",height:"100%",objectFit:"cover" }}/></div>
+          <div style={{ minWidth:0 }}>
+            <div style={{ fontWeight:800,fontSize:16,color:C.text }}>SAM-X AI</div>
+            <div style={{ fontSize:11,color:C.green,fontWeight:600 }}>AI Study Assistant</div>
+          </div>
         </div>
-        <div style={{ display:"flex", gap:8 }}>
+        <div style={{ display:"flex", gap:6, alignItems:"center", flexShrink:0 }}>
+          {creditsLeft != null && (
+            <button
+              type="button"
+              onClick={function(){ if (onUpgrade) onUpgrade(); }}
+              title="AI credits remaining this month"
+              style={{
+                background: creditsLow ? "rgba(245,158,11,0.15)" : "rgba(6,182,212,0.12)",
+                border: "1px solid " + (creditsLow ? "rgba(245,158,11,0.35)" : "rgba(6,182,212,0.3)"),
+                borderRadius: 99,
+                padding: "5px 10px",
+                color: creditsLow ? C.amber : C.cyan,
+                fontSize: 11,
+                fontWeight: 800,
+                cursor: onUpgrade ? "pointer" : "default",
+                whiteSpace: "nowrap",
+              }}
+            >
+              ⚡ {creditsLeft}{creditsLow ? " low" : ""}
+            </button>
+          )}
           <button onClick={function(){setShowHistory(true);}} title="Chat history" style={iconBtnStyle}>🕐</button>
           <button onClick={newChat} title="New chat" style={iconBtnStyle}>✏️</button>
         </div>
       </div>
+      {creditsLow && (
+        <div style={{ background:"rgba(245,158,11,0.1)", borderBottom:"1px solid rgba(245,158,11,0.25)", padding:"8px 14px", fontSize:11, color:C.amber, fontWeight:600, display:"flex", justifyContent:"space-between", alignItems:"center", gap:8 }}>
+          <span>Running low on AI credits ({planLabel} plan).</span>
+          {onUpgrade && (
+            <button type="button" onClick={onUpgrade} style={{ background:C.amber, border:"none", borderRadius:8, padding:"4px 10px", color:"#0A0F1E", fontWeight:800, fontSize:11, cursor:"pointer" }}>Upgrade</button>
+          )}
+        </div>
+      )}
 
       <div style={{ flex:1, overflowY:"auto", padding:"16px 16px 8px" }}>
         {messages.length===1 && !streaming && (
-          <div style={{ display:"flex", flexWrap:"wrap", gap:8, marginBottom:16 }}>
-            <button onClick={function(){openPicker("discuss");}} style={suggestionChip}>📚 Explain a note</button>
-            <button onClick={function(){openPicker("quiz");}} style={suggestionChip}>❓ Quiz me</button>
-            <button onClick={function(){openPicker("flashcards");}} style={suggestionChip}>🗂️ Make flashcards</button>
-            <button onClick={function(){openPicker("studyplan");}} style={suggestionChip}>🗓️ Study plan</button>
+          <div style={{ marginBottom:18 }}>
+            <div style={{ fontSize:12, fontWeight:700, color:C.muted, letterSpacing:0.4, marginBottom:10, textTransform:"uppercase" }}>Quick actions</div>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
+              {[
+                { mode:"discuss", icon:"📚", title:"Explain a note", desc:"Break it down simply" },
+                { mode:"quiz", icon:"❓", title:"Quiz me", desc:"Test what you know" },
+                { mode:"flashcards", icon:"🗂️", title:"Flashcards", desc:"Memorise key points" },
+                { mode:"studyplan", icon:"🗓️", title:"Study plan", desc:"Plan your revision" },
+              ].map(function(s){
+                return (
+                  <button key={s.mode} onClick={function(){openPicker(s.mode);}} style={{ textAlign:"left", background:C.card2, border:"1px solid "+C.border, borderRadius:14, padding:"12px 12px 11px", cursor:"pointer", color:C.text }}>
+                    <div style={{ fontSize:18, marginBottom:6 }}>{s.icon}</div>
+                    <div style={{ fontWeight:800, fontSize:13, marginBottom:2 }}>{s.title}</div>
+                    <div style={{ fontSize:11, color:C.muted, lineHeight:1.35 }}>{s.desc}</div>
+                  </button>
+                );
+              })}
+            </div>
+            <div style={{ fontSize:12, fontWeight:700, color:C.muted, letterSpacing:0.4, margin:"14px 0 8px", textTransform:"uppercase" }}>Or try asking</div>
+            <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+              {[
+                "Summarise photosynthesis in 5 points",
+                "Explain Ohm's law with an example",
+                "Help me revise for my next test",
+                "Make a simple analogy for entropy",
+              ].map(function(q){
+                return (
+                  <button key={q} onClick={function(){
+                    var updated = messages.concat([{role:"user", text:q}]);
+                    setMessages(updated);
+                    askGemini(updated, false);
+                  }} style={{ background:C.card2, border:"1px solid "+C.border, borderRadius:99, padding:"8px 12px", color:C.text, fontSize:12, fontWeight:600, cursor:"pointer" }}>
+                    {q}
+                  </button>
+                );
+              })}
+            </div>
           </div>
         )}
         {messages.map(function(m,i){
@@ -5021,8 +5434,15 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession,
                 </div>
               </div>
               {!isEditing && (
-                <div style={{ display:"flex", gap:12, marginTop:4, marginLeft:m.role==="ai"?40:0 }}>
-                  {m.role==="ai" && <button onClick={function(){copyMessage(i, m.text);}} style={msgActionBtn}>{copiedIndex===i?"✓ Copied":"📋 Copy"}</button>}
+                <div style={{ display:"flex", gap:10, marginTop:6, marginLeft:m.role==="ai"?40:0, alignItems:"center", flexWrap:"wrap" }}>
+                  {m.role==="ai" && (
+                    <button
+                      onClick={function(){copyMessage(i, m.text);}}
+                      style={Object.assign({}, msgActionBtn, copiedIndex===i ? { color:C.green, fontWeight:800, background:"rgba(52,211,153,0.12)", borderRadius:8, padding:"4px 10px" } : null)}
+                    >
+                      {copiedIndex===i ? "✓ Copied" : "📋 Copy answer"}
+                    </button>
+                  )}
                   {m.role==="user" && <button onClick={function(){startEdit(i);}} style={msgActionBtn}>✏️ Edit</button>}
                   {m.role==="ai" && i===messages.length-1 && !streaming && <button onClick={regenerate} style={msgActionBtn}>🔄 Regenerate</button>}
                 </div>
@@ -5036,16 +5456,31 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession,
             <div style={{ maxWidth:"82%", background:C.card2, borderRadius:"18px 18px 18px 4px", padding:"12px 16px", border:"1px solid "+C.border }}>
               {streamingText
                 ? <div className="samx-md" style={{ fontSize:14, color:C.text, lineHeight:1.7 }}><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>{streamingText}</ReactMarkdown></div>
-                : <div style={{ display:"flex", gap:4 }}>{[0,1,2].map(function(i){return <div key={i} style={{ width:8,height:8,borderRadius:"50%",background:C.cyan,animation:"dot "+(0.5+i*0.15)+"s ease-in-out infinite alternate" }}/>;})}</div>}
+                : <div>
+                    <div style={{ fontSize:12, color:C.muted, fontWeight:600, marginBottom:8 }}>SAM-X is thinking…</div>
+                    <div style={{ display:"flex", gap:4 }}>{[0,1,2].map(function(i){return <div key={i} style={{ width:8,height:8,borderRadius:"50%",background:C.cyan,animation:"dot "+(0.5+i*0.15)+"s ease-in-out infinite alternate" }}/>;})}</div>
+                  </div>}
             </div>
           </div>
         )}
-        {errorRetry && (
-          <div style={{ background:"rgba(248,113,113,0.1)", border:"1px solid rgba(248,113,113,0.3)", borderRadius:12, padding:14, marginBottom:16, display:"flex", justifyContent:"space-between", alignItems:"center", gap:10 }}>
-            <span style={{ fontSize:13, color:C.red }}>⚠️ Couldn't reach SAM-X. Check your connection.</span>
-            <button onClick={retry} style={{ background:C.red, border:"none", borderRadius:8, padding:"6px 14px", color:"#fff", fontWeight:700, fontSize:12, cursor:"pointer", flexShrink:0 }}>Retry</button>
+        {errorRetry && (function(){
+          var msg = (errorRetry.message)||"Couldn't reach SAM-X. Check your connection.";
+          var busy = /busy|high demand|30–60|30-60/i.test(msg);
+          var offline = /connection|offline|reach SAM-X|try again later|temporarily/i.test(msg);
+          var tip = busy ? "High demand — wait half a minute, then tap Retry." : offline ? "Check Wi‑Fi or mobile data, then retry." : "Tap Retry when you're ready.";
+          var icon = busy ? "⏳" : offline ? "📡" : "⚠️";
+          return (
+          <div style={{ background: busy ? "rgba(251,191,36,0.1)" : "rgba(248,113,113,0.1)", border:"1px solid "+(busy?"rgba(251,191,36,0.35)":"rgba(248,113,113,0.3)"), borderRadius:14, padding:"14px 14px 12px", marginBottom:16 }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:10 }}>
+              <div style={{ minWidth:0 }}>
+                <div style={{ fontSize:13, color: busy ? C.amber : C.red, lineHeight:1.45, fontWeight:700 }}>{icon} {msg}</div>
+                <div style={{ fontSize:11, color:C.muted, marginTop:6, lineHeight:1.4 }}>{tip}</div>
+              </div>
+              <button onClick={retry} style={{ background: busy ? "linear-gradient(135deg,#F59E0B,#FBBF24)" : C.red, border:"none", borderRadius:10, padding:"8px 14px", color:"#fff", fontWeight:800, fontSize:12, cursor:"pointer", flexShrink:0 }}>Retry</button>
+            </div>
           </div>
-        )}
+          );
+        })()}
         <div ref={endRef}/>
       </div>
 
@@ -5055,7 +5490,7 @@ function AIScreen({ notes, onBack, chatSessions, onSaveSession, onDeleteSession,
         ) : (
           <div style={{ display:"flex", gap:8, alignItems:"flex-end" }}>
             <button onClick={function(){setShowAttachMenu(function(s){return !s;});}} title="Attach" style={{ width:48,height:48,borderRadius:14,background:C.card,border:"1px solid "+C.border,cursor:"pointer",fontSize:20,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,color:C.text }}>+</button>
-            <textarea ref={inputRef} value={input} onChange={autoResizeInput} onKeyDown={function(e){if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }}} placeholder="Ask anything..." rows={1} style={{ flex:1,padding:"12px 16px",borderRadius:18,border:"1px solid "+C.border,fontSize:14,background:C.bg,color:C.text,outline:"none",minWidth:0,resize:"none",overflowY:"auto",maxHeight:120,lineHeight:1.5,fontFamily:"inherit" }}/>
+            <textarea ref={inputRef} value={input} onChange={autoResizeInput} onKeyDown={function(e){if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }}} placeholder={messages.length<=1 ? "Ask SAM-X anything — e.g. Explain mitosis step by step…" : "Follow up, ask for an example, or dig deeper…"} rows={1} style={{ flex:1,padding:"12px 16px",borderRadius:18,border:"1px solid "+C.border,fontSize:14,background:C.bg,color:C.text,outline:"none",minWidth:0,resize:"none",overflowY:"auto",maxHeight:120,lineHeight:1.5,fontFamily:"inherit" }}/>
             <button onClick={send} style={{ width:48,height:48,borderRadius:14,background:"linear-gradient(135deg,#06B6D4,#A78BFA)",border:"none",cursor:"pointer",fontSize:20,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>↑</button>
           </div>
         )}
@@ -5320,7 +5755,7 @@ function ExamModeScreen({ notes, onBack, plan, onUpgrade, onRecordResult, onSave
     setError(""); setPhase("loading");
     try{
       var combined = relevantNotes.map(function(n){return n.title+":\n"+n.content;}).join("\n\n").slice(0,9000);
-      var raw = await callGeminiText("Create "+numQuestions+" multiple choice exam questions covering these lecture notes for the course \""+course+"\". Mix easy, medium and hard questions. Return ONLY a JSON array: [{\"question\":\"...\",\"options\":[\"A\",\"B\",\"C\",\"D\"],\"answer\":0}] NOTES:\n\n"+combined, 2400, "quiz");
+      var raw = await callGeminiText("Create "+numQuestions+" multiple choice exam questions covering these lecture notes for the course \""+course+"\". Mix easy, medium and hard questions. Return ONLY a JSON array: [{\"question\":\"...\",\"options\":[\"A\",\"B\",\"C\",\"D\"],\"answer\":0}] NOTES:\n\n"+combined, 2400, "exam");
       var parsed = parseQuizQuestions(raw);
       setQuestions(parsed);
       if (onSaveQuiz) onSaveQuiz(parsed, {course:course, source:"exam"});
@@ -5375,7 +5810,13 @@ function ExamModeScreen({ notes, onBack, plan, onUpgrade, onRecordResult, onSave
         {phase==="setup" && (
           <div>
             <div style={{ fontWeight:800,fontSize:14,color:C.text,marginBottom:8 }}>Which course is this exam on?</div>
-            {courseList.length===0 ? <p style={{ color:C.muted,fontSize:13 }}>Save a few notes first so SAM-X has something to test you on.</p> : (
+            {courseList.length===0 ? (
+              <div style={{ textAlign:"center", padding:"28px 16px", background:C.card2, borderRadius:16, border:"1px dashed "+C.border, marginBottom:20 }}>
+                <div style={{ fontSize:40, marginBottom:10 }}>📝</div>
+                <div style={{ fontWeight:800, fontSize:15, color:C.text, marginBottom:6 }}>No courses to test yet</div>
+                <div style={{ fontSize:13, color:C.muted, lineHeight:1.5 }}>Save a few notes first — SAM-X builds the exam from your own material.</div>
+              </div>
+            ) : (
               <div style={{ display:"flex",gap:8,flexWrap:"wrap",marginBottom:20 }}>
                 {courseList.map(function(c){return<button key={c} onClick={function(){setCourse(c);}} style={{ padding:"7px 14px",borderRadius:99,border:"2px solid",borderColor:course===c?C.red:C.border,background:course===c?C.red:C.card,color:course===c?"#fff":C.muted,fontSize:12,fontWeight:700,cursor:"pointer" }}>{c}</button>;})}
               </div>
@@ -5394,12 +5835,16 @@ function ExamModeScreen({ notes, onBack, plan, onUpgrade, onRecordResult, onSave
           </div>
         )}
         {phase==="loading" && (
-          <div style={{ textAlign:"center",padding:"60px 20px" }}><div style={{ fontSize:48,animation:"spin 2s linear infinite" }}>🎯</div><p style={{ color:C.muted,marginTop:16 }}>Building your exam...</p></div>
+          <div style={{ textAlign:"center",padding:"60px 20px" }}>
+            <div style={{ fontSize:48,animation:"spin 2s linear infinite" }}>🎯</div>
+            <p style={{ color:C.text,fontWeight:700,marginTop:16,marginBottom:6 }}>Building your exam…</p>
+            <p style={{ color:C.muted,fontSize:13,lineHeight:1.5,maxWidth:280,margin:"0 auto" }}>SAM-X is writing {numQuestions} questions from your {course||"course"} notes. This can take a few seconds.</p>
+          </div>
         )}
         {phase==="exam" && questions.length>0 && (
           <div>
-            <div style={{ display:"flex",justifyContent:"space-between",marginBottom:8 }}><span style={{ fontSize:13,color:C.muted }}>Question {qIdx+1}/{questions.length}</span><span style={{ fontSize:13,color:C.muted }}>{answers.filter(function(a){return a!==null;}).length} answered</span></div>
-            <div style={{ height:4,background:C.border,borderRadius:2,marginBottom:20 }}><div style={{ height:4,background:C.red,borderRadius:2,width:((qIdx+1)/questions.length*100)+"%",transition:"width 0.3s" }}/></div>
+            <div style={{ display:"flex",justifyContent:"space-between",marginBottom:8 }}><span style={{ fontSize:13,fontWeight:700,color:C.text }}>Question {qIdx+1} <span style={{ color:C.muted,fontWeight:600 }}>/ {questions.length}</span></span><span style={{ fontSize:12,color:C.muted }}>{answers.filter(function(a){return a!==null;}).length} answered</span></div>
+            <div style={{ height:6,background:C.card2,borderRadius:99,marginBottom:20,overflow:"hidden" }}><div style={{ height:"100%",background:"linear-gradient(90deg,#F59E0B,#EF4444)",borderRadius:99,width:((qIdx+1)/questions.length*100)+"%",transition:"width 0.3s" }}/></div>
             <div style={{ background:C.card,borderRadius:16,padding:20,marginBottom:16,border:"1px solid "+C.border }}><p style={{ margin:0,fontSize:16,fontWeight:600,color:C.text,lineHeight:1.6 }}>{questions[qIdx].question}</p></div>
             {questions[qIdx].options.map(function(opt,i){ var isSel=answers[qIdx]===i; return<button key={i} onClick={function(){selectAnswer(i);}} style={{ width:"100%",textAlign:"left",background:isSel?C.red+"20":C.card,border:"2px solid "+(isSel?C.red:C.border),borderRadius:12,padding:"13px 16px",marginBottom:10,fontSize:14,color:isSel?C.red:C.text,cursor:"pointer",fontWeight:isSel?700:500,display:"flex",gap:10,fontFamily:"inherit" }}><span style={{opacity:0.5}}>{String.fromCharCode(65+i)}.</span>{opt}</button>;})}
             <div style={{ display:"flex",gap:10,marginTop:16 }}>
@@ -5648,6 +6093,27 @@ function FlashcardsScreen({ notes, onBack, onSaveNote, onSaveDeck }) {
   var known = results.filter(function(r){return r===true;}).length;
   var missedCount = results.filter(function(r){return r===false;}).length;
 
+  // Keyboard shortcuts while studying: Space = flip, 1 = still learning, 2 = got it
+  useEffect(function(){
+    if (phase !== "study") return;
+    function onKey(e){
+      var tag = (e.target && e.target.tagName) || "";
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (e.key === " " || e.code === "Space") {
+        e.preventDefault();
+        setFlipped(function(f){ return !f; });
+      } else if (flipped && (e.key === "1" || e.key === "ArrowLeft")) {
+        e.preventDefault();
+        markAndNext(false);
+      } else if (flipped && (e.key === "2" || e.key === "ArrowRight")) {
+        e.preventDefault();
+        markAndNext(true);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return function(){ window.removeEventListener("keydown", onKey); };
+  }, [phase, flipped, idx, queue, results]);
+
   return (
     <div style={{ flex:1,background:C.bg,display:"flex",flexDirection:"column" }}>
       <div style={{ background:C.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid "+C.border }}>
@@ -5664,7 +6130,15 @@ function FlashcardsScreen({ notes, onBack, onSaveNote, onSaveDeck }) {
             <div style={{ fontWeight:800,fontSize:14,color:C.text,marginBottom:8 }}>Which note should SAM-X build flashcards from?</div>
             <input value={search} onChange={function(e){setSearch(e.target.value);}} placeholder="Search notes, courses..." style={{ width:"100%",padding:"11px 14px",borderRadius:12,border:"1px solid "+C.border,fontSize:13,background:C.card,color:C.text,outline:"none",marginBottom:14,boxSizing:"border-box" }}/>
             {filteredNotes.length===0 ? (
-              <p style={{ color:C.muted,fontSize:13,textAlign:"center",padding:"20px 0" }}>{notes.length===0?"Save a few notes first so SAM-X has something to work from.":"No notes match."}</p>
+              notes.length===0 ? (
+                <div style={{ textAlign:"center", padding:"36px 16px", background:C.card2, borderRadius:16, border:"1px dashed "+C.border, marginBottom:20 }}>
+                  <div style={{ fontSize:44, marginBottom:10 }}>🗂️</div>
+                  <div style={{ fontWeight:800, fontSize:15, color:C.text, marginBottom:6 }}>No notes to build from yet</div>
+                  <div style={{ fontSize:13, color:C.muted, lineHeight:1.5, maxWidth:260, margin:"0 auto" }}>Save a lecture note first — then SAM-X can turn it into flashcards for revision.</div>
+                </div>
+              ) : (
+                <p style={{ color:C.muted,fontSize:13,textAlign:"center",padding:"20px 0" }}>No notes match your search.</p>
+              )
             ) : (
               <div style={{ marginBottom:20,maxHeight:280,overflowY:"auto" }}>
                 {filteredNotes.map(function(n){ var isSel=selectedNote&&selectedNote.id===n.id; return(
@@ -5688,35 +6162,43 @@ function FlashcardsScreen({ notes, onBack, onSaveNote, onSaveDeck }) {
         )}
 
         {phase==="loading" && (
-          <div style={{ textAlign:"center",padding:"60px 20px" }}><div style={{ fontSize:48,animation:"spin 2s linear infinite" }}>🗂️</div><p style={{ color:C.muted,marginTop:16 }}>Building your deck...</p></div>
+          <div style={{ textAlign:"center",padding:"60px 20px" }}>
+            <div style={{ fontSize:48,animation:"spin 2s linear infinite" }}>🗂️</div>
+            <p style={{ color:C.text,fontWeight:700,marginTop:16,marginBottom:6 }}>Building your deck…</p>
+            <p style={{ color:C.muted,fontSize:13,lineHeight:1.5,maxWidth:280,margin:"0 auto" }}>SAM-X is turning “{selectedNote&&selectedNote.title}” into {numCards} study cards. This usually takes a few seconds.</p>
+          </div>
         )}
 
         {phase==="study" && queue.length>0 && (
           <div style={{ flex:1,display:"flex",flexDirection:"column" }}>
-            <div style={{ display:"flex",justifyContent:"space-between",marginBottom:14 }}>
-              <span style={{ fontSize:13,color:C.muted }}>Card {idx+1}/{queue.length}</span>
-              <span style={{ fontSize:13,color:C.muted }}>{results.filter(function(r){return r!==null;}).length} answered</span>
+            <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10 }}>
+              <span style={{ fontSize:13,fontWeight:700,color:C.text }}>Card {idx+1} <span style={{ color:C.muted,fontWeight:600 }}>/ {queue.length}</span></span>
+              <span style={{ fontSize:12,color:C.muted }}>{known} got it · {missedCount} reviewing</span>
             </div>
-            <div style={{ height:4,background:C.border,borderRadius:2,marginBottom:24 }}><div style={{ height:4,background:C.purple,borderRadius:2,width:((idx+1)/queue.length*100)+"%",transition:"width 0.3s" }}/></div>
+            <div style={{ height:6,background:C.card2,borderRadius:99,marginBottom:20,overflow:"hidden" }}><div style={{ height:"100%",background:"linear-gradient(90deg,#A78BFA,#06B6D4)",borderRadius:99,width:((idx+1)/queue.length*100)+"%",transition:"width 0.3s" }}/></div>
             {deckNotice && idx===0 && !flipped && <div style={{ background:"rgba(245,158,11,0.1)",border:"1px solid rgba(245,158,11,0.3)",borderRadius:10,padding:"10px 14px",marginBottom:16,fontSize:12,color:C.amber,fontWeight:600 }}>⚠️ {deckNotice}</div>}
-            <div style={{ flex:1,display:"flex",alignItems:"center",justifyContent:"center",perspective:1000 }} onClick={function(){setFlipped(!flipped);}}>
-              <div style={{ width:"100%",maxWidth:340,height:220,position:"relative",cursor:"pointer" }}>
-                <div style={{ position:"relative",width:"100%",height:"100%",transition:"transform 0.5s",transformStyle:"preserve-3d",transform:flipped?"rotateY(180deg)":"rotateY(0deg)" }}>
-                  <div style={{ position:"absolute",inset:0,backfaceVisibility:"hidden",background:"linear-gradient(135deg,#A78BFA25,#06B6D425)",border:"2px solid "+C.purple+"50",borderRadius:20,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,textAlign:"center" }}>
-                    <span style={{ fontSize:10,fontWeight:800,color:C.purple,letterSpacing:1,marginBottom:12 }}>QUESTION</span>
+            <div style={{ flex:1,display:"flex",alignItems:"center",justifyContent:"center",perspective:1200 }} onClick={function(){setFlipped(!flipped);}}>
+              <div style={{ width:"100%",maxWidth:360,height:240,position:"relative",cursor:"pointer",userSelect:"none" }}>
+                <div style={{ position:"relative",width:"100%",height:"100%",transition:"transform 0.45s cubic-bezier(0.4,0.2,0.2,1)",transformStyle:"preserve-3d",transform:flipped?"rotateY(180deg)":"rotateY(0deg)" }}>
+                  <div style={{ position:"absolute",inset:0,backfaceVisibility:"hidden",WebkitBackfaceVisibility:"hidden",background:"linear-gradient(145deg,#A78BFA28,#06B6D428)",border:"2px solid "+C.purple+"55",borderRadius:20,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,textAlign:"center",boxShadow:"0 8px 28px rgba(0,0,0,0.25)" }}>
+                    <span style={{ fontSize:10,fontWeight:800,color:C.purple,letterSpacing:1.2,marginBottom:12 }}>QUESTION</span>
                     <span style={{ fontSize:17,fontWeight:700,color:C.text,lineHeight:1.5 }}>{queue[idx].front}</span>
-                    <span style={{ fontSize:11,color:C.muted,marginTop:16 }}>Tap to reveal</span>
+                    <span style={{ fontSize:11,color:C.muted,marginTop:18 }}>Tap or press Space to reveal</span>
                   </div>
-                  <div style={{ position:"absolute",inset:0,backfaceVisibility:"hidden",background:C.card,border:"2px solid "+C.cyan+"50",borderRadius:20,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,textAlign:"center",transform:"rotateY(180deg)" }}>
-                    <span style={{ fontSize:10,fontWeight:800,color:C.cyan,letterSpacing:1,marginBottom:12 }}>ANSWER</span>
-                    <span style={{ fontSize:15,color:C.text,lineHeight:1.6 }}>{queue[idx].back}</span>
+                  <div style={{ position:"absolute",inset:0,backfaceVisibility:"hidden",WebkitBackfaceVisibility:"hidden",background:C.card,border:"2px solid "+C.cyan+"55",borderRadius:20,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,textAlign:"center",transform:"rotateY(180deg)",boxShadow:"0 8px 28px rgba(0,0,0,0.25)" }}>
+                    <span style={{ fontSize:10,fontWeight:800,color:C.cyan,letterSpacing:1.2,marginBottom:12 }}>ANSWER</span>
+                    <span style={{ fontSize:15,color:C.text,lineHeight:1.65 }}>{queue[idx].back}</span>
+                    <span style={{ fontSize:11,color:C.muted,marginTop:16 }}>Tap or press Space to flip back</span>
                   </div>
                 </div>
               </div>
             </div>
-            <div style={{ display:"flex",gap:10,marginTop:24 }}>
-              <button onClick={function(){markAndNext(false);}} disabled={!flipped} style={{ flex:1,background:flipped?"rgba(248,113,113,0.15)":C.card2,color:flipped?C.red:C.muted,border:"2px solid "+(flipped?C.red+"40":C.border),borderRadius:14,padding:"14px",fontWeight:800,fontSize:14,cursor:flipped?"pointer":"default" }}>😅 Still Learning</button>
-              <button onClick={function(){markAndNext(true);}} disabled={!flipped} style={{ flex:1,background:flipped?"rgba(52,211,153,0.15)":C.card2,color:flipped?C.green:C.muted,border:"2px solid "+(flipped?C.green+"40":C.border),borderRadius:14,padding:"14px",fontWeight:800,fontSize:14,cursor:flipped?"pointer":"default" }}>✅ Got It</button>
+            <div style={{ display:"flex",gap:10,marginTop:20 }}>
+              <button onClick={function(e){ e.stopPropagation(); markAndNext(false); }} disabled={!flipped} style={{ flex:1,background:flipped?"rgba(248,113,113,0.15)":C.card2,color:flipped?C.red:C.muted,border:"2px solid "+(flipped?C.red+"40":C.border),borderRadius:14,padding:"14px",fontWeight:800,fontSize:14,cursor:flipped?"pointer":"default",opacity:flipped?1:0.55 }}>😅 Still Learning</button>
+              <button onClick={function(e){ e.stopPropagation(); markAndNext(true); }} disabled={!flipped} style={{ flex:1,background:flipped?"rgba(52,211,153,0.15)":C.card2,color:flipped?C.green:C.muted,border:"2px solid "+(flipped?C.green+"40":C.border),borderRadius:14,padding:"14px",fontWeight:800,fontSize:14,cursor:flipped?"pointer":"default",opacity:flipped?1:0.55 }}>✅ Got It</button>
+            </div>
+            <div style={{ textAlign:"center", marginTop:12, fontSize:11, color:C.muted, lineHeight:1.4 }}>
+              {flipped ? "Shortcuts: 1 / ← Still learning · 2 / → Got it · Space flip" : "Shortcut: Space to flip the card"}
             </div>
           </div>
         )}
@@ -5806,7 +6288,7 @@ function AITutorScreen({ notes, onBack, plan, onUpgrade, sessions, onSaveSession
     if (isOpener) contents.push({ role:"user", parts:[{text:"Begin the session — greet me briefly and kick off the first step."}] });
     var acc = "";
     try{
-      var reply = await callGeminiChatStream(contents, systemPromptFor(), function(partial){ acc=partial; setStreamingText(partial); }, abortRef.current.signal, 1000, "chat");
+      var reply = await callGeminiChatStream(contents, systemPromptFor(), function(partial){ acc=partial; setStreamingText(partial); }, abortRef.current.signal, 1000, "tutor");
       var next = history.concat([{role:"ai", text:reply}]);
       setMessages(next); setStreamingText("");
       persist(next);
@@ -5818,7 +6300,7 @@ function AITutorScreen({ notes, onBack, plan, onUpgrade, sessions, onSaveSession
       } else if (e && e.code==="OUT_OF_CREDITS") {
         setStreamingText(""); onUpgrade();
       } else {
-        setErrorRetry({ history:history, isOpener:isOpener });
+        setErrorRetry({ history:history, isOpener:isOpener, message:(e && e.message)||"Couldn't reach SAM-X." });
       }
     }
     setStreaming(false); abortRef.current=null;
@@ -5853,7 +6335,13 @@ function AITutorScreen({ notes, onBack, plan, onUpgrade, sessions, onSaveSession
             <button onClick={function(){setShowHistory(false);}} style={{ background:"none",border:"none",color:C.muted,fontSize:18,cursor:"pointer" }}>✕</button>
           </div>
           <div style={{ overflowY:"auto" }}>
-            {tutorSessions.length===0 && <div style={{ textAlign:"center",color:C.muted,fontSize:13,padding:"20px 0" }}>No past sessions yet.</div>}
+            {tutorSessions.length===0 && (
+              <div style={{ textAlign:"center", padding:"28px 16px", background:C.card2, borderRadius:14, border:"1px dashed "+C.border }}>
+                <div style={{ fontSize:36, marginBottom:8 }}>🕐</div>
+                <div style={{ fontWeight:700, fontSize:14, color:C.text, marginBottom:4 }}>No past sessions yet</div>
+                <div style={{ fontSize:12, color:C.muted, lineHeight:1.45 }}>Start a tutoring session and it will show up here so you can resume later.</div>
+              </div>
+            )}
             {tutorSessions.map(function(s){
               var m = MODES[s.mode] || MODES.explain;
               var lastMsg = s.messages && s.messages.length ? s.messages[s.messages.length-1] : null;
@@ -5925,7 +6413,15 @@ function AITutorScreen({ notes, onBack, plan, onUpgrade, sessions, onSaveSession
             <div style={{ marginBottom:20 }}>
               <input value={search} onChange={function(e){setSearch(e.target.value);}} placeholder="Search notes, courses..." style={{ width:"100%",padding:"11px 14px",borderRadius:12,border:"1px solid "+C.border,fontSize:13,background:C.card,color:C.text,outline:"none",marginBottom:12,boxSizing:"border-box" }}/>
               {filteredNotes.length===0 ? (
-                <p style={{ color:C.muted,fontSize:13,textAlign:"center",padding:"16px 0" }}>{notes.length===0?"Save a few notes first so SAM-X has something to teach from.":"No notes match."}</p>
+                notes.length===0 ? (
+                  <div style={{ textAlign:"center", padding:"28px 16px", background:C.card2, borderRadius:16, border:"1px dashed "+C.border }}>
+                    <div style={{ fontSize:40, marginBottom:10 }}>🎓</div>
+                    <div style={{ fontWeight:800, fontSize:15, color:C.text, marginBottom:6 }}>Nothing to teach from yet</div>
+                    <div style={{ fontSize:13, color:C.muted, lineHeight:1.5 }}>Save a lecture note first — then pick it here so SAM-X can tutor you on it.</div>
+                  </div>
+                ) : (
+                  <p style={{ color:C.muted,fontSize:13,textAlign:"center",padding:"16px 0" }}>No notes match your search.</p>
+                )
               ) : (
                 <div style={{ maxHeight:220,overflowY:"auto" }}>
                   {filteredNotes.map(function(n){ var isSel=topicNote&&topicNote.id===n.id; return(
@@ -5984,12 +6480,24 @@ function AITutorScreen({ notes, onBack, plan, onUpgrade, sessions, onSaveSession
             </div>
           </div>
         )}
-        {errorRetry && (
-          <div style={{ background:"rgba(248,113,113,0.1)",border:"1px solid rgba(248,113,113,0.3)",borderRadius:12,padding:14,marginBottom:16,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10 }}>
-            <span style={{ fontSize:13,color:C.red }}>⚠️ Couldn't reach SAM-X. Check your connection.</span>
-            <button onClick={retry} style={{ background:C.red,border:"none",borderRadius:8,padding:"6px 14px",color:"#fff",fontWeight:700,fontSize:12,cursor:"pointer",flexShrink:0 }}>Retry</button>
+        {errorRetry && (function(){
+          var msg = (errorRetry.message)||"Couldn't reach SAM-X. Check your connection.";
+          var busy = /busy|high demand|30–60|30-60/i.test(msg);
+          var offline = /connection|offline|reach SAM-X|try again later|temporarily/i.test(msg);
+          var tip = busy ? "High demand — wait half a minute, then tap Retry." : offline ? "Check Wi‑Fi or mobile data, then retry." : "Tap Retry when you're ready.";
+          var icon = busy ? "⏳" : offline ? "📡" : "⚠️";
+          return (
+          <div style={{ background: busy ? "rgba(251,191,36,0.1)" : "rgba(248,113,113,0.1)", border:"1px solid "+(busy?"rgba(251,191,36,0.35)":"rgba(248,113,113,0.3)"), borderRadius:14, padding:"14px 14px 12px", marginBottom:16 }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:10 }}>
+              <div style={{ minWidth:0 }}>
+                <div style={{ fontSize:13, color: busy ? C.amber : C.red, lineHeight:1.45, fontWeight:700 }}>{icon} {msg}</div>
+                <div style={{ fontSize:11, color:C.muted, marginTop:6, lineHeight:1.4 }}>{tip}</div>
+              </div>
+              <button onClick={retry} style={{ background: busy ? "linear-gradient(135deg,#F59E0B,#FBBF24)" : C.red, border:"none", borderRadius:10, padding:"8px 14px", color:"#fff", fontWeight:800, fontSize:12, cursor:"pointer", flexShrink:0 }}>Retry</button>
+            </div>
           </div>
-        )}
+          );
+        })()}
         <div ref={endRef}/>
       </div>
       <div style={{ padding:"12px 16px 16px",background:C.card2,borderTop:"1px solid "+C.border }}>
@@ -6098,7 +6606,7 @@ function UnifiedSearchScreen({ notes, assignments, recordings, onBack, onOpenNot
 }
 
 // ── PROFILE & ACCOUNT ──────────────────────────────────────────────────────────
-function ProfileScreen({ onBack, user, plan, credits, profile, onSaveProfile, onLogout }) {
+function ProfileScreen({ onBack, user, plan, credits, profile, onSaveProfile, onLogout, onViewPlans }) {
   var [school, setSchool] = useState(profile.school||"");
   var [faculty, setFaculty] = useState(profile.faculty||"");
   var [department, setDepartment] = useState(profile.department||"");
@@ -6108,6 +6616,9 @@ function ProfileScreen({ onBack, user, plan, credits, profile, onSaveProfile, on
   var [resetSent, setResetSent] = useState(false);
 
   var dirty = school!==(profile.school||"") || faculty!==(profile.faculty||"") || department!==(profile.department||"") || level!==(profile.level||"");
+  var planInfo = PLANS[plan] || PLANS.free;
+  var creditsLow = typeof credits === "number" && credits <= LOW_CREDIT_WARNING_THRESHOLD;
+  var emailOk = !!(user && user.emailVerified);
 
   async function save(){
     setSaving(true);
@@ -6120,7 +6631,7 @@ function ProfileScreen({ onBack, user, plan, credits, profile, onSaveProfile, on
   async function changePassword(){
     if(!user||!user.email) return;
     try{ await sendPasswordResetEmail(auth, user.email); setResetSent(true); }
-    catch(e){ alert("Couldn't send reset email — try again in a moment."); }
+    catch(e){ showAppToast("Couldn't send reset email — try again in a moment.", "error"); }
   }
 
   return (
@@ -6130,13 +6641,47 @@ function ProfileScreen({ onBack, user, plan, credits, profile, onSaveProfile, on
         <span style={{ fontWeight:800, fontSize:16, color:C.text }}>Profile & Account</span>
       </div>
       <div style={{ flex:1, overflowY:"auto", padding:20 }}>
-        <div style={{ textAlign:"center", marginBottom:24 }}>
+        <div style={{ textAlign:"center", marginBottom:20 }}>
           <div style={{ width:84,height:84,borderRadius:"50%",overflow:"hidden",background:"linear-gradient(135deg,#06B6D4,#A78BFA)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:36,margin:"0 auto 14px" }}>
             {user&&user.photoURL ? <img src={user.photoURL} alt="profile" style={{ width:84,height:84,objectFit:"cover" }}/> : "👤"}
           </div>
           <div style={{ fontWeight:800, fontSize:18, color:C.text }}>{(user&&user.displayName)||"Student"}</div>
           <div style={{ fontSize:13, color:C.muted }}>{user&&user.email}</div>
-          <span style={{ display:"inline-block", marginTop:8, background:(PLANS[plan]||PLANS.free).color+"25", color:(PLANS[plan]||PLANS.free).color, borderRadius:99, padding:"4px 14px", fontSize:12, fontWeight:700 }}>{(PLANS[plan]||PLANS.free).name} Plan · {credits} credits</span>
+          <div style={{ fontSize:11, fontWeight:700, marginTop:6, color: emailOk ? C.green : C.amber }}>
+            {emailOk ? "✅ Email verified" : "⚠️ Email not verified — required for SAM-X"}
+          </div>
+        </div>
+
+        {/* Plan badge — same language as Settings subscription card */}
+        <div style={{ background:C.card, borderRadius:16, padding:16, marginBottom:16, border:"1px solid "+C.border }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:12 }}>
+            <div style={{ minWidth:0 }}>
+              <div style={{ fontWeight:700, fontSize:14, color:C.text }}>Current Plan</div>
+              <div style={{ fontSize:12, color: creditsLow ? C.amber : C.muted, marginTop:3 }}>
+                ⚡ {credits} AI credit{credits===1?"":"s"} remaining this month
+              </div>
+            </div>
+            <span style={{
+              background: planInfo.color + "25",
+              color: planInfo.color,
+              border: "1px solid " + planInfo.color + "55",
+              borderRadius: 99,
+              padding: "6px 14px",
+              fontSize: 12,
+              fontWeight: 800,
+              flexShrink: 0,
+            }}>{planInfo.name}</span>
+          </div>
+          {creditsLow && (
+            <div style={{ marginTop:12, background:"rgba(245,158,11,0.1)", border:"1px solid rgba(245,158,11,0.3)", borderRadius:12, padding:"10px 12px", fontSize:12, color:C.amber, fontWeight:600 }}>
+              {credits<=0 ? "You're out of credits — upgrade to keep using SAM-X." : "Running low on credits."}
+            </div>
+          )}
+          {onViewPlans && plan !== "premium" && (
+            <button type="button" onClick={onViewPlans} style={{ width:"100%", marginTop:12, background:"linear-gradient(135deg,#06B6D4,#A78BFA)", color:"#fff", border:"none", borderRadius:12, padding:"12px", fontWeight:800, fontSize:13, cursor:"pointer" }}>
+              {plan==="free" ? "View plans & upgrade" : "Upgrade to Premium"}
+            </button>
+          )}
         </div>
 
         <div style={{ background:C.card, borderRadius:16, padding:18, marginBottom:16, border:"1px solid "+C.border }}>
@@ -6174,7 +6719,7 @@ function NotificationScreen({ onBack, notifications, onMarkRead, onMarkAllRead, 
   function handleTogglePush(v){
     if (v) {
       subscribeToPush(user.uid).then(function(){ setNotifEnabled(true); }).catch(function(e){
-        alert(e.message || "Couldn't enable push notifications on this device.");
+        showAppToast(e.message || "Couldn't enable push notifications on this device.", "error");
       });
     } else {
       setNotifEnabled(false);
@@ -6220,62 +6765,158 @@ function NotificationScreen({ onBack, notifications, onMarkRead, onMarkAllRead, 
 }
 
 // ── PRICING / UPGRADE ─────────────────────────────────────────────────────────
+// Yearly billing is intentionally locked for now — only monthly Pro / Premium
+// are offered. Flip this to true later when yearly plans are ready to sell.
+var YEARLY_PLANS_ENABLED = false;
+
+// For students who already paid but the plan never unlocked — paste the
+// Paystack reference (e.g. jotting_1790420691037_n04n3kvg) and re-verify.
+function ManualReferenceRecovery({ user, processingPlan, onVerify }) {
+  var [open, setOpen] = useState(false);
+  var [refText, setRefText] = useState("");
+  var [planKey, setPlanKey] = useState("pro");
+  if (!user) return null;
+  return (
+    <div style={{ marginBottom:16 }}>
+      {!open ? (
+        <button
+          type="button"
+          onClick={function(){ setOpen(true); }}
+          style={{ width:"100%", background:"none", border:"1px dashed "+C.border, borderRadius:12, padding:"10px", color:C.muted, fontSize:12, fontWeight:600, cursor:"pointer" }}
+        >
+          Already paid? Unlock with payment reference
+        </button>
+      ) : (
+        <div style={{ background:C.card2, border:"1px solid "+C.border, borderRadius:12, padding:14 }}>
+          <div style={{ fontSize:13, fontWeight:700, color:C.text, marginBottom:8 }}>Unlock with payment reference</div>
+          <div style={{ fontSize:11, color:C.muted, marginBottom:10, lineHeight:1.5 }}>
+            Paste the reference from your Paystack receipt or bank SMS (starts with <code style={{ color:C.cyan }}>jotting_</code>).
+          </div>
+          <input
+            value={refText}
+            onChange={function(e){ setRefText(e.target.value); }}
+            placeholder="jotting_…"
+            style={{ width:"100%", padding:"10px 12px", borderRadius:10, border:"1px solid "+C.border, background:C.card, color:C.text, fontSize:13, outline:"none", boxSizing:"border-box", marginBottom:10 }}
+          />
+          <div style={{ display:"flex", gap:8, marginBottom:10 }}>
+            <button type="button" onClick={function(){ setPlanKey("pro"); }} style={{ flex:1, padding:"8px", borderRadius:8, border:"1px solid "+(planKey==="pro"?C.cyan:C.border), background:planKey==="pro"?"rgba(6,182,212,0.15)":"transparent", color:planKey==="pro"?C.cyan:C.muted, fontWeight:700, fontSize:12, cursor:"pointer" }}>Pro</button>
+            <button type="button" onClick={function(){ setPlanKey("premium"); }} style={{ flex:1, padding:"8px", borderRadius:8, border:"1px solid "+(planKey==="premium"?C.purple:C.border), background:planKey==="premium"?"rgba(167,139,250,0.15)":"transparent", color:planKey==="premium"?C.purple:C.muted, fontWeight:700, fontSize:12, cursor:"pointer" }}>Premium</button>
+          </div>
+          <button
+            type="button"
+            disabled={!!processingPlan || !refText.trim()}
+            onClick={function(){ onVerify(refText.trim(), planKey); }}
+            style={{ width:"100%", padding:"11px", borderRadius:10, border:"none", background:(!refText.trim()||processingPlan)?C.card:C.cyan, color:(!refText.trim()||processingPlan)?C.muted:"#0A0F1E", fontWeight:800, fontSize:13, cursor:(!refText.trim()||processingPlan)?"default":"pointer" }}
+          >
+            {processingPlan ? "Verifying…" : "Verify & unlock"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PricingScreen({ onBack, plan, credits, user, onPlanUpdated }) {
+  // Forced to monthly while YEARLY_PLANS_ENABLED is false.
   var [cycle, setCycle] = useState("monthly");
   var [processingPlan, setProcessingPlan] = useState(null); // plan key currently mid-checkout/downgrade
   var [payError, setPayError] = useState("");
   var [paySuccess, setPaySuccess] = useState("");
   var planOrder = ["free","pro","premium"];
+  var effectiveCycle = YEARLY_PLANS_ENABLED ? cycle : "monthly";
 
-  function priceFor(p){ return cycle==="monthly" ? p.priceMonthly : p.priceYearly; }
-  function periodLabel(){ return cycle==="monthly" ? "/month" : "/year"; }
+  function priceFor(p){ return effectiveCycle==="monthly" ? p.priceMonthly : p.priceYearly; }
+  function periodLabel(){ return effectiveCycle==="monthly" ? "/month" : "/year"; }
+
+  var [pendingPay, setPendingPay] = useState(function(){
+    return user ? loadPendingPayment(user.uid) : null;
+  });
 
   async function verifyAndApply(reference, planKey, billCycle){
     try{
-      var result = await callSubscriptionApi({ action:"verify_payment", reference:reference, planId:planKey, cycle:billCycle });
+      var result = await callSubscriptionApi({ action:"verify_payment", reference:reference, planId:planKey, cycle:billCycle||"monthly" });
       // Written ONLY here, directly after the server has genuinely verified
       // this payment with Paystack (using the secret key server-side) — this
       // is what makes the unlock survive a refresh/re-login even if the
       // separate Firestore accounts/{uid} write is ever delayed or fails.
-      // Never written from Paystack's own client-side popup callback alone,
-      // and never from a plain button tap.
-      if (user) persistLocalEntitlement(user.uid, {
-        plan: result.plan,
-        monthlyCredits: (PLANS[result.plan]||PLANS.free).monthlyCredits,
-        verifiedAt: Date.now(),
-        reference: reference,
-      });
+      if (user) {
+        persistLocalEntitlement(user.uid, {
+          plan: result.plan,
+          monthlyCredits: (PLANS[result.plan]||PLANS.free).monthlyCredits,
+          verifiedAt: Date.now(),
+          reference: reference,
+        });
+        clearPendingPayment(user.uid);
+        setPendingPay(null);
+      }
       onPlanUpdated(result.plan, result.credits);
       setPayError("");
       setPaySuccess("✅ Payment verified — you're now on the "+((PLANS[result.plan]||PLANS.free).name)+" plan.");
       setTimeout(function(){ setPaySuccess(""); }, 6000);
     }catch(e){
-      // Deliberately does NOT call onPlanUpdated or write a local
-      // entitlement here — an unverified payment must never unlock
-      // anything, even temporarily.
+      // Keep the pending payment so the student can retry without paying again.
+      if (user) {
+        savePendingPayment(user.uid, {
+          reference: reference,
+          planId: planKey,
+          cycle: billCycle || "monthly",
+          savedAt: Date.now(),
+        });
+        setPendingPay(loadPendingPayment(user.uid));
+      }
       setPaySuccess("");
-      setPayError("Payment went through, but we couldn't confirm it yet. If your plan doesn't update in a minute, contact support with this reference: "+reference);
+      setPayError(
+        (e && e.message ? e.message+" — " : "") +
+        "Payment may have gone through. Tap “Retry verification” below, or contact support with reference: " +
+        reference
+      );
     }
     setProcessingPlan(null);
   }
 
+  async function retryPendingVerification(){
+    var pending = pendingPay || (user && loadPendingPayment(user.uid));
+    if (!pending || !pending.reference) {
+      setPayError("No pending payment found to retry.");
+      return;
+    }
+    setPayError("");
+    setPaySuccess("");
+    setProcessingPlan(pending.planId || "pro");
+    await verifyAndApply(pending.reference, pending.planId || "pro", pending.cycle || "monthly");
+  }
+
   async function startUpgrade(planKey){
     if(!user || !user.email){ setPayError("You need to be signed in with an email to upgrade."); return; }
+    if (!PAYSTACK_PUBLIC_KEY || PAYSTACK_PUBLIC_KEY.indexOf("REPLACE") !== -1) {
+      setPayError("Payments aren't configured yet — Paystack public key is still a placeholder.");
+      return;
+    }
     setPayError("");
     setPaySuccess("");
     setProcessingPlan(planKey);
     try{
       await loadPaystackScript();
       var reference = "jotting_"+Date.now()+"_"+Math.random().toString(36).slice(2,10);
-      var amountNaira = cycle==="monthly" ? PLANS[planKey].priceMonthly : PLANS[planKey].priceYearly;
+      // Always charge monthly while yearly is locked — even if UI state is tampered with.
+      var billCycle = YEARLY_PLANS_ENABLED ? cycle : "monthly";
+      var amountNaira = billCycle==="monthly" ? PLANS[planKey].priceMonthly : PLANS[planKey].priceYearly;
+      // Save before opening popup so a closed/failed verify can still be retried.
+      savePendingPayment(user.uid, {
+        reference: reference,
+        planId: planKey,
+        cycle: billCycle,
+        savedAt: Date.now(),
+      });
+      setPendingPay({ reference:reference, planId:planKey, cycle:billCycle, savedAt:Date.now() });
       window.PaystackPop.setup({
         key: PAYSTACK_PUBLIC_KEY,
         email: user.email,
         amount: amountNaira*100, // Paystack takes kobo
         currency: "NGN",
         ref: reference,
-        metadata: { uid:user.uid, planId:planKey, cycle:cycle },
-        callback: function(response){ verifyAndApply(response.reference, planKey, cycle); },
+        metadata: { uid:user.uid, planId:planKey, cycle:billCycle },
+        callback: function(response){ verifyAndApply(response.reference || reference, planKey, billCycle); },
         onClose: function(){ setProcessingPlan(null); },
       }).openIframe();
     }catch(e){
@@ -6323,16 +6964,48 @@ function PricingScreen({ onBack, plan, credits, user, onPlanUpdated }) {
         {paySuccess && (
           <div style={{ background:"rgba(52,211,153,0.1)", border:"1px solid rgba(52,211,153,0.3)", borderRadius:12, padding:"12px 14px", marginBottom:16, fontSize:12, color:C.green, fontWeight:600, lineHeight:1.5 }}>{paySuccess}</div>
         )}
+        {pendingPay && pendingPay.reference && plan==="free" && (
+          <div style={{ background:"rgba(6,182,212,0.08)", border:"1px solid rgba(6,182,212,0.25)", borderRadius:12, padding:"14px", marginBottom:16 }}>
+            <div style={{ fontSize:13, fontWeight:700, color:C.text, marginBottom:6 }}>Payment pending confirmation</div>
+            <div style={{ fontSize:12, color:C.muted, lineHeight:1.5, marginBottom:10 }}>
+              Reference: <span style={{ color:C.cyan, fontWeight:700 }}>{pendingPay.reference}</span>
+              {pendingPay.planId ? " · "+((PLANS[pendingPay.planId]||{}).name||pendingPay.planId) : ""}
+            </div>
+            <button
+              onClick={retryPendingVerification}
+              disabled={!!processingPlan}
+              style={{ width:"100%", padding:"11px", borderRadius:10, border:"none", background:processingPlan?C.card2:"linear-gradient(135deg,#06B6D4,#A78BFA)", color:processingPlan?C.muted:"#0A0F1E", fontWeight:800, fontSize:13, cursor:processingPlan?"default":"pointer" }}
+            >
+              {processingPlan ? "Verifying…" : "Retry verification"}
+            </button>
+          </div>
+        )}
+        {plan==="free" && (
+          <ManualReferenceRecovery
+            user={user}
+            processingPlan={processingPlan}
+            onVerify={function(ref, planKey){
+              setProcessingPlan(planKey||"pro");
+              verifyAndApply(ref, planKey||"pro", "monthly");
+            }}
+          />
+        )}
         <div style={{ textAlign:"center", marginBottom:20 }}>
           <div style={{ fontWeight:800, fontSize:22, color:C.text, marginBottom:6 }}>Choose your plan</div>
-          <div style={{ fontSize:13, color:C.muted }}>Cancel anytime. Prices in Naira.</div>
+          <div style={{ fontSize:13, color:C.muted }}>Monthly billing · Cancel anytime · Prices in Naira</div>
         </div>
-        <div style={{ display:"flex", justifyContent:"center", marginBottom:24 }}>
-          <div style={{ display:"flex", background:C.card2, borderRadius:99, padding:4, gap:4 }}>
-            <button onClick={function(){setCycle("monthly");}} style={{ padding:"8px 18px", borderRadius:99, border:"none", background:cycle==="monthly"?C.cyan:"transparent", color:cycle==="monthly"?"#0A0F1E":C.muted, fontWeight:700, fontSize:13, cursor:"pointer" }}>Monthly</button>
-            <button onClick={function(){setCycle("yearly");}} style={{ padding:"8px 18px", borderRadius:99, border:"none", background:cycle==="yearly"?C.cyan:"transparent", color:cycle==="yearly"?"#0A0F1E":C.muted, fontWeight:700, fontSize:13, cursor:"pointer", display:"flex", alignItems:"center", gap:6 }}>Yearly <span style={{ fontSize:10, background:C.green, color:"#0A0F1E", borderRadius:99, padding:"2px 6px", fontWeight:800 }}>save 17%</span></button>
+        {YEARLY_PLANS_ENABLED ? (
+          <div style={{ display:"flex", justifyContent:"center", marginBottom:24 }}>
+            <div style={{ display:"flex", background:C.card2, borderRadius:99, padding:4, gap:4 }}>
+              <button onClick={function(){setCycle("monthly");}} style={{ padding:"8px 18px", borderRadius:99, border:"none", background:cycle==="monthly"?C.cyan:"transparent", color:cycle==="monthly"?"#0A0F1E":C.muted, fontWeight:700, fontSize:13, cursor:"pointer" }}>Monthly</button>
+              <button onClick={function(){setCycle("yearly");}} style={{ padding:"8px 18px", borderRadius:99, border:"none", background:cycle==="yearly"?C.cyan:"transparent", color:cycle==="yearly"?"#0A0F1E":C.muted, fontWeight:700, fontSize:13, cursor:"pointer", display:"flex", alignItems:"center", gap:6 }}>Yearly <span style={{ fontSize:10, background:C.green, color:"#0A0F1E", borderRadius:99, padding:"2px 6px", fontWeight:800 }}>save 17%</span></button>
+            </div>
           </div>
-        </div>
+        ) : (
+          <div style={{ textAlign:"center", marginBottom:20, fontSize:12, color:C.muted }}>
+            Showing monthly plans only · Yearly options coming soon
+          </div>
+        )}
 
         {planOrder.map(function(key, idx){
           var p = PLANS[key];
@@ -6397,14 +7070,8 @@ function PricingScreen({ onBack, plan, credits, user, onPlanUpdated }) {
   );
 }
 
-// Small, self-contained addition to Settings → Account: resend uses
-// sendEmailVerification directly (a plain module-level import — it doesn't
-// touch React state, so no App-level wiring is needed for it). Rechecking
-// status goes through the onRefresh prop (App's refreshEmailVerification)
-// so the real `user` state gets updated — not just a local copy here — and
-// every other place that happens to read user.emailVerified stays correct
-// too. Never gates anything: this only ever changes what this one row
-// displays, matching the app's "don't block on verification" requirement.
+// Settings → Account: resend verification + recheck.
+// Server now blocks AI until email_verified is true — this row is how students unlock SAM-X.
 function EmailVerificationRow({ user, onRefresh }) {
   var [sending, setSending] = useState(false);
   var [checking, setChecking] = useState(false);
@@ -6437,14 +7104,19 @@ function EmailVerificationRow({ user, onRefresh }) {
 
   return (
     <div>
-      <Row icon="✅" label="Email Verified" sub={verified?"Your email is verified":"Email not verified yet"} right={<span style={{ fontSize:13,fontWeight:800,color:verified?C.green:C.amber }}>{verified?"Verified ✓":"Pending"}</span>}/>
+      <Row icon="✅" label="Email Verified" sub={verified?"Your email is verified — SAM-X is unlocked":"Required before SAM-X / AI features work"} right={<span style={{ fontSize:13,fontWeight:800,color:verified?C.green:C.amber }}>{verified?"Verified ✓":"Pending"}</span>}/>
       {!verified && (
-        <div style={{ display:"flex",gap:8,padding:"4px 0 8px" }}>
-          <button onClick={resend} disabled={sending} style={{ ...actionBtn(C.cyan), flex:1, opacity:sending?0.6:1 }}>{sending?"Sending...":"Resend email"}</button>
-          <button onClick={recheck} disabled={checking} style={{ ...actionBtn(C.green), flex:1, opacity:checking?0.6:1 }}>{checking?"Checking...":"I've verified"}</button>
+        <div>
+          <div style={{ fontSize:12, color:C.muted, lineHeight:1.45, margin:"0 0 10px" }}>
+            Open the link in your inbox, then tap “I’ve verified” so the app refreshes your login token.
+          </div>
+          <div style={{ display:"flex",gap:8,padding:"0 0 8px" }}>
+            <button onClick={resend} disabled={sending} style={{ ...actionBtn(C.cyan), flex:1, opacity:sending?0.6:1 }}>{sending?"Sending...":"Resend email"}</button>
+            <button onClick={recheck} disabled={checking} style={{ ...actionBtn(C.green), flex:1, opacity:checking?0.6:1 }}>{checking?"Checking...":"I've verified"}</button>
+          </div>
         </div>
       )}
-      {message && <div style={{ fontSize:12,color:C.muted,padding:"0 0 8px",lineHeight:1.5 }}>{message}</div>}
+      {message && <div style={{ fontSize:12,color: message.indexOf("verified")!==-1 ? C.green : C.muted,padding:"0 0 8px",lineHeight:1.5 }}>{message}</div>}
     </div>
   );
 }
@@ -6537,7 +7209,20 @@ function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings
             <div style={{ flex:1 }}>
               <div style={{ fontWeight:800,fontSize:18,color:C.text }}>{(user&&user.displayName)||"Student"}</div>
               <div style={{ fontSize:13,color:C.muted }}>{user&&user.email}</div>
-              <div style={{ fontSize:11,color:C.green,marginTop:2 }}>✅ Verified Account</div>
+              <div style={{ display:"flex", alignItems:"center", gap:8, marginTop:6, flexWrap:"wrap" }}>
+                <span style={{
+                  background: (PLANS[plan]||PLANS.free).color + "25",
+                  color: (PLANS[plan]||PLANS.free).color,
+                  border: "1px solid " + (PLANS[plan]||PLANS.free).color + "55",
+                  borderRadius: 99,
+                  padding: "3px 10px",
+                  fontSize: 11,
+                  fontWeight: 800,
+                }}>{(PLANS[plan]||PLANS.free).name}</span>
+                <span style={{ fontSize:11, color: user&&user.emailVerified ? C.green : C.amber, fontWeight:700 }}>
+                  {user&&user.emailVerified ? "✅ Email verified" : "⚠️ Verify email"}
+                </span>
+              </div>
             </div>
           </div>
         </div>
@@ -6576,7 +7261,7 @@ function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings
                 <div style={{ fontWeight:700,fontSize:14,color:C.text }}>Current Plan</div>
                 <div style={{ fontSize:12,color:C.muted }}>{credits} AI credit{credits===1?"":"s"} remaining this month</div>
               </div>
-              <span style={{ background:(PLANS[plan]||PLANS.free).color+"25",color:(PLANS[plan]||PLANS.free).color,borderRadius:99,padding:"4px 14px",fontSize:12,fontWeight:700 }}>{(PLANS[plan]||PLANS.free).name}</span>
+              <span style={{ background:(PLANS[plan]||PLANS.free).color+"25",color:(PLANS[plan]||PLANS.free).color,border:"1px solid "+(PLANS[plan]||PLANS.free).color+"55",borderRadius:99,padding:"6px 14px",fontSize:12,fontWeight:800 }}>{(PLANS[plan]||PLANS.free).name}</span>
             </div>
             {credits<=LOW_CREDIT_WARNING_THRESHOLD && <div style={{ background:"rgba(245,158,11,0.1)",border:"1px solid rgba(245,158,11,0.3)",borderRadius:12,padding:"10px 14px",marginBottom:10,fontSize:12,color:C.amber,fontWeight:600 }}>⚡ {credits<=0?"You're out of credits — upgrade to keep using AI features.":"Running low on credits."}</div>}
             {plan!=="premium" && (
@@ -6680,9 +7365,9 @@ function SettingsScreen({ user, onLogout, recQuality, setRecQuality, recSettings
             <Row icon="🔏" label="Privacy Policy" sub="How we handle your data" onPress={function(){setInfoSheet("privacy");}}/>
             <Row icon="📜" label="Terms of Service" sub="Rules and conditions" onPress={function(){setInfoSheet("terms");}}/>
             <Row icon="💬" label="Contact Support" sub="Get help from our team" onPress={function(){setInfoSheet("contact");}}/>
-            <Row icon="⭐" label="Rate the App" onPress={function(){alert("Thank you! Rating coming soon!");}}/>
-            <Row icon="📤" label="Share the App" onPress={function(){if(navigator.share){navigator.share({title:"Jotting AI",text:"Check out this AI note-taking app!",url:"https://notewave12.netlify.app"});}else{alert("Link: notewave12.netlify.app");}}}/>
-            <Row icon="🐛" label="Report a Bug" onPress={function(){alert("Report bugs to: samuel@gmail.com");}}/>
+            <Row icon="⭐" label="Rate the App" onPress={function(){showAppToast("Thank you! Rating is coming soon.", "info");}}/>
+            <Row icon="📤" label="Share the App" onPress={function(){if(navigator.share){navigator.share({title:"Jotting AI",text:"Check out this AI note-taking app!",url:"https://notewave12.netlify.app"});}else{showAppToast("Share link: notewave12.netlify.app", "info");}}}/>
+            <Row icon="🐛" label="Report a Bug" onPress={function(){showAppToast("Report bugs to: samuel@gmail.com", "info");}}/>
             <div style={{ textAlign:"center",marginTop:16,color:C.muted,fontSize:12 }}>Jotting AI v4.0 - Built with love by Samuel</div>
           </div>
         </Section>
@@ -6819,6 +7504,7 @@ export default function App() {
   }
   var [plan, setPlan] = useState("free");
   var [credits, setCredits] = useState(PLANS.free.monthlyCredits);
+  var [toast, setToast] = useState(null); // { message, kind, id }
   var [profile, setProfile] = useState({ school:"", faculty:"", department:"", level:"", streak:0 });
   var [notifEnabled, setNotifEnabled] = useState(function(){ try{ return localStorage.getItem("jotting_notifEnabled")==="1"; }catch(e){ return false; } });
   useEffect(function(){ try{ localStorage.setItem("jotting_notifEnabled", notifEnabled?"1":"0"); }catch(e){} }, [notifEnabled]);
@@ -7043,6 +7729,8 @@ export default function App() {
   async function refreshEmailVerification(){
     if (!auth.currentUser) return false;
     await auth.currentUser.reload();
+    // Force a new ID token so the server sees email_verified: true immediately.
+    try { await auth.currentUser.getIdToken(true); } catch(e) {}
     var fresh = auth.currentUser;
     setUser(function(prev){ return fresh ? {...fresh} : prev; });
     return !!(fresh && fresh.emailVerified);
@@ -7054,8 +7742,22 @@ export default function App() {
   useEffect(function(){
     updateGlobalCredits = function(remaining){ setCredits(remaining); };
     triggerUpgradeScreen = function(){ setScreen("pricing"); };
-    return function(){ updateGlobalCredits = function(){}; triggerUpgradeScreen = function(){}; };
+    showAppToast = function(message, kind){
+      setToast({ message: String(message||""), kind: kind||"info", id: Date.now() });
+    };
+    return function(){
+      updateGlobalCredits = function(){};
+      triggerUpgradeScreen = function(){};
+      showAppToast = function(){};
+    };
   }, [user]);
+
+  // Auto-dismiss toast after ~2.6s
+  useEffect(function(){
+    if (!toast) return;
+    var t = setTimeout(function(){ setToast(null); }, 2600);
+    return function(){ clearTimeout(t); };
+  }, [toast && toast.id]);
 
   // Listen for auth state
   useEffect(function() {
@@ -7075,16 +7777,54 @@ export default function App() {
           .then(function(cached){
             if (cached && cached.length > 0) setNotes(cached);
             setCloudLoading(true);
-            loadNotesFromCloud(firebaseUser.uid).then(function(cloudNotes){
+            loadNotesFromCloud(firebaseUser.uid).then(function(result){
+              var cloudOk = result && result.ok;
+              var cloudNotes = (result && result.notes) || [];
               setNotes(function(prev){
-                // Keep any note that hasn't made it to the cloud yet (no firestoreId),
-                // and merge with what the cloud has, so nothing already on-screen is lost.
-                var unsynced = prev.filter(function(n){ return !n.firestoreId; });
+                // SAFE MERGE (local-first):
+                // 1. Start with EVERY local note — never drop a note just because the
+                //    cloud call failed or returned empty.
+                // 2. Overlay cloud notes by client id (or firestoreId as fallback).
+                // 3. Only after a successful cloud load do we treat "missing from cloud
+                //    + already had firestoreId" as a remote delete.
                 var byId = {};
-                unsynced.concat(cloudNotes).forEach(function(n){ byId[n.id] = n; });
+                function noteKey(n){
+                  if (!n) return null;
+                  if (n.id != null) return String(n.id);
+                  if (n.firestoreId != null) return "fs:"+n.firestoreId;
+                  return null;
+                }
+                (prev || []).forEach(function(n){
+                  var k = noteKey(n);
+                  if (k) byId[k] = n;
+                });
+                cloudNotes.forEach(function(n){
+                  var k = noteKey(n);
+                  if (k) byId[k] = n;
+                });
+                if (cloudOk) {
+                  // Drop local notes that were previously synced (have firestoreId)
+                  // but are no longer present in the cloud result — true remote delete.
+                  var cloudFsIds = {};
+                  var cloudClientIds = {};
+                  cloudNotes.forEach(function(c){
+                    if (c && c.firestoreId != null) cloudFsIds[String(c.firestoreId)] = true;
+                    if (c && c.id != null) cloudClientIds[String(c.id)] = true;
+                  });
+                  Object.keys(byId).forEach(function(k){
+                    var n = byId[k];
+                    if (n && n.firestoreId) {
+                      var stillInCloud =
+                        cloudFsIds[String(n.firestoreId)] ||
+                        (n.id != null && cloudClientIds[String(n.id)]);
+                      if (!stillInCloud) delete byId[k];
+                    }
+                  });
+                }
                 var merged = Object.values(byId);
                 merged.sort(function(a,b){ return (b.createdAt||0) - (a.createdAt||0); });
-                syncNotesToRepository(firebaseUser.uid, merged).catch(function(e){ console.error("Note repository sync failed:", e); });
+                // Only allow IndexedDB deletions when cloud load succeeded.
+                syncNotesToRepository(firebaseUser.uid, merged, !!cloudOk).catch(function(e){ console.error("Note repository sync failed:", e); });
                 return merged;
               });
               setCloudLoading(false);
@@ -7387,7 +8127,7 @@ export default function App() {
   function startStudyStep(step){
     if (step.key==="notes") {
       var mostRecent = notes.length ? notes.slice().sort(function(a,b){return (b.id||0)-(a.id||0);})[0] : null;
-      if (!mostRecent) { alert("No notes yet to review — try Skip."); return; }
+      if (!mostRecent) { showAppToast("No notes yet to review — try Skip.", "info"); return; }
       setActiveNote(mostRecent);
       go("detail");
     } else if (step.key==="flashcards") {
@@ -7400,7 +8140,13 @@ export default function App() {
   }
 
   function saveNote(note) {
-    var newNote = {...note, userId: user&&user.uid, createdAt: note.createdAt || Date.now()};
+    // Guaranteed id + userId so IndexedDB by_userId index and later merge always work.
+    var newNote = {
+      ...note,
+      id: note.id != null ? note.id : Date.now(),
+      userId: (user && user.uid) || note.userId || null,
+      createdAt: note.createdAt || Date.now()
+    };
     setNotes(function(n){
       var updated = [newNote, ...n];
       if (user) notesRepository.create(newNote).catch(function(e){ console.error("Local note save failed:", e); });
@@ -7840,11 +8586,11 @@ export default function App() {
   async function openRecordingForTranscription(rec) {
     try {
       var blob = await getAudioBlobLocal(rec.id);
-      if (!blob) { alert("This recording's audio isn't saved on this device — recordings are stored locally, not in the cloud. Try opening it from the device you originally recorded it on."); return; }
+      if (!blob) { showAppToast("This recording's audio isn't on this device. Open it from the phone/computer you recorded it on.", "error"); return; }
       setResumeRecording({ blob:blob, mimeType:rec.mimeType, title:rec.title, course:rec.course, recordingId:rec.id });
       go("voice", tab);
     } catch(e) {
-      alert("Couldn't load this recording — try again.");
+      showAppToast("Couldn't load this recording — try again.", "error");
     }
   }
 
@@ -7854,11 +8600,12 @@ export default function App() {
     setScreen("home"); setTab("home");
   }
 
+  // Stats moved to Home quick actions; Ask Jotting (SAM-X) lives in the bottom nav.
   var NAV = [
     {id:"home",icon:"🏠",label:"Home",s:"home"},
     {id:"library",icon:"📚",label:"Library",s:"library"},
     {id:"new",icon:"+",label:"New",s:"voice",special:true},
-    {id:"dashboard",icon:"📊",label:"Stats",s:"dashboard"},
+    {id:"ai",icon:"💬",label:"Ask",s:"ai"},
     {id:"settings",icon:"⚙️",label:"Settings",s:"settings"},
   ];
 
@@ -7906,13 +8653,36 @@ export default function App() {
   // Main app
   return (
     <div style={{ height:"100dvh",background:"#06081A",display:"flex",justifyContent:"center",alignItems:"center",overflow:"hidden" }}>
-      <style>{"\n@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');\n*{box-sizing:border-box;font-family:'DM Sans',sans-serif;}\nhtml,body{height:100%;overflow:hidden;position:fixed;width:100%;margin:0;background:#06081A;}\nbutton,textarea,input{font-family:'DM Sans',sans-serif;}\n::-webkit-scrollbar{width:0;}\ninput::placeholder,textarea::placeholder{color:#4B5563;}\n@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}\n@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0.4)}50%{box-shadow:0 0 0 20px rgba(239,68,68,0)}}\n@keyframes wv{from{transform:scaleY(0.3)}to{transform:scaleY(1.2)}}\n@keyframes dot{from{opacity:0.3;transform:scale(0.7)}to{opacity:1;transform:scale(1)}}\n.samx-md p{margin:6px 0;}\n.samx-md ul,.samx-md ol{padding-left:20px;margin:8px 0;}\n.samx-md li{margin:4px 0;}\n.samx-md h1{margin:4px 0 14px;font-size:22px;font-weight:800;color:#F1F5F9;border-bottom:2px solid rgba(6,182,212,0.3);padding-bottom:8px;}\n.samx-md h2{margin:20px 0 8px;font-size:16px;font-weight:800;color:#06B6D4;}\n.samx-md h3{margin:12px 0 6px;font-size:14px;font-weight:700;color:#A78BFA;}\n.samx-md strong{color:#F1F5F9;}\n.samx-md code{background:rgba(6,182,212,0.15);color:#06B6D4;padding:2px 6px;border-radius:5px;font-size:13px;font-family:monospace;}\n.samx-md pre{background:#0A0F1E;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:12px;overflow-x:auto;margin:8px 0;}\n.samx-md pre code{background:transparent;color:#E2E8F0;padding:0;}\n.samx-md table{border-collapse:collapse;width:100%;font-size:13px;margin:10px 0;}\n.samx-md th,.samx-md td{border:1px solid rgba(255,255,255,0.08);padding:6px 10px;text-align:left;}\n.samx-md th{background:rgba(255,255,255,0.05);}\n.samx-md blockquote{border-left:3px solid #06B6D4;padding-left:10px;margin:8px 0;color:#94A3B8;}\n"}</style>
-      <div style={{ width:"100%",maxWidth:400,height:"100dvh",background:C.bg,overflow:"hidden",display:"flex",flexDirection:"column",boxShadow:"0 24px 80px rgba(6,182,212,0.12), 0 0 0 1px rgba(255,255,255,0.06)" }}>
+      <style>{"\n@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');\n*{box-sizing:border-box;font-family:'DM Sans',sans-serif;}\nhtml,body{height:100%;overflow:hidden;position:fixed;width:100%;margin:0;background:#06081A;}\nbutton,textarea,input{font-family:'DM Sans',sans-serif;}\n::-webkit-scrollbar{width:0;}\ninput::placeholder,textarea::placeholder{color:#4B5563;}\n@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}\n@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0.4)}50%{box-shadow:0 0 0 20px rgba(239,68,68,0)}}\n@keyframes wv{from{transform:scaleY(0.3)}to{transform:scaleY(1.2)}}\n@keyframes dot{from{opacity:0.3;transform:scale(0.7)}to{opacity:1;transform:scale(1)}}\n.samx-md p{margin:6px 0;}\n.samx-md ul,.samx-md ol{padding-left:20px;margin:8px 0;}\n.samx-md li{margin:4px 0;}\n.samx-md h1{margin:4px 0 14px;font-size:22px;font-weight:800;color:#F1F5F9;border-bottom:2px solid rgba(6,182,212,0.3);padding-bottom:8px;}\n.samx-md h2{margin:20px 0 8px;font-size:16px;font-weight:800;color:#06B6D4;}\n.samx-md h3{margin:12px 0 6px;font-size:14px;font-weight:700;color:#A78BFA;}\n.samx-md strong{color:#F1F5F9;}\n.samx-md code{background:rgba(6,182,212,0.15);color:#06B6D4;padding:2px 6px;border-radius:5px;font-size:13px;font-family:monospace;}\n.samx-md pre{background:#0A0F1E;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:12px;overflow-x:auto;margin:8px 0;}\n.samx-md pre code{background:transparent;color:#E2E8F0;padding:0;}\n.samx-md table{border-collapse:collapse;width:100%;font-size:13px;margin:10px 0;}\n.samx-md th,.samx-md td{border:1px solid rgba(255,255,255,0.08);padding:6px 10px;text-align:left;}\n.samx-md th{background:rgba(255,255,255,0.05);}\n.samx-md blockquote{border-left:3px solid #06B6D4;padding-left:10px;margin:8px 0;color:#94A3B8;}\n.note-md p{margin:10px 0;}\n.note-md h1{margin:6px 0 16px;font-size:24px;}\n.note-md h2{margin:24px 0 10px;font-size:17px;}\n.note-md h3{margin:16px 0 8px;}\n.note-md ul,.note-md ol{margin:10px 0 14px;}\n.note-md li{margin:6px 0;line-height:1.7;}\n.note-md hr{border:none;border-top:1px solid rgba(255,255,255,0.08);margin:18px 0;}\n"}</style>
+      <div style={{ width:"100%",maxWidth:400,height:"100dvh",background:C.bg,overflow:"hidden",display:"flex",flexDirection:"column",boxShadow:"0 24px 80px rgba(6,182,212,0.12), 0 0 0 1px rgba(255,255,255,0.06)", position:"relative" }}>
         <div style={{ background:syncBarMeta.bg,padding:"6px 16px",textAlign:"center",fontSize:11,fontWeight:700,color:syncBarMeta.color,flexShrink:0 }}>{syncBarMeta.icon} {syncBarMeta.label}</div>
         {swUpdateAvailable&&<div style={{ background:"rgba(167,139,250,0.15)",padding:"10px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",gap:10 }}><span style={{ fontSize:12,color:C.purple,fontWeight:600 }}>🔄 A new version of Jotting AI is ready</span><button onClick={applyAppUpdate} style={{ background:C.purple,border:"none",borderRadius:8,padding:"5px 12px",color:"#fff",fontSize:11,fontWeight:800,cursor:"pointer",flexShrink:0 }}>Refresh</button></div>}
         {cloudLoading&&<div style={{ background:"rgba(6,182,212,0.1)",padding:"10px",textAlign:"center",fontSize:12,color:C.cyan,fontWeight:600 }}>☁️ Syncing your notes...</div>}
+        {user && user.emailVerified===false && (
+          <div style={{ background:"rgba(245,158,11,0.12)", borderBottom:"1px solid rgba(245,158,11,0.25)", padding:"10px 14px", display:"flex", alignItems:"flex-start", gap:10, flexShrink:0 }}>
+            <span style={{ fontSize:16, lineHeight:1.2 }}>✉️</span>
+            <div style={{ flex:1, minWidth:0 }}>
+              <div style={{ fontSize:12, fontWeight:800, color:C.amber, marginBottom:2 }}>Verify your email to use SAM-X</div>
+              <div style={{ fontSize:11, color:C.muted, lineHeight:1.45 }}>We sent a link to your inbox. After you open it, go to Settings → Email Verified and tap “I’ve verified”.</div>
+            </div>
+            <button type="button" onClick={function(){ setScreen("settings"); }} style={{ background:C.amber, border:"none", borderRadius:8, padding:"6px 10px", color:"#0A0F1E", fontWeight:800, fontSize:11, cursor:"pointer", flexShrink:0 }}>Settings</button>
+          </div>
+        )}
+        {toast && (function(){
+          var kind = toast.kind || "info";
+          var bg = kind==="error" ? "rgba(248,113,113,0.95)" : kind==="success" ? "rgba(52,211,153,0.95)" : "rgba(30,41,59,0.96)";
+          var icon = kind==="error" ? "⚠️" : kind==="success" ? "✓" : "ℹ️";
+          return (
+            <div style={{ position:"absolute", left:12, right:12, bottom:72, zIndex:80, pointerEvents:"none" }}>
+              <div style={{ background:bg, color:"#fff", borderRadius:14, padding:"12px 14px", fontSize:13, fontWeight:700, lineHeight:1.4, boxShadow:"0 10px 28px rgba(0,0,0,0.35)", display:"flex", gap:8, alignItems:"flex-start" }}>
+                <span style={{ flexShrink:0 }}>{icon}</span>
+                <span style={{ minWidth:0 }}>{toast.message}</span>
+              </div>
+            </div>
+          );
+        })()}
         <div style={{ flex:1,display:"flex",flexDirection:"column",overflowY:"auto",minHeight:0 }}>
-          {screen==="home"&&<CommandCenterScreen notes={visibleNotes} recordings={recordings} assignments={assignments} topicMastery={topicMastery} courses={courses} user={user} plan={plan} onVoice={function(){setResumeRecording(null);go("voice","new");}} onDraw={function(){go("draw");}} onAIWrite={function(){go("aiwrite");}} onScan={function(){go("scan");}} onChat={function(seed){setAiChatSeed(seed||null);go("ai");}} onRecordings={function(){setScreen("recordings");}} onStudyPlanner={function(){go("studyplanner","home");}} onExamMode={function(){go("exammode","home");}} onAssignments={function(){go("assignments","home");}} onFlashcards={function(){go("flashcards","home");}} onAITutor={function(){go("aitutor","home");}} onSearch={function(){setPendingAssignmentId(null);setScreen("search");}} onNotifications={function(){setScreen("notifications");}} onProfile={function(){setScreen("profile");}} unreadCount={notifCenter.filter(function(n){return !n.read;}).length} onOpenMission={function(){go("mission","home");}} onOpenCourse={function(c){setActiveCourse(c);go("course");}} onOpenTopic={function(m){setActiveTopicId(m.id);go("topic");}} onStartStudySession={startStudySession} onOpenVault={function(){go("vault","home");}} onOpenUpcoming={function(){go("upcoming","home");}} onOpenProgress={function(){go("progress","dashboard");}} onCreateNote={function(){go("createnote","home");}} onUploadMaterial={function(){go("uploadmaterial","home");}} onAddAssignmentDirect={function(){setAssignmentAddMode(true);go("assignments","home");}}/>}
+          {screen==="home"&&<CommandCenterScreen notes={visibleNotes} recordings={recordings} assignments={assignments} topicMastery={topicMastery} courses={courses} user={user} plan={plan} onVoice={function(){setResumeRecording(null);go("voice","new");}} onDraw={function(){go("draw");}} onAIWrite={function(){go("aiwrite");}} onScan={function(){go("scan");}} onChat={function(seed){setAiChatSeed(seed||null);go("ai");}} onRecordings={function(){setScreen("recordings");}} onStudyPlanner={function(){go("studyplanner","home");}} onExamMode={function(){go("exammode","home");}} onAssignments={function(){go("assignments","home");}} onFlashcards={function(){go("flashcards","home");}} onAITutor={function(){go("aitutor","home");}} onSearch={function(){setPendingAssignmentId(null);setScreen("search");}} onNotifications={function(){setScreen("notifications");}} onProfile={function(){setScreen("profile");}} unreadCount={notifCenter.filter(function(n){return !n.read;}).length} onOpenMission={function(){go("mission","home");}} onOpenCourse={function(c){setActiveCourse(c);go("course");}} onOpenTopic={function(m){setActiveTopicId(m.id);go("topic");}} onStartStudySession={startStudySession} onOpenVault={function(){go("vault","home");}} onOpenUpcoming={function(){go("upcoming","home");}} onOpenProgress={function(){go("progress","dashboard");}} onOpenStats={function(){go("dashboard","home");}} onCreateNote={function(){go("createnote","home");}} onUploadMaterial={function(){go("uploadmaterial","home");}} onAddAssignmentDirect={function(){setAssignmentAddMode(true);go("assignments","home");}}/>}
           {screen==="course"&&activeCourse&&<CourseOverviewScreen course={activeCourse} courses={courses} assignments={assignments} topicMastery={topicMastery} materials={materials} onBack={function(){go(tab,tab);}} onAITutor={function(){go("aitutor","home");}} onFlashcards={function(){go("flashcards","home");}} onExamMode={function(){go("exammode","home");}} onOpenTopic={function(m){setActiveTopicId(m.id);go("topic");}}/>}
           {screen==="vault"&&<StudyVaultScreen notes={visibleNotes} recordings={recordings} materials={materials} quizzes={quizzes} flashcardDecks={flashcardDecks} courses={courses} semesters={semesters} onBack={function(){go(tab,tab);}} onOpenCourse={function(c){setActiveVaultCourse(c);go("vaultcourse");}} onManageSemesters={function(){go("managesemesters",tab);}} onManageCourses={function(){go("managecourses",tab);}}/>}
           {screen==="managesemesters"&&<ManageSemestersScreen semesters={semesters} courses={courses} onBack={function(){go("vault",tab);}} onAdd={addSemester} onUpdate={updateSemesterRecord} onDelete={deleteSemesterRecord} onUpdateCourse={updateCourseRecord}/>}
@@ -7930,7 +8700,7 @@ export default function App() {
           {screen==="draw"&&<DrawScreen onBack={function(){go("home","home");}} onSave={saveNote} courses={courses} onCreateCourse={addCourse}/>}
           {screen==="aiwrite"&&<AIWriteScreen onBack={function(){go("home","home");}} onSave={saveNote} courses={courses} onCreateCourse={addCourse}/>}
           {screen==="scan"&&<ScanDocScreen onBack={function(){go("home","home");}} onSave={saveNote} courses={courses} onCreateCourse={addCourse}/>}
-          {screen==="ai"&&<AIScreen notes={notes} onBack={function(){setAiChatSeed(null);go("home","home");}} chatSessions={chatSessions} onSaveSession={saveChatSession} onDeleteSession={deleteChatSession} initialPrefill={aiChatSeed&&aiChatSeed.initialPrefill} initialSend={aiChatSeed&&aiChatSeed.initialSend} initialPicker={aiChatSeed&&aiChatSeed.initialPicker}/>}
+          {screen==="ai"&&<AIScreen notes={notes} onBack={function(){setAiChatSeed(null);go("home","home");}} chatSessions={chatSessions} onSaveSession={saveChatSession} onDeleteSession={deleteChatSession} initialPrefill={aiChatSeed&&aiChatSeed.initialPrefill} initialSend={aiChatSeed&&aiChatSeed.initialSend} initialPicker={aiChatSeed&&aiChatSeed.initialPicker} credits={credits} plan={plan} onUpgrade={function(){setScreen("pricing");}}/>}
           {screen==="recordings"&&<RecordingsScreen recordings={recordings} onBack={function(){go(tab,tab);}} onRename={renameRecording} onDelete={deleteRecording} onTranscribe={openRecordingForTranscription}/>}
           {screen==="studyplanner"&&<StudyPlannerScreen notes={notes} onBack={function(){go(tab,tab);}} plan={plan} onUpgrade={function(){setScreen("pricing");}} onSaveNote={saveNote} onSavePlan={saveStudyPlanLocally} courses={courses} onCreateCourse={addCourse}/>}
           {screen==="exammode"&&<ExamModeScreen notes={notes} onBack={function(){ if(studySession){studyStepReturn();}else{go(tab,tab);} }} plan={plan} onUpgrade={function(){setScreen("pricing");}} onRecordResult={recordExamResult} onSaveQuiz={saveQuizLocally}/>}
@@ -7945,11 +8715,15 @@ export default function App() {
           {screen==="settings"&&<SettingsScreen user={user} onLogout={handleLogout} recQuality={recQuality} setRecQuality={setRecQuality} recSettings={recSettings} setRecSettings={setRecSettings} plan={plan} credits={credits} onViewPlans={function(){setScreen("pricing");}} themeName={themeName} onSelectTheme={selectTheme} notifPrefs={notifPrefs} setNotifPrefs={setNotifPrefs} privacy={privacy} onSetPin={setPinCode} onDisablePin={disablePin} onSetAutoLock={setAutoLock} onSetHiddenFolder={setHiddenFolder} aiStyle={aiStyle} setAiStyle={setAiStyle} aiLength={aiLength} setAiLength={setAiLength} aiLanguage={aiLanguage} setAiLanguage={setAiLanguage} isIOS={isIOS} isStandalone={isStandalone} installPromptEvent={installPromptEvent} promptInstall={promptInstall} onRefreshVerification={refreshEmailVerification}/>}
           {screen==="pricing"&&<PricingScreen onBack={function(){go("settings","settings");}} plan={plan} credits={credits} user={user} onPlanUpdated={function(newPlan,newCredits){ setPlan(newPlan); setCredits(newCredits); addNotificationRef.current("app_update","🎉 Plan updated","You're now on the "+((PLANS[newPlan]||PLANS.free).name)+" plan.", {screen:"pricing"}); }}/>}
           {screen==="notifications"&&<NotificationScreen onBack={function(){go(tab,tab);}} notifications={notifCenter} onMarkRead={markNotifRead} onMarkAllRead={markAllNotifsRead} onNavigate={navigateFromNotification} notifEnabled={notifEnabled} setNotifEnabled={setNotifEnabled} user={user}/>}
-          {screen==="profile"&&<ProfileScreen onBack={function(){go(tab,tab);}} user={user} plan={plan} credits={credits} profile={profile} onSaveProfile={saveProfile} onLogout={handleLogout}/>}
+          {screen==="profile"&&<ProfileScreen onBack={function(){go(tab,tab);}} user={user} plan={plan} credits={credits} profile={profile} onSaveProfile={saveProfile} onLogout={handleLogout} onViewPlans={function(){setScreen("pricing");}}/>}
         </div>
         <div style={{ background:C.card2,borderTop:"1px solid "+C.border,padding:"10px 10px 16px",display:"flex",justifyContent:"space-around",alignItems:"center",flexShrink:0 }}>
           {NAV.map(function(item){return(
-            <button key={item.id} onClick={function(){ if(item.s==="voice") setResumeRecording(null); go(item.s,item.id); }} style={{ background:item.special?"linear-gradient(135deg,#06B6D4,#A78BFA)":"none",border:"none",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:3,padding:item.special?"0":"4px 8px",width:item.special?52:"auto",height:item.special?52:"auto",borderRadius:item.special?"50%":0,boxShadow:item.special?"0 4px 20px rgba(6,182,212,0.4)":"none",justifyContent:"center",flexShrink:0 }}>
+            <button key={item.id} onClick={function(){
+              if(item.s==="voice") setResumeRecording(null);
+              if(item.s==="ai") setAiChatSeed(null); // open clean SAM-X chat from bottom nav
+              go(item.s,item.id);
+            }} style={{ background:item.special?"linear-gradient(135deg,#06B6D4,#A78BFA)":"none",border:"none",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:3,padding:item.special?"0":"4px 8px",width:item.special?52:"auto",height:item.special?52:"auto",borderRadius:item.special?"50%":0,boxShadow:item.special?"0 4px 20px rgba(6,182,212,0.4)":"none",justifyContent:"center",flexShrink:0 }}>
               <span style={{ fontSize:item.special?24:20,color:item.special?"#fff":tab===item.id?C.cyan:"#4B5563" }}>{item.icon}</span>
               {!item.special&&<span style={{ fontSize:10,fontWeight:700,color:tab===item.id?C.cyan:"#4B5563" }}>{item.label}</span>}
               {!item.special&&tab===item.id&&<div style={{ width:4,height:4,borderRadius:"50%",background:C.cyan }}/>}
