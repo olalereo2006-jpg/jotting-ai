@@ -196,10 +196,42 @@ const GEMINI_KEY = process.env.GEMINI_SERVER_KEY;
 // Gemini 3 models think by default. With a small maxOutputTokens (e.g. 800–1500),
 // thinking can consume the whole budget and return empty text → "No response from SAM-X".
 // MINIMAL keeps latency low for study chat while still leaving room for the answer.
+// Hard caps — stop one request from running up a huge Gemini bill.
+var MAX_OUTPUT_TOKENS = 4096;
+var MAX_PAYLOAD_CHARS = 120000; // ~text + base64 across contents + systemInstruction
+
+function estimatePayloadChars(contents, systemInstruction) {
+  var n = 0;
+  if (typeof systemInstruction === "string") n += systemInstruction.length;
+  else if (systemInstruction && systemInstruction.parts) {
+    for (var i = 0; i < systemInstruction.parts.length; i++) {
+      var p = systemInstruction.parts[i];
+      if (p && typeof p.text === "string") n += p.text.length;
+    }
+  }
+  var list = contents || [];
+  for (var c = 0; c < list.length; c++) {
+    var parts = (list[c] && list[c].parts) || [];
+    for (var j = 0; j < parts.length; j++) {
+      var part = parts[j];
+      if (!part) continue;
+      if (typeof part.text === "string") n += part.text.length;
+      if (part.inline_data && typeof part.inline_data.data === "string") {
+        n += part.inline_data.data.length;
+      }
+      if (part.inlineData && typeof part.inlineData.data === "string") {
+        n += part.inlineData.data.length;
+      }
+    }
+  }
+  return n;
+}
+
 function buildGenerationConfig(maxTokens) {
   var out = Math.max(Number(maxTokens) || 800, 1024);
   // Give headroom so thinking + answer both fit when the model must think a little.
   if (out < 2048) out = 2048;
+  if (out > MAX_OUTPUT_TOKENS) out = MAX_OUTPUT_TOKENS;
   return {
     maxOutputTokens: out,
     thinkingConfig: { thinkingLevel: "MINIMAL" },
@@ -353,6 +385,9 @@ const CREDIT_COSTS = {
   flashcards: 8,
   pdf_analysis: 20,
   transcribe: 15,
+  // Paid-feature actions (same Gemini cost as related free actions, but plan-gated below)
+  tutor: 1,
+  exam: 8,
 };
 const PLAN_MONTHLY_CREDITS = { free: 60, pro: 400, premium: 1500 };
 const PLANS = {
@@ -360,6 +395,40 @@ const PLANS = {
   pro:     { monthlyCredits: 400,  priceMonthly: 550,  priceYearly: 5500 },
   premium: { monthlyCredits: 1500, priceMonthly: 1500, priceYearly: 15000 },
 };
+
+// Server-side plan gates — NEVER trust the React UI alone.
+// Hierarchy: free < pro < premium
+const PLAN_RANK = { free: 0, pro: 1, premium: 2 };
+const ACTION_MIN_PLAN = {
+  tutor: "pro",     // Advanced AI Tutor
+  exam: "premium",  // Exam Mode
+};
+
+function planAllows(userPlan, requiredPlan) {
+  var have = PLAN_RANK[userPlan] != null ? PLAN_RANK[userPlan] : 0;
+  var need = PLAN_RANK[requiredPlan] != null ? PLAN_RANK[requiredPlan] : 0;
+  return have >= need;
+}
+
+// Simple per-uid rate limit (in-memory per Netlify instance).
+// Stops rapid spam from one account; not a full DDoS shield, but blocks casual abuse.
+var RATE_LIMIT_WINDOW_MS = 60 * 1000;
+var RATE_LIMIT_MAX = 30; // max AI calls per uid per minute
+var rateBuckets = Object.create(null);
+
+function checkRateLimit(uid) {
+  var now = Date.now();
+  var bucket = rateBuckets[uid];
+  if (!bucket || now - bucket.windowStart > RATE_LIMIT_WINDOW_MS) {
+    rateBuckets[uid] = { windowStart: now, count: 1 };
+    return { ok: true };
+  }
+  bucket.count += 1;
+  if (bucket.count > RATE_LIMIT_MAX) {
+    return { ok: false, retryAfterSec: Math.ceil((RATE_LIMIT_WINDOW_MS - (now - bucket.windowStart)) / 1000) };
+  }
+  return { ok: true };
+}
 
 function monthKey() {
   var d = new Date();
@@ -452,6 +521,14 @@ async function handleSubscription(uid, body) {
       });
     }
 
+    // Only accept NGN (Paystack Nigeria). Block currency mismatches.
+    var currency = String(paystackData.currency || "").toUpperCase();
+    if (currency && currency !== "NGN") {
+      return jsonResponse(402, {
+        error: "Unsupported payment currency (" + currency + "). Expected NGN.",
+      });
+    }
+
     // Prefer client planId; fall back to Paystack metadata if missing/stale.
     var meta = paystackData.metadata || {};
     if ((!planId || planId === "free") && meta.planId) {
@@ -467,40 +544,93 @@ async function handleSubscription(uid, body) {
       });
     }
 
+    var paidNaira = Math.round((paystackData.amount || 0) / 100);
+
+    // Amount is source of truth — never upgrade to a higher plan than was paid for.
+    var planFromAmount = null;
+    if (paidNaira >= PLANS.premium.priceMonthly) planFromAmount = "premium";
+    else if (paidNaira >= PLANS.pro.priceMonthly) planFromAmount = "pro";
+
     var targetPlan = PLANS[planId];
     if (!targetPlan || planId === "free") {
-      // Last resort: infer plan from amount paid (kobo)
-      var paidNaira = Math.round((paystackData.amount || 0) / 100);
-      if (paidNaira >= PLANS.premium.priceMonthly) planId = "premium";
-      else if (paidNaira >= PLANS.pro.priceMonthly) planId = "pro";
-      else {
+      if (!planFromAmount) {
         return jsonResponse(400, {
           error: "Couldn't determine which plan was paid for. Reference: " + reference,
         });
       }
+      planId = planFromAmount;
       targetPlan = PLANS[planId];
-    }
-
-    var expectedNaira =
-      cycle === "yearly" ? targetPlan.priceYearly : targetPlan.priceMonthly;
-    // Allow 1 Naira tolerance for rounding; reject clearly underpaid amounts.
-    if (paystackData.amount < expectedNaira * 100 - 100) {
-      return jsonResponse(402, {
-        error:
-          "The amount paid (₦" +
-          Math.round(paystackData.amount / 100) +
-          ") doesn't match the " +
-          planId +
-          " plan price (₦" +
-          expectedNaira +
-          ")",
-      });
+    } else {
+      // Client asked for Pro but only paid Free-tier amount → reject
+      var expectedNaira =
+        cycle === "yearly" ? targetPlan.priceYearly : targetPlan.priceMonthly;
+      if (paystackData.amount < expectedNaira * 100 - 100) {
+        // If amount matches a cheaper paid plan, grant that instead of failing hard
+        if (planFromAmount && planFromAmount !== planId) {
+          planId = planFromAmount;
+          targetPlan = PLANS[planId];
+        } else {
+          return jsonResponse(402, {
+            error:
+              "The amount paid (₦" +
+              paidNaira +
+              ") doesn't match the " +
+              planId +
+              " plan price (₦" +
+              expectedNaira +
+              ")",
+          });
+        }
+      }
     }
 
     if (meta.uid && meta.uid !== uid) {
       return jsonResponse(403, {
         error: "This payment isn't linked to your account",
       });
+    }
+
+    // Reject replay of the same Paystack reference (can't unlock twice)
+    try {
+      var existingSnap = await accountRef.get();
+      var existing = existingSnap.exists ? existingSnap.data() : {};
+      if (existing.disabled === true || existing.banned === true) {
+        return jsonResponse(403, {
+          error: "ACCOUNT_DISABLED",
+          message: "This account has been suspended. Contact support if you think this is a mistake.",
+        });
+      }
+      if (existing.lastPaymentRef && existing.lastPaymentRef === reference) {
+        // Idempotent success — already applied this payment
+        return jsonResponse(200, {
+          plan: existing.plan || planId,
+          credits:
+            typeof existing.credits === "number"
+              ? existing.credits
+              : targetPlan.monthlyCredits,
+          alreadyApplied: true,
+        });
+      }
+      // Track used refs in an array (cap length) to block older replays too
+      var usedRefs = Array.isArray(existing.usedPaymentRefs)
+        ? existing.usedPaymentRefs.slice()
+        : [];
+      if (usedRefs.indexOf(reference) !== -1) {
+        return jsonResponse(200, {
+          plan: existing.plan || planId,
+          credits:
+            typeof existing.credits === "number"
+              ? existing.credits
+              : targetPlan.monthlyCredits,
+          alreadyApplied: true,
+        });
+      }
+      usedRefs.push(reference);
+      if (usedRefs.length > 20) usedRefs = usedRefs.slice(usedRefs.length - 20);
+    } catch (e) {
+      console.error("Payment replay check failed:", e);
+      // Continue — better to verify payment than lock student out on read error
+      var usedRefs = [reference];
     }
 
     var update = {
@@ -510,6 +640,7 @@ async function handleSubscription(uid, body) {
       lastPaymentRef: reference,
       lastPaymentAt: Date.now(),
       lastPaymentCycle: cycle || "monthly",
+      usedPaymentRefs: usedRefs,
     };
     try {
       await accountRef.set(update, { merge: true });
@@ -646,8 +777,9 @@ exports.handler = async function (event) {
     }
 
     var uid;
+    var decoded;
     try {
-      var decoded = await admin.auth().verifyIdToken(idToken);
+      decoded = await admin.auth().verifyIdToken(idToken);
       uid = decoded.uid;
     } catch (e) {
       return jsonResponse(401, {
@@ -655,12 +787,34 @@ exports.handler = async function (event) {
       });
     }
 
+    // Payments still allowed before email verify (so upgrade isn't blocked).
     if (action === "verify_payment" || action === "downgrade") {
       return await handleSubscription(uid, body);
     }
 
+    // AI calls require a verified email — stops mass throwaway accounts farming free credits.
+    // Google sign-in is already verified; email/password must click the link in their inbox.
+    if (decoded.email_verified !== true) {
+      return jsonResponse(403, {
+        error: "EMAIL_NOT_VERIFIED",
+        message:
+          "Please verify your email before using SAM-X. Open the link we sent you, then tap “I’ve verified” in Settings.",
+      });
+    }
+
     if (!GEMINI_KEY) {
       return jsonResponse(500, { error: "Gemini server key is not configured." });
+    }
+
+    // Rate limit before spending credits / calling Gemini
+    var rate = checkRateLimit(uid);
+    if (!rate.ok) {
+      return jsonResponse(429, {
+        error:
+          "Too many requests. Please wait " +
+          (rate.retryAfterSec || 30) +
+          " seconds and try again.",
+      });
     }
 
     var contents = body.contents;
@@ -669,6 +823,16 @@ exports.handler = async function (event) {
 
     if (!contents) {
       return jsonResponse(400, { error: "Missing request content" });
+    }
+
+    // Reject oversized payloads (huge notes / base64) before charging credits
+    var payloadChars = estimatePayloadChars(contents, systemInstruction);
+    if (payloadChars > MAX_PAYLOAD_CHARS) {
+      return jsonResponse(413, {
+        error: "PAYLOAD_TOO_LARGE",
+        message:
+          "That request is too large for SAM-X. Try a shorter note, a smaller file, or fewer attachments.",
+      });
     }
 
     var cost = CREDIT_COSTS[action] != null ? CREDIT_COSTS[action] : 1;
@@ -684,6 +848,29 @@ exports.handler = async function (event) {
         var monthlyAllowance =
           PLAN_MONTHLY_CREDITS[plan] || PLAN_MONTHLY_CREDITS.free;
 
+        // Owner can set accounts/{uid}.disabled = true (or banned) in Firebase Console
+        if (data.disabled === true || data.banned === true) {
+          return {
+            ok: false,
+            reason: "ACCOUNT_DISABLED",
+            remaining:
+              typeof data.credits === "number" ? data.credits : monthlyAllowance,
+          };
+        }
+
+        // Enforce paid features on the server (UI gates are not enough)
+        var requiredPlan = ACTION_MIN_PLAN[action];
+        if (requiredPlan && !planAllows(plan, requiredPlan)) {
+          return {
+            ok: false,
+            reason: "PLAN_REQUIRED",
+            plan: plan,
+            requiredPlan: requiredPlan,
+            remaining:
+              typeof data.credits === "number" ? data.credits : monthlyAllowance,
+          };
+        }
+
         var credits =
           typeof data.credits === "number" ? data.credits : monthlyAllowance;
         if (data.creditsMonthKey !== thisMonth) {
@@ -696,7 +883,7 @@ exports.handler = async function (event) {
             { plan: plan, credits: credits, creditsMonthKey: thisMonth },
             { merge: true }
           );
-          return { ok: false, remaining: credits, plan: plan };
+          return { ok: false, reason: "OUT_OF_CREDITS", remaining: credits, plan: plan };
         }
 
         var newBalance = credits - cost;
@@ -718,6 +905,26 @@ exports.handler = async function (event) {
     }
 
     if (!deduction.ok) {
+      if (deduction.reason === "ACCOUNT_DISABLED") {
+        return jsonResponse(403, {
+          error: "ACCOUNT_DISABLED",
+          message:
+            "This account has been suspended. Contact support if you think this is a mistake.",
+        });
+      }
+      if (deduction.reason === "PLAN_REQUIRED") {
+        return jsonResponse(403, {
+          error: "PLAN_REQUIRED",
+          plan: deduction.plan || "free",
+          requiredPlan: deduction.requiredPlan,
+          message:
+            deduction.requiredPlan === "premium"
+              ? "Exam Mode requires a Premium plan. Please upgrade to continue."
+              : "This feature requires a " +
+                (deduction.requiredPlan === "pro" ? "Pro" : "paid") +
+                " plan. Please upgrade to continue.",
+        });
+      }
       return jsonResponse(402, {
         error: "OUT_OF_CREDITS",
         remaining: deduction.remaining,
