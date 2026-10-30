@@ -12,6 +12,7 @@
 [functions]
   directory = "netlify/functions"
   node_bundler = "nft"
+  external_node_modules = ["firebase-admin"]
 
 # SPA fallback + API route
 [[redirects]]
