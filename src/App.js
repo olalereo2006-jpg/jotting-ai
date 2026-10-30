@@ -47,7 +47,7 @@ const googleProvider = new GoogleAuthProvider();
 // popup, never move money or touch account data on its own. Get this from your
 // Paystack dashboard (Settings → API Keys) and swap in your live key when ready.
 // The matching SECRET key belongs only on the server — see netlify/functions/manage-subscription.js.
-const PAYSTACK_PUBLIC_KEY = "pk_test_REPLACE_WITH_YOUR_PAYSTACK_PUBLIC_KEY";
+const PAYSTACK_PUBLIC_KEY = "pk_live_35f814871b22cf97cf0fdf9007d2be2e82300aca";
 
 // Web Push VAPID public key — identifies your server to browsers' push services so a
 // push subscription can only be used by you, not anyone who happens to see the endpoint
@@ -55,7 +55,7 @@ const PAYSTACK_PUBLIC_KEY = "pk_test_REPLACE_WITH_YOUR_PAYSTACK_PUBLIC_KEY";
 // This one was freshly generated for you — pair it with the matching VAPID_PRIVATE_KEY
 // set as a Netlify env var for netlify/functions/send-reminders.js. Regenerate anytime
 // with `npx web-push generate-vapid-keys` if you'd rather use your own.
-const VAPID_PUBLIC_KEY = "BCewO3bPQScLntwHiEpsHOCfNSPtl5I7CaqnbkE_dQk12bh9bbuyVsyYxAFkoNgifT1eD9wXTFyDfDksrvE1SsY";
+const VAPID_PUBLIC_KEY = "BFedshU80TzJPnPEB0FQHUMpQ3CMxuA9ObT84auybyoLBwix2g8zvwf02j-tFlffG6OGA3Z-T7WxrcOx5l7pOwU";
 
 // ── Theme system ────────────────────────────────────────────────────────────
 // `C` is read all over the app as plain property access (C.bg, C.text, ...) at
